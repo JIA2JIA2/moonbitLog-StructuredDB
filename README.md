@@ -106,6 +106,15 @@ let recs = log.scan()
 
 需要真实文件持久化时改用 `backend_native`（仅 native 目标），二者接口一致，业务代码无需改动。
 
+## 可运行示例
+
+`examples/mem_demo/` 是一个最小可运行程序，用内存后端演示追加、tombstone、live 视图与消费游标，可在三种目标运行：
+
+```bash
+moon run examples/mem_demo --target native
+moon run examples/mem_demo --target wasm
+```
+
 ## 磁盘格式
 
 每条记录（小端）：
@@ -151,6 +160,10 @@ u32 crc32          (仅覆盖 body)
 - M11 可配置 durability（`SyncPolicy`）与按字节保留
 - M12 `flock` 目录锁、读快照与 CLI 游标持久化
 - M13 property/fuzz 恢复测试、`moon bench`、CI 与 API/CHANGELOG 文档
+- M14 compaction 提升为 `Log::compact` 库方法
+- M15 按时间戳保留（`Log::retain_before` 与 `prune-before`）
+- M16 manifest 记录段字节大小并在打开时校验
+- M17 `examples/mem_demo` 可运行示例（wasm/js/native）
 
 ## 许可
 

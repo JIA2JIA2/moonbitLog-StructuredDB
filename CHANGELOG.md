@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **Compaction as a library API (M14)**：`Log::compact` folds a log down to its
+  live view in place, invoking a callback per dropped segment so the caller can
+  reclaim the backing files.
+- **Timestamp retention (M15)**：`Log::retain_before` and the `prune-before`
+  CLI command drop segments whose last record predates a cutoff.
+- **Segment size verification (M16)**：the manifest now records each segment's
+  byte size; opening cross-checks the real file size and falls back to a full
+  recovery scan when it does not match.
+- **Runnable examples (M17)**：`examples/mem_demo` demonstrates the in-memory
+  backend end to end on wasm, js and native.
+
 ## 0.1.0 - 2026-10-31
 
 First complete release of the append-only event log database, built up over

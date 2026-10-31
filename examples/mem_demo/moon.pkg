@@ -1,0 +1,8 @@
+pkgtype(kind: "executable")
+
+import {
+  "moonlog/lsdb/src/log",
+  "moonlog/lsdb/src/segment",
+  "moonlog/lsdb/src/backend_mem",
+  "moonbitlang/core/encoding/utf8",
+}
