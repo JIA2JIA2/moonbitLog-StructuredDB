@@ -260,25 +260,13 @@ fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
 fn cmd_compact(dir : String) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
-    let snap = log.snapshot()
-    for seg in log.segments {
+    let n = log.compact(on_drop=seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
       seg.writer.close()
-    }
-    let names = @backend_native.list_dir(dir)
-    for name in names {
-      if name != "LOCK" {
-        ignore(@backend_native.remove_file(dir + "/" + name))
-      }
-    }
-    let fresh : CliLog = @log.Log::new(ROLL_SIZE, base => {
-      @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
     })
-    for rec in snap {
-      ignore(fresh.append(rec.key, rec.value, rec.timestamp) catch { _ => panic() })
-    }
-    @backend_native.flush_meta(dir, fresh)
-    println("compacted " + snap.length().to_string() + " records")
-    close_log(fresh)
+    @backend_native.flush_meta(dir, log)
+    println("compacted " + n.to_string() + " records")
+    close_log(log)
   })
 }
 

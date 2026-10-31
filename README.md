@@ -79,7 +79,7 @@ $EXE scan /tmp/log
 | `Log::append` / `Log::delete` | `log` | 追加记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `drop_before` | `log` | 段级保留策略 |
-| `Log::build_key_index` / `get_latest` / `snapshot` | `log` | KV 逻辑视图 / 折叠为 live 记录 |
+| `Log::build_key_index` / `get_latest` / `snapshot` / `compact` | `log` | KV 逻辑视图 / 折叠 live 记录 / 原地重写 |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` | `log` | `Never` / `Always` 持久化策略 |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |

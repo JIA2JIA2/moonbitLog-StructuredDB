@@ -96,3 +96,28 @@ pub fn[W, R : @io.LogReader] Log::snapshot(
   }
   out
 }
+
+///|
+/// Fold the log down to its live view in place: snapshot the current live
+/// records, hand every existing segment to `on_drop` (so the caller can
+/// reclaim its files), reset the offset space, and replay the live records
+/// into freshly created segments. Returns the number of records written.
+///
+/// `on_drop` runs *before* the fresh segments are created, so a caller that
+/// deletes the dropped segment files by `base_offset` will not accidentally
+/// remove the rewritten ones.
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(
+  self : Log[W, R],
+  on_drop~ : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 raise @io.IoError {
+  let live = self.snapshot()
+  for seg in self.segments {
+    on_drop(seg)
+  }
+  self.segments = []
+  self.next_offset = (0 : UInt64)
+  for rec in live {
+    ignore(self.append(rec.key, rec.value, rec.timestamp))
+  }
+  live.length()
+}

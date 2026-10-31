@@ -388,3 +388,39 @@ test "sync policy Always flushes on append" {
   let recs = log.scan() catch { _ => panic() }
   assert_eq(recs.length(), 1)
 }
+
+///|
+test "log compact folds to the live view and drops old segments" {
+  let dropped : Array[UInt64] = []
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"2", (2 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"3", (3 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"4", (4 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"c", (5 : Int64)) catch { _ => panic() })
+  let before = log.segment_count()
+  assert_true(before >= 2)
+  let n = log.compact(on_drop=seg => dropped.push(seg.base_offset)) catch {
+    _ => panic()
+  }
+  assert_eq(n, 2)
+  assert_eq(dropped.length(), before)
+  assert_eq(log.segment_count(), 1)
+  assert_eq(log.count(), 2)
+  assert_eq(log.next_offset(), (2 : UInt64))
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 2)
+  assert_eq(recs[0].key, b"a")
+  assert_eq(recs[0].value, b"2")
+  assert_eq(recs[1].key, b"b")
+  let idx = log.build_key_index() catch { _ => panic() }
+  assert_eq(idx.size(), 2)
+  let gone = log.get_latest(idx, b"c") catch { _ => panic() }
+  match gone {
+    Some(_) => panic()
+    None => ()
+  }
+}
