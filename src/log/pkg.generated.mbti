@@ -41,6 +41,7 @@ pub(all) struct Log[W, R] {
   sync : SyncPolicy
 }
 pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
+pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, Int64)]) -> Array[UInt64] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::build_key_index(Self[W, R]) -> KeyIndex raise @io.IoError
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(Self[W, R], on_drop~ : (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::count(Self[W, R]) -> Int32

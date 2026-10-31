@@ -454,3 +454,25 @@ test "retain_before drops segments whose last record predates the cutoff" {
   assert_true(recs.length() >= 1)
   assert_eq(recs[recs.length() - 1].timestamp, (50 : Int64))
 }
+
+///|
+test "append_batch assigns contiguous offsets across rolls" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  let batch : Array[(Bytes, Bytes, Int64)] = [
+    (b"a", b"1", (0 : Int64)),
+    (b"b", b"2", (1 : Int64)),
+    (b"c", b"3", (2 : Int64)),
+    (b"d", b"4", (3 : Int64)),
+  ]
+  let offsets = log.append_batch(batch) catch { _ => panic() }
+  assert_eq(offsets.length(), 4)
+  assert_eq(offsets[0], (0 : UInt64))
+  assert_eq(offsets[3], (3 : UInt64))
+  assert_eq(log.count(), 4)
+  assert_true(log.segment_count() >= 2)
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs[3].value, b"4")
+}

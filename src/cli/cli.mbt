@@ -7,6 +7,7 @@
 ///
 /// Commands:
 ///   put <dir> <key> <value>          append a key/value record
+///   put-batch <dir> <k> <v> ...      append several key/value records at once
 ///   delete <dir> <key>               append a tombstone for a key
 ///   get <dir> <offset>               fetch one record by offset
 ///   scan <dir> [from] [to]           list records in [from, to)
@@ -28,7 +29,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -115,6 +116,30 @@ fn cmd_put(dir : String, key : String, value : String) -> Unit raise @io.IoError
     let log = open_log(dir)
     let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
     println("offset " + off.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
+/// Append several key/value pairs passed as `<k1> <v1> <k2> <v2> ...`.
+fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
+  let n = args.length()
+  if (n - 3) % 2 != 0 {
+    raise @io.IoError::Invalid("put-batch needs key/value pairs")
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let recs : Array[(Bytes, Bytes, Int64)] = []
+    let mut i = 3
+    while i < n {
+      recs.push((@utf8.encode(args[i]), @utf8.encode(args[i + 1]), now_ms()))
+      i = i + 2
+    }
+    let offsets = log.append_batch(recs)
+    for off in offsets {
+      println("offset " + off.to_string())
+    }
     @backend_native.flush_meta(dir, log)
     close_log(log)
   })
@@ -301,6 +326,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_put(args[2], args[3], args[4])
+    }
+  } else if cmd == "put-batch" {
+    if args.length() < 5 {
+      println(USAGE)
+    } else {
+      cmd_put_batch(args[2], args)
     }
   } else if cmd == "delete" {
     if args.length() < 4 {

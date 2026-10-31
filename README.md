@@ -48,6 +48,7 @@ moon bench --target native   # 基准：追加 / 点查 / 范围扫描 / 恢复
 moonlog <command> <dir> [args...]
 
   put <dir> <key> <value>       追加一条 key/value 记录
+  put-batch <dir> <k> <v> ...   一次追加多组 key/value 记录
   delete <dir> <key>            追加 key 的 tombstone
   get <dir> <offset>            按 offset 读取记录
   scan <dir> [from] [to]        列出 [from, to) 区间记录
@@ -77,7 +78,7 @@ $EXE scan /tmp/log
 | 类型 / 函数 | 包 | 用途 |
 | --- | --- | --- |
 | `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
-| `Log::append` / `Log::delete` | `log` | 追加记录 / tombstone，返回全局 offset |
+| `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `get_latest` / `snapshot` / `compact` | `log` | KV 逻辑视图 / 折叠 live 记录 / 原地重写 |
@@ -164,6 +165,7 @@ u32 crc32          (仅覆盖 body)
 - M15 按时间戳保留（`Log::retain_before` 与 `prune-before`）
 - M16 manifest 记录段字节大小并在打开时校验
 - M17 `examples/mem_demo` 可运行示例（wasm/js/native）
+- M18 批量写入 `Log::append_batch` 与 CLI `put-batch`
 
 ## 许可
 

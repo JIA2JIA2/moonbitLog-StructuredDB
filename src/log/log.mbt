@@ -104,6 +104,23 @@ pub fn[W : @io.LogWriter, R] Log::append(
 }
 
 ///|
+/// Append several records in one call, returning their assigned offsets in the
+/// same order. Records are appended independently (each may roll the active
+/// segment), so a mid-batch IO failure leaves the successful prefix durable
+/// rather than nothing at all.
+pub fn[W : @io.LogWriter, R] Log::append_batch(
+  self : Log[W, R],
+  records : Array[(Bytes, Bytes, Int64)],
+) -> Array[UInt64] raise @io.IoError {
+  let offsets : Array[UInt64] = []
+  for rec in records {
+    let (key, value, timestamp) = rec
+    offsets.push(self.append(key, value, timestamp))
+  }
+  offsets
+}
+
+///|
 /// Locate the segment that owns `offset`, if any. Segments are kept in
 /// increasing `base_offset` order, so this binary-searches them.
 fn[W, R] Log::find_segment(
