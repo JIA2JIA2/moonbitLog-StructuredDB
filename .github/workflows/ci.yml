@@ -8,14 +8,19 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up MoonBit
-        uses: moonbitlang/setup-moonbit@v1
+      - name: Install MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain version
-        run: moon version
+        run: moon version --all
 
       - name: Check formatting
         run: moon fmt --check
@@ -42,7 +47,6 @@ jobs:
         run: moon bench --target native
 
       - name: CLI smoke test
-        shell: bash
         run: |
           set -euo pipefail
           EXE=_build/native/debug/build/src/cli/cli.exe
