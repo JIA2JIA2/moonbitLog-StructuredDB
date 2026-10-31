@@ -1,0 +1,29 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonlog/lsdb/src/backend_mem"
+
+import {
+  "moonlog/lsdb/src/io",
+}
+
+// Values
+
+// Errors
+
+// Types and methods
+pub struct MemLog {
+  mut data : Bytes
+  mut closed : Bool
+}
+pub fn MemLog::append(Self, Bytes) -> Int64 raise @io.IoError
+pub fn MemLog::close(Self) -> Unit
+pub fn MemLog::flush(Self) -> Unit raise @io.IoError
+pub fn MemLog::is_closed(Self) -> Bool
+pub fn MemLog::length(Self) -> Int64
+pub fn MemLog::new() -> Self
+pub fn MemLog::read_at(Self, Int64, Int32) -> Bytes raise @io.IoError
+pub impl @io.LogReader for MemLog
+pub impl @io.LogWriter for MemLog
+
+// Type aliases
+
+// Traits

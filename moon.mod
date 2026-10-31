@@ -1,0 +1,13 @@
+name = "moonlog/lsdb"
+
+version = "0.1.0"
+
+readme = "README.md"
+
+license = "Apache-2.0"
+
+preferred_target = "wasm"
+
+keywords = [ "database", "log", "append-only", "storage", "event-log" ]
+
+description = "Append-only event log database built in MoonBit"

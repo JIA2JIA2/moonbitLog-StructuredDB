@@ -1,0 +1,35 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonlog/lsdb/src/core"
+
+import {
+  "moonbitlang/core/debug",
+}
+
+// Values
+pub fn crc32(Bytes) -> UInt32
+
+pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
+
+pub fn slice(Bytes, Int32, Int32) -> Bytes
+
+// Errors
+pub(all) suberror DecodeError {
+  Truncated(Int32)
+  BadCrc(UInt32, UInt32)
+}
+
+// Types and methods
+pub(all) struct Record {
+  offset : UInt64
+  timestamp : Int64
+  key : Bytes
+  value : Bytes
+} derive(Eq, @debug.Debug)
+pub fn Record::encode(Self) -> Bytes
+pub fn Record::equal(Self, Self) -> Bool
+pub fn Record::not_equal(Self, Self) -> Bool
+pub fn Record::to_repr(Self) -> @debug.Repr
+
+// Type aliases
+
+// Traits
