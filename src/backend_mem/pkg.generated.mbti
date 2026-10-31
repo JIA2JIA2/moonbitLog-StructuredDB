@@ -21,7 +21,9 @@ pub fn MemLog::is_closed(Self) -> Bool
 pub fn MemLog::length(Self) -> Int64
 pub fn MemLog::new() -> Self
 pub fn MemLog::read_at(Self, Int64, Int32) -> Bytes raise @io.IoError
+pub fn MemLog::truncate(Self, Int64) -> Unit raise @io.IoError
 pub impl @io.LogReader for MemLog
+pub impl @io.LogTruncate for MemLog
 pub impl @io.LogWriter for MemLog
 
 // Type aliases

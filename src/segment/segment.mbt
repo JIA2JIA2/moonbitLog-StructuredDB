@@ -7,7 +7,7 @@
 /// point lookups and range scans can seek near their target instead of
 /// decoding the whole segment.
 pub(all) struct Segment[W, R] {
-  base_offset : UInt64
+  mut base_offset : UInt64
   writer : W
   reader : R
   mut next_offset : UInt64
@@ -102,7 +102,8 @@ pub fn[W, R : @io.LogReader] Segment::read_raw(
 /// Decode the single record that starts at `pos`, returning it together with
 /// the position just after it. Only the 4-byte length prefix is read first, so
 /// callers can walk records without materialising the whole segment. Returns
-/// `None` when `pos` is at (or a truncated tail remains before) the end.
+/// `None` when `pos` is at (or a truncated / corrupted tail begins before) the
+/// end of the readable bytes.
 fn[W, R : @io.LogReader] Segment::load_record_at(
   self : Segment[W, R],
   pos : Int64,
@@ -112,17 +113,13 @@ fn[W, R : @io.LogReader] Segment::load_record_at(
     return None
   }
   let head = self.reader.read_at(pos, 4)
-  let body_len = @core.body_len_at(head, 0) catch {
-    _ => raise @io.IoError::Corrupt(pos)
-  }
+  let body_len = @core.body_len_at(head, 0) catch { _ => return None }
   let full_len = (4 : Int64) + body_len.to_int64() + (4 : Int64)
   if pos + full_len > total {
     return None
   }
   let data = self.reader.read_at(pos, full_len.to_int())
-  let (rec, next) = @core.decode_record(data, 0) catch {
-    _ => raise @io.IoError::Corrupt(pos)
-  }
+  let (rec, next) = @core.decode_record(data, 0) catch { _ => return None }
   Some((rec, pos + next.to_int64()))
 }
 
@@ -252,6 +249,56 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self.record_count = n
   self.size = total
   self.next_offset = self.base_offset + n.to_uint64()
+  n
+}
+
+///|
+/// Crash recovery for a single segment: walk the bytes from the start,
+/// counting records that decode cleanly with a valid CRC. The first truncated
+/// or corrupt record ends the walk (a crash only ever leaves a torn tail), and
+/// the segment is truncated back to the last good boundary. `base_offset` is
+/// corrected from the first record encountered so the caller need not parse it
+/// out of the file name. Returns the number of recovered records.
+pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
+  self : Segment[W, R],
+) -> Int32 raise @io.IoError {
+  self.index.reset()
+  let total = self.reader.length()
+  let mut pos : Int64 = 0
+  let mut n : Int32 = 0
+  let mut first : UInt64 = self.base_offset
+  let mut last : UInt64 = self.base_offset
+  let mut any = false
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) => {
+        if !any {
+          first = rec.offset
+          any = true
+        }
+        last = rec.offset
+        if self.index.should_index(n) {
+          self.index.push(n.to_uint64(), pos)
+        }
+        n = n + 1
+        pos = next
+      }
+    }
+  }
+  if pos < total {
+    self.writer.truncate(pos)
+  }
+  if any {
+    self.base_offset = first
+    self.next_offset = last + (1 : UInt64)
+  } else {
+    self.next_offset = self.base_offset
+  }
+  self.record_count = n
+  self.size = pos
   n
 }
 

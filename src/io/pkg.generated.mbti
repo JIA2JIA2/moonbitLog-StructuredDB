@@ -21,6 +21,10 @@ pub(open) trait LogReader {
   fn length(Self) -> Int64
 }
 
+pub(open) trait LogTruncate {
+  fn truncate(Self, Int64) -> Unit raise IoError
+}
+
 pub(open) trait LogWriter {
   fn append(Self, Bytes) -> Int64 raise IoError
   fn flush(Self) -> Unit raise IoError

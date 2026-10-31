@@ -18,7 +18,7 @@ pub(all) struct IndexEntry {
 }
 
 pub(all) struct Segment[W, R] {
-  base_offset : UInt64
+  mut base_offset : UInt64
   writer : W
   reader : R
   mut next_offset : UInt64
@@ -35,6 +35,7 @@ pub fn[W, R] Segment::new(W, R, UInt64) -> Self[W, R]
 pub fn[W, R] Segment::new_with_index_interval(W, R, UInt64, Int32) -> Self[W, R]
 pub fn[W, R : @io.LogReader] Segment::read_raw(Self[W, R], Int64, Int32) -> Bytes raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::rebuild_index(Self[W, R]) -> Int32 raise @io.IoError
+pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(Self[W, R]) -> Int32 raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
 

@@ -20,6 +20,22 @@ pub fn[W, R] Log::new(roll_size : Int64, make : MakeSegment[W, R]) -> Log[W, R] 
 }
 
 ///|
+/// Assemble a log from already-opened, already-recovered segments in
+/// increasing `base_offset` order. The next offset continues from the last
+/// segment so that subsequent appends remain contiguous.
+pub fn[W, R] Log::recover(
+  roll_size : Int64,
+  make : MakeSegment[W, R],
+  segments : Array[@segment.Segment[W, R]],
+) -> Log[W, R] {
+  let mut next : UInt64 = (0 : UInt64)
+  if segments.length() > 0 {
+    next = segments[segments.length() - 1].next_offset
+  }
+  { segments, roll_size, next_offset: next, make, }
+}
+
+///|
 /// Number of segments currently held by this log.
 pub fn[W, R] Log::segment_count(self : Log[W, R]) -> Int32 {
   self.segments.length()

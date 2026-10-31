@@ -1,4 +1,5 @@
 import {
   "moonlog/lsdb/src/io",
+  "moonlog/lsdb/src/core",
   "moonbitlang/core/buffer",
 }

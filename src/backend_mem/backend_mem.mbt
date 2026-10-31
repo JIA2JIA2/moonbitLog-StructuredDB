@@ -59,7 +59,22 @@ pub impl @io.LogReader for MemLog with fn length(self) {
 }
 
 ///|
+pub impl @io.LogTruncate for MemLog with fn truncate(self, size) {
+  if self.closed {
+    raise @io.IoError::Closed
+  }
+  let total = self.data.length().to_int64()
+  if size < (0 : Int64) || size > total {
+    raise @io.IoError::OutOfBounds(size)
+  }
+  self.data = @core.slice(self.data, 0, size.to_int())
+}
+
+///|
 pub extend MemLog with @io.LogWriter::{append, flush}
 
 ///|
 pub extend MemLog with @io.LogReader::{read_at, length}
+
+///|
+pub extend MemLog with @io.LogTruncate::{truncate}

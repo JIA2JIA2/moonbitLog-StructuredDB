@@ -182,3 +182,47 @@ test "rebuild_index restores an index from persisted bytes" {
     None => panic()
   }
 }
+
+///|
+test "recover truncates a short torn tail" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  ignore(seg.append(b"k", b"v0", (0 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"k", b"v1", (1 : Int64)) catch { _ => panic() })
+  let good = seg.byte_size()
+  ignore(store.append(b"ab") catch { _ => panic() })
+  assert_true(store.length() > good)
+  let n = seg.recover() catch { _ => panic() }
+  assert_eq(n, 2)
+  assert_eq(seg.count(), 2)
+  assert_eq(seg.byte_size(), good)
+  assert_eq(store.length(), good)
+  let recs = seg.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 2)
+}
+
+///|
+test "recover truncates a tail whose declared length overruns the file" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  ignore(seg.append(b"k", b"v0", (0 : Int64)) catch { _ => panic() })
+  let good = seg.byte_size()
+  ignore(store.append(b"junk") catch { _ => panic() })
+  let n = seg.recover() catch { _ => panic() }
+  assert_eq(n, 1)
+  assert_eq(seg.byte_size(), good)
+  assert_eq(store.length(), good)
+  let hit = seg.get((0 : UInt64)) catch { _ => panic() }
+  match hit {
+    Some(rec) => assert_eq(rec.value, b"v0")
+    None => panic()
+  }
+}

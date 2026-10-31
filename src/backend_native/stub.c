@@ -9,10 +9,12 @@
 #include <moonbit.h>
 
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 static char *moonlog_c_path(moonbit_bytes_t path) {
@@ -130,4 +132,56 @@ int32_t moonlog_exists(moonbit_bytes_t path) {
   int r = access(p, F_OK) == 0 ? 1 : 0;
   free(p);
   return r;
+}
+
+/*
+ * Crash-recovery helpers.
+ */
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_truncate(int32_t fd, int64_t size) {
+  return (int32_t)ftruncate(fd, (off_t)size);
+}
+
+MOONBIT_FFI_EXPORT
+int64_t moonlog_opendir(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  DIR *d = opendir(p);
+  free(p);
+  if (d == NULL) {
+    return -1;
+  }
+  return (int64_t)(intptr_t)d;
+}
+
+MOONBIT_FFI_EXPORT
+moonbit_bytes_t moonlog_readdir(int64_t handle) {
+  DIR *d = (DIR *)handle;
+  if (d == NULL) {
+    return moonbit_make_bytes_raw(0);
+  }
+  struct dirent *ent;
+  while ((ent = readdir(d)) != NULL) {
+    const char *name = ent->d_name;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+      continue;
+    }
+    size_t len = strlen(name);
+    moonbit_bytes_t out = moonbit_make_bytes_raw((int32_t)len);
+    memcpy(out, name, len);
+    return out;
+  }
+  return moonbit_make_bytes_raw(0);
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_closedir(int64_t handle) {
+  DIR *d = (DIR *)handle;
+  if (d == NULL) {
+    return 0;
+  }
+  return (int32_t)closedir(d);
 }

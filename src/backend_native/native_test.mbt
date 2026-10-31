@@ -84,3 +84,84 @@ test "native log rolls into separate files and scans back" {
     None => panic()
   }
 }
+
+///|
+fn clean_dir(dir : String) -> Unit {
+  let names = @backend_native.list_dir(dir) catch { _ => return }
+  for name in names {
+    if name.has_suffix(".log") {
+      ignore(@backend_native.remove_file(dir + "/" + name))
+    }
+  }
+}
+
+///|
+test "native recover_log_dir ignores a torn tail and keeps appending" {
+  let dir = "/tmp/moonlog_recover_tail"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  })
+  ignore(log.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"b", (1 : Int64)) catch { _ => panic() })
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let f = @backend_native.NativeFileLog::open(path) catch { _ => panic() }
+  ignore(f.append(b"junk") catch { _ => panic() })
+  f.close()
+  let rlog = @backend_native.recover_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), 2)
+  let recs = rlog.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 2)
+  assert_eq(recs[1].value, b"b")
+  let o = rlog.append(b"k", b"c", (2 : Int64)) catch { _ => panic() }
+  assert_eq(o, (2 : UInt64))
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+test "native recover_log_dir rebuilds every rolled segment" {
+  let dir = "/tmp/moonlog_recover_multi"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((100 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let before = log.segment_count()
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let rlog = @backend_native.recover_log_dir(dir, (100 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), 8)
+  assert_eq(rlog.segment_count(), before)
+  let recs = rlog.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 8)
+  assert_eq(recs[0].offset, (0 : UInt64))
+  assert_eq(recs[7].offset, (7 : UInt64))
+  let o = rlog.append(b"k", b"v", (8 : Int64)) catch { _ => panic() }
+  assert_eq(o, (8 : UInt64))
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
