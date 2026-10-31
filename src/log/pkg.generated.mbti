@@ -47,6 +47,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(Self[W, R], on_drop~ :
 pub fn[W, R] Log::count(Self[W, R]) -> Int32
 pub fn[W : @io.LogWriter, R] Log::delete(Self[W, R], Bytes, Int64) -> UInt64 raise @io.IoError
 pub fn[W, R] Log::drop_before(Self[W, R], UInt64, (@segment.Segment[W, R]) -> Unit) -> Int32
+pub fn[W : @io.LogWriter, R] Log::flush(Self[W, R]) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest(Self[W, R], KeyIndex, Bytes) -> @core.Record? raise @io.IoError
@@ -73,6 +74,7 @@ pub fn Manifest::encode(Self) -> Bytes
 pub(all) enum SyncPolicy {
   Never
   Always
+  Batch
 } derive(Eq)
 pub fn SyncPolicy::equal(Self, Self) -> Bool
 pub fn SyncPolicy::not_equal(Self, Self) -> Bool

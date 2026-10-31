@@ -510,3 +510,98 @@ test "verify on an empty log is healthy" {
     None => ()
   }
 }
+
+///|
+/// A writer that forwards bytes to an in-memory log but counts flush (fsync)
+/// calls, letting tests observe the SyncPolicy behaviour.
+struct FlushSpy {
+  mem : @backend_mem.MemLog
+  counter : FlushCounter
+}
+
+///|
+struct FlushCounter {
+  mut n : Int32
+}
+
+///|
+impl @io.LogWriter for FlushSpy with fn append(self, chunk) {
+  self.mem.append(chunk)
+}
+
+///|
+impl @io.LogWriter for FlushSpy with fn flush(self) {
+  self.counter.n = self.counter.n + 1
+}
+
+///|
+impl @io.LogReader for FlushSpy with fn read_at(self, offset, len) {
+  self.mem.read_at(offset, len)
+}
+
+///|
+impl @io.LogReader for FlushSpy with fn length(self) {
+  self.mem.length()
+}
+
+///|
+fn spy_segment(
+  counter : FlushCounter,
+  base : UInt64,
+) -> @segment.Segment[FlushSpy, FlushSpy] {
+  let spy = { mem: @backend_mem.MemLog::new(), counter, }
+  @segment.Segment::new(spy, spy, base)
+}
+
+///|
+test "sync policy Batch defers fsync to batch end or explicit flush" {
+  // Always: one fsync per appended record.
+  let always_counter : FlushCounter = { n: 0, }
+  let always_log : @log.Log[FlushSpy, FlushSpy] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => spy_segment(always_counter, base),
+    sync=@log.SyncPolicy::Always,
+  )
+  ignore(always_log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(always_log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  assert_eq(always_counter.n, 2)
+
+  // Batch: individual appends do not flush; the batch tail flushes once.
+  let batch_counter : FlushCounter = { n: 0, }
+  let batch_log : @log.Log[FlushSpy, FlushSpy] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => spy_segment(batch_counter, base),
+    sync=@log.SyncPolicy::Batch,
+  )
+  ignore(batch_log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  assert_eq(batch_counter.n, 0)
+  let batch : Array[(Bytes, Bytes, Int64)] = [
+    (b"b", b"2", (1 : Int64)),
+    (b"c", b"3", (2 : Int64)),
+  ]
+  ignore(batch_log.append_batch(batch) catch { _ => panic() })
+  assert_eq(batch_counter.n, 1)
+  batch_log.flush() catch {
+    _ => panic()
+  }
+  assert_eq(batch_counter.n, 2)
+
+  // Never: nothing flushes unless the caller asks.
+  let never_counter : FlushCounter = { n: 0, }
+  let never_log : @log.Log[FlushSpy, FlushSpy] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => spy_segment(never_counter, base),
+    sync=@log.SyncPolicy::Never,
+  )
+  ignore(never_log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(never_log.append_batch(batch) catch { _ => panic() })
+  assert_eq(never_counter.n, 0)
+  never_log.flush() catch {
+    _ => panic()
+  }
+  assert_eq(never_counter.n, 1)
+
+  // Reading the batch log exercises the LogReader side of FlushSpy.
+  let recs = batch_log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+}

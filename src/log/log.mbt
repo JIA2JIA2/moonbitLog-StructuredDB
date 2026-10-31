@@ -4,10 +4,12 @@ pub type MakeSegment[W, R] = (UInt64) -> @segment.Segment[W, R] raise @io.IoErro
 
 ///|
 /// Durability policy for appends: `Never` leaves flushing to the caller,
-/// `Always` fsyncs after every appended record.
+/// `Always` fsyncs after every appended record, and `Batch` defers fsync to
+/// the end of `append_batch` or an explicit `Log::flush`.
 pub(all) enum SyncPolicy {
   Never
   Always
+  Batch
 } derive(Eq)
 
 ///|
@@ -104,10 +106,22 @@ pub fn[W : @io.LogWriter, R] Log::append(
 }
 
 ///|
+/// fsync the active segment's writer, making every prior append durable. A
+/// no-op when there is no active segment.
+pub fn[W : @io.LogWriter, R] Log::flush(
+  self : Log[W, R],
+) -> Unit raise @io.IoError {
+  if self.segments.length() > 0 {
+    self.segments[self.segments.length() - 1].writer.flush()
+  }
+}
+
+///|
 /// Append several records in one call, returning their assigned offsets in the
 /// same order. Records are appended independently (each may roll the active
 /// segment), so a mid-batch IO failure leaves the successful prefix durable
-/// rather than nothing at all.
+/// rather than nothing at all. Under `SyncPolicy::Batch` a single fsync is
+/// issued once at the end of the batch.
 pub fn[W : @io.LogWriter, R] Log::append_batch(
   self : Log[W, R],
   records : Array[(Bytes, Bytes, Int64)],
@@ -116,6 +130,9 @@ pub fn[W : @io.LogWriter, R] Log::append_batch(
   for rec in records {
     let (key, value, timestamp) = rec
     offsets.push(self.append(key, value, timestamp))
+  }
+  if self.sync is SyncPolicy::Batch {
+    self.flush()
   }
   offsets
 }

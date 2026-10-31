@@ -86,7 +86,7 @@ $EXE scan /tmp/log
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `get_latest` / `snapshot` / `compact` | `log` | KV 逻辑视图 / 折叠 live 记录 / 原地重写 |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
-| `SyncPolicy` | `log` | `Never` / `Always` 持久化策略 |
+| `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
 | `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
@@ -174,6 +174,7 @@ u32 crc32          (仅覆盖 body)
 - M19 完整性校验 `Log::verify` 与 CLI `fsck`
 - M20 命名消费者游标（`cursor-save` / `cursor-load`）
 - M21 元数据原子写（tmp + fsync + rename + fsync 目录）
+- M22 组提交：`SyncPolicy::Batch` 与 `Log::flush`（批量写只 fsync 一次）
 
 ## 许可
 

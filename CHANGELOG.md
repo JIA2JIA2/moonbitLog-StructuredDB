@@ -27,6 +27,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Atomic metadata (M21)**：the manifest and per-segment indexes are replaced
   atomically (write temp → fsync → rename → fsync directory), so a crash can
   never leave a half-written metadata file.
+- **Group commit (M22)**：`SyncPolicy::Batch` defers fsync to the end of
+  `append_batch`, and `Log::flush` exposes an explicit fsync point.
 
 ## 0.1.0 - 2026-10-31
 

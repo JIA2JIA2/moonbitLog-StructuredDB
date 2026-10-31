@@ -10,5 +10,6 @@ import {
 import {
   "moonlog/lsdb/src/backend_mem",
   "moonlog/lsdb/src/core",
+  "moonlog/lsdb/src/io",
   "moonbitlang/core/bench",
 } for "test"
