@@ -295,3 +295,55 @@ test "log for_each aggregates across segments" {
     i = i + 1
   }
 }
+
+///|
+test "key index tracks latest puts and honours tombstones" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"b", (3 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"4", (4 : Int64)) catch { _ => panic() })
+  let idx = log.build_key_index() catch { _ => panic() }
+  assert_eq(idx.size(), 2)
+  let a = log.get_latest(idx, b"a") catch { _ => panic() }
+  match a {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+  let b = log.get_latest(idx, b"b") catch { _ => panic() }
+  match b {
+    Some(_) => panic()
+    None => ()
+  }
+  let c = log.get_latest(idx, b"c") catch { _ => panic() }
+  match c {
+    Some(rec) => assert_eq(rec.value, b"4")
+    None => panic()
+  }
+}
+
+///|
+test "snapshot folds to latest puts with renumbered offsets" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"b", (3 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"4", (4 : Int64)) catch { _ => panic() })
+  let snap = log.snapshot() catch { _ => panic() }
+  assert_eq(snap.length(), 2)
+  assert_eq(snap[0].offset, (0 : UInt64))
+  assert_eq(snap[0].key, b"a")
+  assert_eq(snap[0].value, b"2")
+  assert_true(!snap[0].is_delete())
+  assert_eq(snap[1].offset, (1 : UInt64))
+  assert_eq(snap[1].key, b"c")
+  assert_eq(snap[1].value, b"4")
+}

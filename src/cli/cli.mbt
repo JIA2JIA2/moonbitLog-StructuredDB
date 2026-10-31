@@ -20,7 +20,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|delete|get|scan|recover|prune|cursor|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|cursor|compact|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -161,6 +161,41 @@ fn cmd_cursor(dir : String, start : String, limit : String) -> Unit raise @io.Io
 }
 
 ///|
+fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
+  let log = open_log(dir)
+  let index = log.build_key_index()
+  match log.get_latest(index, @utf8.encode(key)) {
+    Some(rec) => print_record(rec)
+    None => println("not found")
+  }
+  close_log(log)
+}
+
+///|
+/// Rewrite the directory with only the live keys (latest puts), dropping
+/// tombstones and superseded history, then refresh the manifest.
+fn cmd_compact(dir : String) -> Unit raise @io.IoError {
+  let log = open_log(dir)
+  let snap = log.snapshot()
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let names = @backend_native.list_dir(dir)
+  for name in names {
+    ignore(@backend_native.remove_file(dir + "/" + name))
+  }
+  let fresh : CliLog = @log.Log::new(ROLL_SIZE, base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  })
+  for rec in snap {
+    ignore(fresh.append(rec.key, rec.value, rec.timestamp) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, fresh)
+  println("compacted " + snap.length().to_string() + " records")
+  close_log(fresh)
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -203,6 +238,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       cmd_cursor(args[2], args[3], args[4])
     }
+  } else if cmd == "getkey" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_getkey(args[2], args[3])
+    }
+  } else if cmd == "compact" {
+    cmd_compact(args[2])
   } else {
     println(USAGE)
   }
