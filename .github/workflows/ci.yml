@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,11 +17,20 @@ jobs:
       - name: Show toolchain version
         run: moon version
 
+      - name: Check formatting
+        run: moon fmt --check
+
+      - name: Type-check (wasm)
+        run: moon check --target wasm
+
       - name: Type-check (native)
         run: moon check --target native
 
-      - name: Build native (includes CLI)
+      - name: Build native (CLI and examples)
         run: moon build --target native
+
+      - name: Build wasm (browser demo)
+        run: moon build --target wasm
 
       - name: Test (wasm)
         run: moon test
@@ -31,3 +40,19 @@ jobs:
 
       - name: Benchmark (native)
         run: moon bench --target native
+
+      - name: CLI smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXE=_build/native/debug/build/src/cli/cli.exe
+          D=$(mktemp -d)
+          "$EXE" put "$D" user:1 alice
+          "$EXE" put-batch "$D" user:2 bob user:3 carol
+          "$EXE" getkey "$D" user:1
+          "$EXE" cursor-save "$D" consumer-a 2
+          "$EXE" cursor-load "$D" consumer-a
+          "$EXE" fsck "$D"
+          "$EXE" compact "$D"
+          "$EXE" fsck "$D"
+          "$EXE" recover "$D"
