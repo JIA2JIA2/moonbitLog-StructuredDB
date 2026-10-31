@@ -47,11 +47,13 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(Self[W, R], on_drop~ :
 pub fn[W, R] Log::count(Self[W, R]) -> Int32
 pub fn[W : @io.LogWriter, R] Log::delete(Self[W, R], Bytes, Int64) -> UInt64 raise @io.IoError
 pub fn[W, R] Log::drop_before(Self[W, R], UInt64, (@segment.Segment[W, R]) -> Unit) -> Int32
+pub fn[W, R : @io.LogReader] Log::export_bytes(Self[W, R]) -> Bytes raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::flush(Self[W, R]) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest(Self[W, R], KeyIndex, Bytes) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest_at(Self[W, R], KeyIndex, Bytes, Int64, Int64) -> @core.Record? raise @io.IoError
+pub fn[W : @io.LogWriter, R] Log::import_bytes(Self[W, R], Bytes) -> Int32 raise @io.IoError
 pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64
 pub fn[W, R] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]], sync? : SyncPolicy) -> Self[W, R]

@@ -400,3 +400,39 @@ pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
     },
   }
 }
+
+///|
+/// Serialize every record (including tombstones) as a stream of self-checking
+/// record frames. The result can be persisted and later replayed with
+/// `import_bytes` into another log directory.
+pub fn[W, R : @io.LogReader] Log::export_bytes(
+  self : Log[W, R],
+) -> Bytes raise @io.IoError {
+  let buf = @buffer.Buffer::Buffer()
+  self.for_each((0 : UInt64), self.next_offset, rec => {
+    buf.write_bytes(rec.encode())
+  })
+  buf.to_bytes()
+}
+
+///|
+/// Replay a record stream produced by `export_bytes`, appending each record
+/// (put or tombstone) in order. Returns the number of records imported. A
+/// truncated or corrupt frame aborts with `IoError::Corrupt`.
+pub fn[W : @io.LogWriter, R] Log::import_bytes(
+  self : Log[W, R],
+  data : Bytes,
+) -> Int32 raise @io.IoError {
+  let total = data.length()
+  let mut pos : Int32 = 0
+  let mut n : Int32 = 0
+  while pos < total {
+    let (rec, next) = @core.decode_record(data, pos) catch {
+      _ => raise @io.IoError::Corrupt(pos.to_int64())
+    }
+    ignore(self.append(rec.key, rec.value, rec.timestamp, kind=rec.kind))
+    pos = next
+    n = n + 1
+  }
+  n
+}

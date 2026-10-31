@@ -37,6 +37,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   commands.
 - **Named cursor management (M27)**：`list_named_cursors` /
   `remove_named_cursor` and the `cursor-list` / `cursor-drop` CLI commands.
+- **Export / import (M28)**：`Log::export_bytes` / `Log::import_bytes` and the
+  `export` / `import` CLI commands move records (including tombstones) between
+  directories as a self-checking frame stream.
 
 ## 0.1.0 - 2026-10-31
 

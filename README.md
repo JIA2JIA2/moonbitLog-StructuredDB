@@ -65,6 +65,8 @@ moonlog <command> <dir> [args...]
   cursor-drop <dir> <name>      删除命名消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
+  export <dir> <file>           导出全部记录（含 tombstone）到可移植文件
+  import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   fsck <dir>                    校验记录/offset 完整性
   stats <dir>                   打印记录/段计数
@@ -89,6 +91,7 @@ $EXE scan /tmp/log
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `get_latest` / `get_latest_at` / `scan_live` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / 折叠 live 记录 / 原地重写 |
+| `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
@@ -183,6 +186,7 @@ u32 crc32          (仅覆盖 body)
 - M23 创建/删除加固：新建段与删除段后 fsync 目录，游标原子写
 - M26 记录级 TTL：`Log::get_latest_at` / `Log::scan_live` 与 CLI `getkey-live` / `prune-expired`
 - M27 命名游标管理：`list_named_cursors` / `remove_named_cursor` 与 CLI `cursor-list` / `cursor-drop`
+- M28 导出/导入：`Log::export_bytes` / `Log::import_bytes` 与 CLI `export` / `import`
 
 ## 许可
 

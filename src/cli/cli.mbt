@@ -24,6 +24,8 @@
 ///   cursor-drop <dir> <name>         delete a named consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
+///   export <dir> <file>              write all records to a portable file
+///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
 ///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir>                      print record/segment counts
@@ -39,7 +41,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|scan|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|scan|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -443,6 +445,32 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Export the whole directory (including tombstones) to a portable record
+/// stream file.
+fn cmd_export(dir : String, file : String) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let data = log.export_bytes()
+    @backend_native.write_file(file, data)
+    println("exported " + log.count().to_string() + " records")
+    close_log(log)
+  })
+}
+
+///|
+/// Import records from a file produced by `export` into a log directory.
+fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
+  run_locked(dir, true, () => {
+    let data = @backend_native.read_file(file)
+    let log = open_log(dir)
+    let n = log.import_bytes(data)
+    @backend_native.flush_meta(dir, log)
+    println("imported " + n.to_string() + " records")
+    close_log(log)
+  })
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -554,6 +582,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_cursor_drop(args[2], args[3])
+    }
+  } else if cmd == "export" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_export(args[2], args[3])
+    }
+  } else if cmd == "import" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_import(args[2], args[3])
     }
   } else {
     println(USAGE)

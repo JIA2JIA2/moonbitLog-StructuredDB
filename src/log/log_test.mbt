@@ -637,3 +637,40 @@ test "get_latest_at honours ttl while scan_live filters expired keys" {
   assert_eq(live.length(), 1)
   assert_eq(live[0].key, b"b")
 }
+
+///|
+test "export/import round-trips the record stream" {
+  let src : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(src.append(b"a", b"1", (1_000 : Int64)) catch { _ => panic() })
+  ignore(src.append(b"b", b"2", (2_000 : Int64)) catch { _ => panic() })
+  ignore(src.delete(b"a", (3_000 : Int64)) catch { _ => panic() })
+  let blob = src.export_bytes() catch { _ => panic() }
+
+  let dst : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  let n = dst.import_bytes(blob) catch { _ => panic() }
+  assert_eq(n, 3)
+  assert_eq(dst.count(), 3)
+  let src_recs = src.scan() catch { _ => panic() }
+  let dst_recs = dst.scan() catch { _ => panic() }
+  assert_eq(src_recs.length(), dst_recs.length())
+  for i = 0; i < src_recs.length(); i = i + 1 {
+    assert_eq(src_recs[i].offset, dst_recs[i].offset)
+    assert_eq(src_recs[i].timestamp, dst_recs[i].timestamp)
+    assert_eq(src_recs[i].key, dst_recs[i].key)
+    assert_eq(src_recs[i].value, dst_recs[i].value)
+    assert_eq(src_recs[i].kind, dst_recs[i].kind)
+  }
+  // The imported tombstone still hides the key.
+  let idx = dst.build_key_index() catch { _ => panic() }
+  let gone = dst.get_latest(idx, b"a") catch { _ => panic() }
+  match gone {
+    Some(_) => panic()
+    None => ()
+  }
+}
