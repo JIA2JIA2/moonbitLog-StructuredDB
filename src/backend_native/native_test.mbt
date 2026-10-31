@@ -165,3 +165,21 @@ test "native recover_log_dir rebuilds every rolled segment" {
   }
   clean_dir(dir)
 }
+
+///|
+test "recover_log_dir on an empty directory yields an empty log" {
+  let dir = "/tmp/moonlog_recover_empty"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log = @backend_native.recover_log_dir(dir, (100 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(log.count(), 0)
+  assert_eq(log.segment_count(), 0)
+  let o = log.append(b"k", b"v", (0 : Int64)) catch { _ => panic() }
+  assert_eq(o, (0 : UInt64))
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

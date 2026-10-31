@@ -226,3 +226,38 @@ test "recover truncates a tail whose declared length overruns the file" {
     None => panic()
   }
 }
+
+///|
+test "sparse index interval normalises to at least one" {
+  assert_eq(@segment.SparseIndex::new((0 : Int32)).interval, 1)
+  assert_eq(@segment.SparseIndex::new((-4 : Int32)).interval, 1)
+  assert_eq(@segment.SparseIndex::new((8 : Int32)).interval, 8)
+}
+
+///|
+test "get honours segment offset boundaries" {
+  let seg = indexed_mem_segment((10 : UInt64), (4 : Int32))
+  for i = 0; i < 3; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let lo = seg.get((10 : UInt64)) catch { _ => panic() }
+  match lo {
+    Some(rec) => assert_eq(rec.offset.to_int(), 10)
+    None => panic()
+  }
+  let hi = seg.get((12 : UInt64)) catch { _ => panic() }
+  match hi {
+    Some(rec) => assert_eq(rec.offset.to_int(), 12)
+    None => panic()
+  }
+  let below = seg.get((9 : UInt64)) catch { _ => panic() }
+  match below {
+    Some(_) => panic()
+    None => ()
+  }
+  let above = seg.get((13 : UInt64)) catch { _ => panic() }
+  match above {
+    Some(_) => panic()
+    None => ()
+  }
+}

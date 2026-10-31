@@ -5,6 +5,7 @@ pub(all) suberror IoError {
   OutOfBounds(Int64)
   Corrupt(Int64)
   Syscall(Int32)
+  Invalid(String)
 }
 
 ///|

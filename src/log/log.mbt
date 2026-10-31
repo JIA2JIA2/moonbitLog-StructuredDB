@@ -205,7 +205,8 @@ pub fn[W, R] Log::retain_last(
   on_drop : (@segment.Segment[W, R]) -> Unit,
 ) -> Int32 {
   let n = self.segments.length()
-  let drop_count = if n > keep { n - keep } else { 0 }
+  let effective = if keep < 1 { 1 } else { keep }
+  let drop_count = if n > effective { n - effective } else { 0 }
   let kept : Array[@segment.Segment[W, R]] = []
   let mut dropped = 0
   for i = 0; i < n; i = i + 1 {

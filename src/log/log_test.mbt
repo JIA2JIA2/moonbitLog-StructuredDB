@@ -194,3 +194,51 @@ test "consumer cursor polls in batches and advances" {
   assert_eq(b4.length(), 0)
   assert_eq(cur.position(), (7 : UInt64))
 }
+
+///|
+test "retain_last with zero keeps the active segment" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 10; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let before = log.segment_count()
+  assert_true(before >= 2)
+  let dropped = log.retain_last(0, _seg => ())
+  assert_eq(dropped, before - 1)
+  assert_eq(log.segment_count(), 1)
+}
+
+///|
+test "cursor poll with non-positive limit returns nothing" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 5; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let cur = @log.ConsumerCursor::new((0 : UInt64))
+  let z = cur.poll(log, 0) catch { _ => panic() }
+  assert_eq(z.length(), 0)
+  let n = cur.poll(log, -2) catch { _ => panic() }
+  assert_eq(n.length(), 0)
+  assert_eq(cur.position(), (0 : UInt64))
+}
+
+///|
+test "empty log get and scan_range return nothing" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1024 : Int64),
+    base => mem_segment(base),
+  )
+  let g = log.get((0 : UInt64)) catch { _ => panic() }
+  match g {
+    Some(_) => panic()
+    None => ()
+  }
+  let recs = log.scan_range((0 : UInt64), (10 : UInt64)) catch { _ => panic() }
+  assert_eq(recs.length(), 0)
+}

@@ -34,12 +34,16 @@ fn bytes_to_string(b : Bytes) -> String {
 
 ///|
 fn parse_offset(s : String) -> UInt64 raise @io.IoError {
-  @string.parse_uint64(s) catch { _ => raise @io.IoError::Syscall(-1) }
+  @string.parse_uint64(s) catch {
+    _ => raise @io.IoError::Invalid("invalid offset: " + s)
+  }
 }
 
 ///|
 fn parse_count(s : String) -> Int32 raise @io.IoError {
-  @string.parse_int(s) catch { _ => raise @io.IoError::Syscall(-1) }
+  @string.parse_int(s) catch {
+    _ => raise @io.IoError::Invalid("invalid number: " + s)
+  }
 }
 
 ///|
@@ -212,5 +216,6 @@ fn main {
     @io.IoError::OutOfBounds(o) => println("error: out of bounds " + o.to_string())
     @io.IoError::Corrupt(o) => println("error: corrupt at " + o.to_string())
     @io.IoError::Syscall(c) => println("error: syscall " + c.to_string())
+    @io.IoError::Invalid(m) => println("error: " + m)
   }
 }
