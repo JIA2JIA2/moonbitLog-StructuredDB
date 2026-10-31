@@ -62,12 +62,13 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   key : Bytes,
   value : Bytes,
   timestamp : Int64,
+  kind~ : @core.RecordKind = @core.RecordKind::Put,
 ) -> UInt64 raise @io.IoError {
   let offset = self.next_offset
   if self.index.should_index(self.record_count) {
     self.index.push(self.record_count.to_uint64(), self.size)
   }
-  let rec : @core.Record = { offset, timestamp, key, value, }
+  let rec : @core.Record = { offset, timestamp, kind, key, value, }
   let bytes = rec.encode()
   ignore(self.writer.append(bytes))
   self.next_offset = offset + (1 : UInt64)

@@ -26,7 +26,7 @@ pub(all) struct Segment[W, R] {
   mut size : Int64
   mut index : SparseIndex
 }
-pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64) -> UInt64 raise @io.IoError
+pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError

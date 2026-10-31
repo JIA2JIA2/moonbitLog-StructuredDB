@@ -113,3 +113,84 @@ test "log get binary-searches the owning segment" {
     None => ()
   }
 }
+
+///|
+test "delete appends tombstones without rewriting history" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"k", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"v2", (2 : Int64)) catch { _ => panic() })
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+  assert_true(!recs[0].is_delete())
+  assert_true(recs[1].is_delete())
+  assert_eq(recs[1].value.length(), 0)
+  assert_true(!recs[2].is_delete())
+}
+
+///|
+test "drop_before removes fully old segments and reports them" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 10; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let before = log.segment_count()
+  let last_base = log.segments[log.segments.length() - 1].base_offset
+  let dropped_bases : Array[UInt64] = []
+  let dropped = log.drop_before(last_base, seg => {
+    dropped_bases.push(seg.base_offset)
+  })
+  assert_eq(dropped, dropped_bases.length())
+  assert_true(dropped >= 1)
+  assert_eq(log.segment_count(), before - dropped)
+  let remaining = log.scan() catch { _ => panic() }
+  assert_eq(remaining.length(), 10 - last_base.to_int())
+}
+
+///|
+test "retain_last keeps only the newest segments" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 10; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let before = log.segment_count()
+  assert_true(before >= 2)
+  let dropped = log.retain_last(1, _seg => ())
+  assert_eq(dropped, before - 1)
+  assert_eq(log.segment_count(), 1)
+}
+
+///|
+test "consumer cursor polls in batches and advances" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 7; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let cur = @log.ConsumerCursor::new((0 : UInt64))
+  let b1 = cur.poll(log, 3) catch { _ => panic() }
+  assert_eq(b1.length(), 3)
+  assert_eq(cur.position(), (3 : UInt64))
+  let b2 = cur.poll(log, 3) catch { _ => panic() }
+  assert_eq(b2.length(), 3)
+  assert_eq(b2[0].offset.to_int(), 3)
+  assert_eq(cur.position(), (6 : UInt64))
+  let b3 = cur.poll(log, 3) catch { _ => panic() }
+  assert_eq(b3.length(), 1)
+  assert_eq(cur.position(), (7 : UInt64))
+  let b4 = cur.poll(log, 3) catch { _ => panic() }
+  assert_eq(b4.length(), 0)
+  assert_eq(cur.position(), (7 : UInt64))
+}

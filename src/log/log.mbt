@@ -65,6 +65,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
   key : Bytes,
   value : Bytes,
   timestamp : Int64,
+  kind~ : @core.RecordKind = @core.RecordKind::Put,
 ) -> UInt64 raise @io.IoError {
   let need_new = if self.segments.length() == 0 {
     true
@@ -77,7 +78,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
     self.segments.push(seg)
   }
   let active = self.segments[self.segments.length() - 1]
-  let offset = active.append(key, value, timestamp)
+  let offset = active.append(key, value, timestamp, kind=kind)
   self.next_offset = offset + (1 : UInt64)
   offset
 }
@@ -157,4 +158,64 @@ pub fn[W, R : @io.LogReader] Log::scan_range(
     }
   }
   out
+}
+
+///|
+/// Append a tombstone that marks `key` as deleted, without rewriting history.
+pub fn[W : @io.LogWriter, R] Log::delete(
+  self : Log[W, R],
+  key : Bytes,
+  timestamp : Int64,
+) -> UInt64 raise @io.IoError {
+  self.append(key, b"", timestamp, kind=@core.RecordKind::Delete)
+}
+
+///|
+/// Retention: drop every rolled-over segment that lies entirely before
+/// `offset`, invoking `on_drop` (e.g. to delete its backing file) for each.
+/// The active (last) segment is never dropped. Returns the number dropped.
+pub fn[W, R] Log::drop_before(
+  self : Log[W, R],
+  offset : UInt64,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 {
+  let keep : Array[@segment.Segment[W, R]] = []
+  let mut dropped = 0
+  let n = self.segments.length()
+  for i = 0; i < n; i = i + 1 {
+    let seg = self.segments[i]
+    let seg_end = seg.base_offset + seg.record_count.to_uint64()
+    if i < n - 1 && seg_end <= offset {
+      on_drop(seg)
+      dropped = dropped + 1
+    } else {
+      keep.push(seg)
+    }
+  }
+  self.segments = keep
+  dropped
+}
+
+///|
+/// Retention: keep only the newest `keep` segments, dropping older ones via
+/// `on_drop`. Returns the number dropped.
+pub fn[W, R] Log::retain_last(
+  self : Log[W, R],
+  keep : Int32,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 {
+  let n = self.segments.length()
+  let drop_count = if n > keep { n - keep } else { 0 }
+  let kept : Array[@segment.Segment[W, R]] = []
+  let mut dropped = 0
+  for i = 0; i < n; i = i + 1 {
+    if i < drop_count {
+      on_drop(self.segments[i])
+      dropped = dropped + 1
+    } else {
+      kept.push(self.segments[i])
+    }
+  }
+  self.segments = kept
+  dropped
 }

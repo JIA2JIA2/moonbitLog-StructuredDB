@@ -1,10 +1,26 @@
 ///|
+/// Kind of an append-only record. `Delete` is a tombstone: it marks a key as
+/// removed without rewriting or erasing the original data, preserving the
+/// append-only invariant.
+pub(all) enum RecordKind {
+  Put
+  Delete
+} derive(Eq, Debug)
+
+///|
+pub extend RecordKind with Eq::{equal, not_equal}
+
+///|
+pub extend RecordKind with @debug.Debug::{to_repr}
+
+///|
 /// A single append-only log record.
 ///
 /// On-disk layout (little endian):
 ///
 ///   u32 body_len          -- length of `body` in bytes
 ///   body:
+///     u8  flags           -- 0 = Put, 1 = Delete
 ///     u64 offset
 ///     i64 timestamp
 ///     u32 key_len
@@ -15,6 +31,7 @@
 pub(all) struct Record {
   offset : UInt64
   timestamp : Int64
+  kind : RecordKind
   key : Bytes
   value : Bytes
 } derive(Eq, Debug)
@@ -24,6 +41,12 @@ pub extend Record with Eq::{equal, not_equal}
 
 ///|
 pub extend Record with @debug.Debug::{to_repr}
+
+///|
+/// Whether this record is a tombstone (a key deletion marker).
+pub fn Record::is_delete(self : Record) -> Bool {
+  self.kind is RecordKind::Delete
+}
 
 ///|
 /// Errors raised while decoding a record from a byte buffer.
@@ -69,7 +92,12 @@ pub fn slice(data : Bytes, start : Int32, end : Int32) -> Bytes {
 ///|
 /// Encode a record into its append-only on-disk representation.
 pub fn Record::encode(self : Record) -> Bytes {
+  let flags : Byte = match self.kind {
+    RecordKind::Put => 0
+    RecordKind::Delete => 1
+  }
   let body = @buffer.Buffer::Buffer()
+  body.write_byte(flags)
   body.write_uint64_le(self.offset)
   body.write_int64_le(self.timestamp)
   body.write_uint_le(self.key.length().reinterpret_as_uint())
@@ -118,19 +146,28 @@ pub fn decode_record(
   if expected_crc != actual_crc {
     raise DecodeError::BadCrc(expected_crc, actual_crc)
   }
-  let offset = read_u64_le(data, body_start)
-  let timestamp = read_i64_le(data, body_start + 8)
-  let key_len = u32_as_int(read_u32_le(data, body_start + 16))
-  let value_len = u32_as_int(read_u32_le(data, body_start + 20))
-  if 24 + key_len + value_len > body_len {
+  if body_len < 25 {
     raise DecodeError::Truncated(pos)
   }
-  let key = slice(data, body_start + 24, body_start + 24 + key_len)
+  let flag = data.at(body_start)
+  let kind = if flag == 1 {
+    RecordKind::Delete
+  } else {
+    RecordKind::Put
+  }
+  let offset = read_u64_le(data, body_start + 1)
+  let timestamp = read_i64_le(data, body_start + 9)
+  let key_len = u32_as_int(read_u32_le(data, body_start + 17))
+  let value_len = u32_as_int(read_u32_le(data, body_start + 21))
+  if 25 + key_len + value_len > body_len {
+    raise DecodeError::Truncated(pos)
+  }
+  let key = slice(data, body_start + 25, body_start + 25 + key_len)
   let value = slice(
     data,
-    body_start + 24 + key_len,
-    body_start + 24 + key_len + value_len,
+    body_start + 25 + key_len,
+    body_start + 25 + key_len + value_len,
   )
-  let rec : Record = { offset, timestamp, key, value, }
+  let rec : Record = { offset, timestamp, kind, key, value, }
   (rec, body_end + 4)
 }
