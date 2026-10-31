@@ -1,0 +1,15 @@
+import {
+  "moonlog/lsdb/src/io",
+  "moonbitlang/core/encoding/utf8",
+}
+
+supported_targets = "-all+native"
+
+options(
+  "native-stub": [ "stub.c" ],
+)
+
+import {
+  "moonlog/lsdb/src/log",
+  "moonlog/lsdb/src/segment",
+} for "test"

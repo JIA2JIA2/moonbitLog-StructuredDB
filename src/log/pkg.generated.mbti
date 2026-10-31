@@ -1,0 +1,32 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonlog/lsdb/src/log"
+
+import {
+  "moonlog/lsdb/src/core",
+  "moonlog/lsdb/src/io",
+  "moonlog/lsdb/src/segment",
+}
+
+// Values
+
+// Errors
+
+// Types and methods
+pub(all) struct Log[W, R] {
+  mut segments : Array[@segment.Segment[W, R]]
+  roll_size : Int64
+  mut next_offset : UInt64
+  make : (UInt64) -> @segment.Segment[W, R] raise @io.IoError
+}
+pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64) -> UInt64 raise @io.IoError
+pub fn[W, R] Log::count(Self[W, R]) -> Int32
+pub fn[W, R : @io.LogReader] Log::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
+pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError) -> Self[W, R]
+pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64
+pub fn[W, R : @io.LogReader] Log::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
+
+// Type aliases
+pub type MakeSegment[W, R] = (UInt64) -> @segment.Segment[W, R] raise @io.IoError
+
+// Traits

@@ -4,6 +4,7 @@ pub(all) suberror IoError {
   Closed
   OutOfBounds(Int64)
   Corrupt(Int64)
+  Syscall(Int32)
 }
 
 ///|

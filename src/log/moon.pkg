@@ -1,0 +1,9 @@
+import {
+  "moonlog/lsdb/src/core",
+  "moonlog/lsdb/src/io",
+  "moonlog/lsdb/src/segment",
+}
+
+import {
+  "moonlog/lsdb/src/backend_mem",
+} for "test"
