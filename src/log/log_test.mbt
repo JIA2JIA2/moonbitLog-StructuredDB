@@ -605,3 +605,35 @@ test "sync policy Batch defers fsync to batch end or explicit flush" {
   let recs = batch_log.scan() catch { _ => panic() }
   assert_eq(recs.length(), 3)
 }
+
+///|
+test "get_latest_at honours ttl while scan_live filters expired keys" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (1_000 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (5_000 : Int64)) catch { _ => panic() })
+  let index = log.build_key_index() catch { _ => panic() }
+
+  // now = 6000, ttl = 2000: `a` (age 5000) expired, `b` (age 1000) still live.
+  let a = log.get_latest_at(index, b"a", (6_000 : Int64), (2_000 : Int64)) catch {
+    _ => panic()
+  }
+  match a {
+    Some(_) => panic()
+    None => ()
+  }
+  let b = log.get_latest_at(index, b"b", (6_000 : Int64), (2_000 : Int64)) catch {
+    _ => panic()
+  }
+  match b {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+  let live = log.scan_live((6_000 : Int64), (2_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(live.length(), 1)
+  assert_eq(live[0].key, b"b")
+}

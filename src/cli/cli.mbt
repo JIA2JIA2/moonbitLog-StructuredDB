@@ -15,11 +15,13 @@
 ///   prune <dir> <keep-segments>      keep only the newest segments
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
+///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
 ///   cursor-load <dir> <name>         read a named consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
+///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
 ///   compact <dir>                    rewrite the directory with live keys
 ///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir>                      print record/segment counts
@@ -35,7 +37,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|cursor-save|cursor-load|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|scan|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -289,6 +291,24 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Drop segments whose last record is older than `ttl` ms relative to now.
+fn cmd_prune_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
+  let ttl_ms = @string.parse_int64(ttl) catch {
+    _ => raise @io.IoError::Invalid("invalid ttl: " + ttl)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let dropped = log.retain_before(now_ms() - ttl_ms, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("dropped " + dropped.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
 fn cmd_cursor(
@@ -352,6 +372,27 @@ fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
     let log = open_log(dir)
     let index = log.build_key_index()
     match log.get_latest(index, @utf8.encode(key)) {
+      Some(rec) => print_record(rec)
+      None => println("not found")
+    }
+    close_log(log)
+  })
+}
+
+///|
+/// Latest live value for `key`, treating records older than `ttl` ms as gone.
+fn cmd_getkey_live(
+  dir : String,
+  key : String,
+  ttl : String,
+) -> Unit raise @io.IoError {
+  let ttl_ms = @string.parse_int64(ttl) catch {
+    _ => raise @io.IoError::Invalid("invalid ttl: " + ttl)
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let index = log.build_key_index()
+    match log.get_latest_at(index, @utf8.encode(key), now_ms(), ttl_ms) {
       Some(rec) => print_record(rec)
       None => println("not found")
     }
@@ -432,6 +473,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       cmd_prune_before(args[2], args[3])
     }
+  } else if cmd == "prune-expired" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_prune_expired(args[2], args[3])
+    }
   } else if cmd == "cursor" {
     if args.length() < 5 {
       println(USAGE)
@@ -443,6 +490,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_getkey(args[2], args[3])
+    }
+  } else if cmd == "getkey-live" {
+    if args.length() < 5 {
+      println(USAGE)
+    } else {
+      cmd_getkey_live(args[2], args[3], args[4])
     }
   } else if cmd == "compact" {
     cmd_compact(args[2])

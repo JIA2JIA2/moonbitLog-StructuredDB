@@ -32,6 +32,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Creation/deletion hardening (M23)**：newly created segment files and
   retention deletions fsync the directory, and cursor files are written
   atomically.
+- **Record TTL (M26)**：`Log::get_latest_at` / `Log::scan_live` filter records
+  older than a ttl at a given `now`, with `getkey-live` / `prune-expired` CLI
+  commands.
 
 ## 0.1.0 - 2026-10-31
 

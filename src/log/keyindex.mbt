@@ -117,3 +117,48 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(
   }
   live.length()
 }
+
+///|
+/// Latest live record for `key` that has not outlived `ttl` at `now`: a record
+/// with `now - timestamp > ttl` is treated as expired and reported as absent.
+pub fn[W, R : @io.LogReader] Log::get_latest_at(
+  self : Log[W, R],
+  index : KeyIndex,
+  key : Bytes,
+  now : Int64,
+  ttl : Int64,
+) -> @core.Record? raise @io.IoError {
+  match self.get_latest(index, key) {
+    Some(rec) =>
+      if now - rec.timestamp > ttl {
+        (None : @core.Record?)
+      } else {
+        Some(rec)
+      }
+    None => (None : @core.Record?)
+  }
+}
+
+///|
+/// Live records (latest put per key) that have not outlived `ttl` at `now`, in
+/// log order.
+pub fn[W, R : @io.LogReader] Log::scan_live(
+  self : Log[W, R],
+  now : Int64,
+  ttl : Int64,
+) -> Array[@core.Record] raise @io.IoError {
+  let index = self.build_key_index()
+  let out : Array[@core.Record] = []
+  self.for_each((0 : UInt64), self.next_offset, rec => {
+    if !rec.is_delete() {
+      match index.latest(rec.key) {
+        Some(off) =>
+          if off == rec.offset && now - rec.timestamp <= ttl {
+            out.push(rec)
+          }
+        None => ()
+      }
+    }
+  })
+  out
+}

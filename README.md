@@ -56,11 +56,13 @@ moonlog <command> <dir> [args...]
   prune <dir> <keep-segments>   只保留最新 N 个段
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
   prune-before <dir> <timestamp> 回收末条记录早于 timestamp 的段
+  prune-expired <dir> <ttl>     回收末条记录早于 now-ttl 的段
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
   cursor-load <dir> <name>      读取命名消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
+  getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
   compact <dir>                 折叠为 live 记录并重写目录
   fsck <dir>                    校验记录/offset 完整性
   stats <dir>                   打印记录/段计数
@@ -84,7 +86,7 @@ $EXE scan /tmp/log
 | `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `snapshot` / `compact` | `log` | KV 逻辑视图 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `get_latest` / `get_latest_at` / `scan_live` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / 折叠 live 记录 / 原地重写 |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
@@ -176,6 +178,7 @@ u32 crc32          (仅覆盖 body)
 - M21 元数据原子写（tmp + fsync + rename + fsync 目录）
 - M22 组提交：`SyncPolicy::Batch` 与 `Log::flush`（批量写只 fsync 一次）
 - M23 创建/删除加固：新建段与删除段后 fsync 目录，游标原子写
+- M26 记录级 TTL：`Log::get_latest_at` / `Log::scan_live` 与 CLI `getkey-live` / `prune-expired`
 
 ## 许可
 
