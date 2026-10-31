@@ -67,22 +67,40 @@ pub fn[W : @io.LogWriter, R] Log::append(
 }
 
 ///|
+/// Locate the segment that owns `offset`, if any. Segments are kept in
+/// increasing `base_offset` order, so this binary-searches them.
+fn[W, R] Log::find_segment(
+  self : Log[W, R],
+  offset : UInt64,
+) -> @segment.Segment[W, R]? {
+  let mut lo = 0
+  let mut hi = self.segments.length()
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    let seg = self.segments[mid]
+    let base = seg.base_offset
+    let end = base + seg.record_count.to_uint64()
+    if offset < base {
+      hi = mid
+    } else if offset >= end {
+      lo = mid + 1
+    } else {
+      return Some(seg)
+    }
+  }
+  None
+}
+
+///|
 /// Look up a single record by global offset.
 pub fn[W, R : @io.LogReader] Log::get(
   self : Log[W, R],
   offset : UInt64,
 ) -> @core.Record? raise @io.IoError {
-  let mut found : @core.Record? = None
-  for seg in self.segments {
-    if found is None {
-      let base = seg.base_offset
-      let end = base + seg.record_count.to_uint64()
-      if offset >= base && offset < end {
-        found = seg.get(offset)
-      }
-    }
+  match self.find_segment(offset) {
+    Some(seg) => seg.get(offset)
+    None => None
   }
-  found
 }
 
 ///|
@@ -95,6 +113,31 @@ pub fn[W, R : @io.LogReader] Log::scan(
     let recs = seg.scan()
     for rec in recs {
       out.push(rec)
+    }
+  }
+  out
+}
+
+///|
+/// Decode records whose global offset lies in the half-open range
+/// `[from, to)`, skipping segments that cannot intersect the range.
+pub fn[W, R : @io.LogReader] Log::scan_range(
+  self : Log[W, R],
+  from : UInt64,
+  to : UInt64,
+) -> Array[@core.Record] raise @io.IoError {
+  let out : Array[@core.Record] = []
+  if to <= from {
+    return out
+  }
+  for seg in self.segments {
+    let base = seg.base_offset
+    let seg_end = base + seg.record_count.to_uint64()
+    if seg_end > from && base < to {
+      let recs = seg.scan_range(from, to)
+      for rec in recs {
+        out.push(rec)
+      }
     }
   }
   out

@@ -68,3 +68,48 @@ test "single large segment holds all records when under roll size" {
   assert_eq(log.segment_count(), 1)
   assert_eq(log.next_offset(), (20 : UInt64))
 }
+
+///|
+test "scan_range spans segments and returns records in order" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let recs = log.scan_range((3 : UInt64), (6 : UInt64)) catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+  assert_eq(recs[0].offset.to_int(), 3)
+  assert_eq(recs[1].offset.to_int(), 4)
+  assert_eq(recs[2].offset.to_int(), 5)
+  let empty = log.scan_range((6 : UInt64), (6 : UInt64)) catch { _ => panic() }
+  assert_eq(empty.length(), 0)
+}
+
+///|
+test "log get binary-searches the owning segment" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let first = log.get((0 : UInt64)) catch { _ => panic() }
+  match first {
+    Some(rec) => assert_eq(rec.offset.to_int(), 0)
+    None => panic()
+  }
+  let last = log.get((7 : UInt64)) catch { _ => panic() }
+  match last {
+    Some(rec) => assert_eq(rec.offset.to_int(), 7)
+    None => panic()
+  }
+  let miss = log.get((99 : UInt64)) catch { _ => panic() }
+  match miss {
+    Some(_) => panic()
+    None => ()
+  }
+}

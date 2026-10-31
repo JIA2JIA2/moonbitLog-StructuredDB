@@ -2,6 +2,10 @@
 /// A single append-only segment: a contiguous run of records stored in one
 /// backend log. `base_offset` is the logical offset assigned to the first
 /// record written into this segment.
+///
+/// The segment keeps an in-memory sparse index alongside the data so that
+/// point lookups and range scans can seek near their target instead of
+/// decoding the whole segment.
 pub(all) struct Segment[W, R] {
   base_offset : UInt64
   writer : W
@@ -9,13 +13,29 @@ pub(all) struct Segment[W, R] {
   mut next_offset : UInt64
   mut record_count : Int32
   mut size : Int64
+  mut index : SparseIndex
 }
+
+///|
+/// Default number of records between two sparse-index entries.
+const DEFAULT_INDEX_INTERVAL : Int32 = 32
 
 ///|
 pub fn[W, R] Segment::new(
   writer : W,
   reader : R,
   base_offset : UInt64,
+) -> Segment[W, R] {
+  Segment::new_with_index_interval(writer, reader, base_offset, DEFAULT_INDEX_INTERVAL)
+}
+
+///|
+/// Create a segment with a custom sparse-index interval (mainly for tests).
+pub fn[W, R] Segment::new_with_index_interval(
+  writer : W,
+  reader : R,
+  base_offset : UInt64,
+  index_interval : Int32,
 ) -> Segment[W, R] {
   {
     base_offset,
@@ -24,7 +44,14 @@ pub fn[W, R] Segment::new(
     next_offset: base_offset,
     record_count: 0,
     size: 0,
+    index: SparseIndex::new(index_interval),
   }
+}
+
+///|
+/// The sparse-index interval in effect for this segment.
+pub fn[W, R] Segment::index_interval(self : Segment[W, R]) -> Int32 {
+  self.index.interval
 }
 
 ///|
@@ -37,6 +64,9 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   timestamp : Int64,
 ) -> UInt64 raise @io.IoError {
   let offset = self.next_offset
+  if self.index.should_index(self.record_count) {
+    self.index.push(self.record_count.to_uint64(), self.size)
+  }
   let rec : @core.Record = { offset, timestamp, key, value, }
   let bytes = rec.encode()
   ignore(self.writer.append(bytes))
@@ -69,6 +99,34 @@ pub fn[W, R : @io.LogReader] Segment::read_raw(
 }
 
 ///|
+/// Decode the single record that starts at `pos`, returning it together with
+/// the position just after it. Only the 4-byte length prefix is read first, so
+/// callers can walk records without materialising the whole segment. Returns
+/// `None` when `pos` is at (or a truncated tail remains before) the end.
+fn[W, R : @io.LogReader] Segment::load_record_at(
+  self : Segment[W, R],
+  pos : Int64,
+) -> (@core.Record, Int64)? raise @io.IoError {
+  let total = self.reader.length()
+  if pos < (0 : Int64) || pos + (4 : Int64) > total {
+    return None
+  }
+  let head = self.reader.read_at(pos, 4)
+  let body_len = @core.body_len_at(head, 0) catch {
+    _ => raise @io.IoError::Corrupt(pos)
+  }
+  let full_len = (4 : Int64) + body_len.to_int64() + (4 : Int64)
+  if pos + full_len > total {
+    return None
+  }
+  let data = self.reader.read_at(pos, full_len.to_int())
+  let (rec, next) = @core.decode_record(data, 0) catch {
+    _ => raise @io.IoError::Corrupt(pos)
+  }
+  Some((rec, pos + next.to_int64()))
+}
+
+///|
 /// Decode every record in this segment, in append order.
 pub fn[W, R : @io.LogReader] Segment::scan(
   self : Segment[W, R],
@@ -88,19 +146,113 @@ pub fn[W, R : @io.LogReader] Segment::scan(
 }
 
 ///|
-/// Look up a single record by its logical offset.
+/// Look up a single record by its logical offset. Uses the sparse index to
+/// seek near the target, then walks at most `index_interval` records.
 pub fn[W, R : @io.LogReader] Segment::get(
   self : Segment[W, R],
   offset : UInt64,
 ) -> @core.Record? raise @io.IoError {
-  let recs = self.scan()
-  let mut found : @core.Record? = None
-  for rec in recs {
-    if rec.offset == offset {
-      found = Some(rec)
+  if offset < self.base_offset {
+    return None
+  }
+  let rel = offset - self.base_offset
+  if rel >= self.record_count.to_uint64() {
+    return None
+  }
+  let mut pos : Int64 = match self.index.floor(rel) {
+    Some(e) => e.position
+    None => (0 : Int64)
+  }
+  let mut result : @core.Record? = None
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) => {
+        if rec.offset == offset {
+          result = Some(rec)
+          go = false
+        } else if rec.offset > offset {
+          go = false
+        } else {
+          pos = next
+        }
+      }
     }
   }
-  found
+  result
+}
+
+///|
+/// Decode records whose logical offset lies in the half-open range
+/// `[from, to)`, clamped to this segment's own range.
+pub fn[W, R : @io.LogReader] Segment::scan_range(
+  self : Segment[W, R],
+  from : UInt64,
+  to : UInt64,
+) -> Array[@core.Record] raise @io.IoError {
+  let out : Array[@core.Record] = []
+  let seg_end = self.base_offset + self.record_count.to_uint64()
+  let lo = if from < self.base_offset { self.base_offset } else { from }
+  let hi = if to > seg_end { seg_end } else { to }
+  if lo >= hi {
+    return out
+  }
+  let rel = lo - self.base_offset
+  let mut pos : Int64 = match self.index.floor(rel) {
+    Some(e) => e.position
+    None => (0 : Int64)
+  }
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) => {
+        if rec.offset >= hi {
+          go = false
+        } else {
+          if rec.offset >= lo {
+            out.push(rec)
+          }
+          pos = next
+        }
+      }
+    }
+  }
+  out
+}
+
+///|
+/// Rebuild the sparse index (and derived counters) by decoding the segment's
+/// bytes from the beginning. Returns the number of records discovered. Useful
+/// after reopening a segment whose in-memory index was not persisted.
+pub fn[W, R : @io.LogReader] Segment::rebuild_index(
+  self : Segment[W, R],
+) -> Int32 raise @io.IoError {
+  self.index.reset()
+  let total = self.reader.length()
+  let mut pos : Int64 = 0
+  let mut n : Int32 = 0
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((_rec, next)) => {
+        if self.index.should_index(n) {
+          self.index.push(n.to_uint64(), pos)
+        }
+        n = n + 1
+        pos = next
+      }
+    }
+  }
+  self.record_count = n
+  self.size = total
+  self.next_offset = self.base_offset + n.to_uint64()
+  n
 }
 
 ///|

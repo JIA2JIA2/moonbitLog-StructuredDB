@@ -66,3 +66,119 @@ test "segment file name is zero padded for lexical ordering" {
   assert_eq(@segment.segment_file_name((7 : UInt64)), "0000000000000007.log")
   assert_eq(@segment.segment_file_name((0 : UInt64)), "0000000000000000.log")
 }
+
+///|
+fn indexed_mem_segment(
+  base : UInt64,
+  interval : Int32,
+) -> @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] {
+  let store = @backend_mem.MemLog::new()
+  @segment.Segment::new_with_index_interval(store, store, base, interval)
+}
+
+///|
+test "sparse index samples one entry per interval and still finds any offset" {
+  let seg = indexed_mem_segment((10 : UInt64), 2)
+  for i = 0; i < 10; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_eq(seg.count(), 10)
+  assert_eq(seg.index_interval(), 2)
+  assert_eq(seg.index.length(), 5)
+  assert_eq(seg.index.entry(0).record_index, (0 : UInt64))
+  assert_eq(seg.index.entry(1).record_index, (2 : UInt64))
+  assert_eq(seg.index.entry(4).record_index, (8 : UInt64))
+  for i = 0; i < 10; i = i + 1 {
+    let hit = seg.get((10 + i).to_uint64()) catch { _ => panic() }
+    match hit {
+      Some(rec) => assert_eq(rec.offset.to_int(), 10 + i)
+      None => panic()
+    }
+  }
+  let below = seg.get((9 : UInt64)) catch { _ => panic() }
+  match below {
+    Some(_) => panic()
+    None => ()
+  }
+  let beyond = seg.get((20 : UInt64)) catch { _ => panic() }
+  match beyond {
+    Some(_) => panic()
+    None => ()
+  }
+}
+
+///|
+test "sparse index floor returns the greatest lower bound" {
+  let idx = @segment.SparseIndex::new(4)
+  idx.push((0 : UInt64), (0 : Int64))
+  idx.push((4 : UInt64), (40 : Int64))
+  idx.push((8 : UInt64), (80 : Int64))
+  let f0 = idx.floor((0 : UInt64))
+  match f0 {
+    Some(e) => assert_eq(e.position, (0 : Int64))
+    None => panic()
+  }
+  let f5 = idx.floor((5 : UInt64))
+  match f5 {
+    Some(e) => {
+      assert_eq(e.record_index, (4 : UInt64))
+      assert_eq(e.position, (40 : Int64))
+    }
+    None => panic()
+  }
+  let f99 = idx.floor((99 : UInt64))
+  match f99 {
+    Some(e) => assert_eq(e.record_index, (8 : UInt64))
+    None => panic()
+  }
+}
+
+///|
+test "scan_range honours half-open bounds and clamps to segment" {
+  let seg = indexed_mem_segment((0 : UInt64), 2)
+  for i = 0; i < 8; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let recs = seg.scan_range((2 : UInt64), (5 : UInt64)) catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+  assert_eq(recs[0].offset.to_int(), 2)
+  assert_eq(recs[2].offset.to_int(), 4)
+  let whole = seg.scan_range((0 : UInt64), (100 : UInt64)) catch {
+    _ => panic()
+  }
+  assert_eq(whole.length(), 8)
+  let empty = seg.scan_range((5 : UInt64), (5 : UInt64)) catch { _ => panic() }
+  assert_eq(empty.length(), 0)
+  let past = seg.scan_range((100 : UInt64), (200 : UInt64)) catch {
+    _ => panic()
+  }
+  assert_eq(past.length(), 0)
+}
+
+///|
+test "rebuild_index restores an index from persisted bytes" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  for i = 0; i < 6; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let seg2 : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  assert_eq(seg2.count(), 0)
+  let n = seg2.rebuild_index() catch { _ => panic() }
+  assert_eq(n, 6)
+  assert_eq(seg2.count(), 6)
+  assert_eq(seg2.next_offset, (6 : UInt64))
+  let hit = seg2.get((4 : UInt64)) catch { _ => panic() }
+  match hit {
+    Some(rec) => assert_eq(rec.value, b"v")
+    None => panic()
+  }
+}

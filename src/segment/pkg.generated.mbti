@@ -12,6 +12,11 @@ pub fn segment_file_name(UInt64) -> String
 // Errors
 
 // Types and methods
+pub(all) struct IndexEntry {
+  record_index : UInt64
+  position : Int64
+}
+
 pub(all) struct Segment[W, R] {
   base_offset : UInt64
   writer : W
@@ -19,14 +24,31 @@ pub(all) struct Segment[W, R] {
   mut next_offset : UInt64
   mut record_count : Int32
   mut size : Int64
+  mut index : SparseIndex
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
+pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
 pub fn[W, R] Segment::new(W, R, UInt64) -> Self[W, R]
+pub fn[W, R] Segment::new_with_index_interval(W, R, UInt64, Int32) -> Self[W, R]
 pub fn[W, R : @io.LogReader] Segment::read_raw(Self[W, R], Int64, Int32) -> Bytes raise @io.IoError
+pub fn[W, R : @io.LogReader] Segment::rebuild_index(Self[W, R]) -> Int32 raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R : @io.LogReader] Segment::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
+
+pub(all) struct SparseIndex {
+  interval : Int32
+  mut entries : Array[IndexEntry]
+}
+pub fn SparseIndex::entry(Self, Int32) -> IndexEntry
+pub fn SparseIndex::floor(Self, UInt64) -> IndexEntry?
+pub fn SparseIndex::length(Self) -> Int32
+pub fn SparseIndex::new(Int32) -> Self
+pub fn SparseIndex::push(Self, UInt64, Int64) -> Unit
+pub fn SparseIndex::reset(Self) -> Unit
+pub fn SparseIndex::should_index(Self, Int32) -> Bool
 
 // Type aliases
 

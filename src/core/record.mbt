@@ -86,6 +86,17 @@ pub fn Record::encode(self : Record) -> Bytes {
 }
 
 ///|
+/// Read the 4-byte length prefix of the record encoded at `pos`, without
+/// decoding the record itself. Lets callers seek record by record.
+pub fn body_len_at(data : Bytes, pos : Int32) -> Int32 raise DecodeError {
+  let total = data.length()
+  if pos < 0 || pos + 4 > total {
+    raise DecodeError::Truncated(pos)
+  }
+  u32_as_int(read_u32_le(data, pos))
+}
+
+///|
 /// Decode the record starting at `pos`, returning the record and the position
 /// immediately after it (so callers can scan a buffer of concatenated records).
 pub fn decode_record(

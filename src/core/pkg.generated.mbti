@@ -6,6 +6,8 @@ import {
 }
 
 // Values
+pub fn body_len_at(Bytes, Int32) -> Int32 raise DecodeError
+
 pub fn crc32(Bytes) -> UInt32
 
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
