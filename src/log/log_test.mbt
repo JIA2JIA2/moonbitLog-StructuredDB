@@ -249,6 +249,7 @@ test "manifest roundtrips through encode/decode" {
     roll_size: (1024 : Int64),
     next_offset: (42 : UInt64),
     segment_bases: [(0 : UInt64), (10 : UInt64), (20 : UInt64)],
+    segment_sizes: [(100 : Int64), (200 : Int64), (300 : Int64)],
   }
   let bytes = m.encode()
   let d = @log.decode_manifest(bytes) catch { _ => panic() }
@@ -257,6 +258,9 @@ test "manifest roundtrips through encode/decode" {
   assert_eq(d.segment_bases.length(), 3)
   assert_eq(d.segment_bases[0], (0 : UInt64))
   assert_eq(d.segment_bases[2], (20 : UInt64))
+  assert_eq(d.segment_sizes.length(), 3)
+  assert_eq(d.segment_sizes[0], (100 : Int64))
+  assert_eq(d.segment_sizes[2], (300 : Int64))
 }
 
 ///|
@@ -265,6 +269,7 @@ test "manifest decode rejects corrupt bytes" {
     roll_size: (8 : Int64),
     next_offset: (1 : UInt64),
     segment_bases: [(0 : UInt64)],
+    segment_sizes: [(16 : Int64)],
   }
   let bytes = m.encode()
   let broken = @core.slice(bytes, 0, bytes.length() - 1) + b"\x00"

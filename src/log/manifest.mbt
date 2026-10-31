@@ -9,19 +9,24 @@
 ///   i64 roll_size
 ///   u64 next_offset
 ///   u32 seg_count
-///   segment_bases[seg_count]: u64
+///   segments[seg_count]: { u64 base_offset; i64 byte_size }
 ///   u32 crc32
+///
+/// Each segment carries its byte size so a reopened log can verify that every
+/// segment file still matches what was written; a mismatch (e.g. a truncated
+/// or tampered segment) makes the reader fall back to a full recovery scan.
 pub(all) struct Manifest {
   roll_size : Int64
   next_offset : UInt64
   segment_bases : Array[UInt64]
+  segment_sizes : Array[Int64]
 }
 
 ///|
 const MANIFEST_MAGIC : UInt32 = 0x4D4C4D4E
 
 ///|
-const MANIFEST_VERSION : UInt32 = 1
+const MANIFEST_VERSION : UInt32 = 2
 
 ///|
 fn mf_u32(data : Bytes, pos : Int32) -> UInt32 {
@@ -54,8 +59,11 @@ pub fn Manifest::encode(self : Manifest) -> Bytes {
   body.write_int64_le(self.roll_size)
   body.write_uint64_le(self.next_offset)
   body.write_uint_le(mf_count(self.segment_bases.length()))
-  for base in self.segment_bases {
-    body.write_uint64_le(base)
+  let mut i = 0
+  while i < self.segment_bases.length() {
+    body.write_uint64_le(self.segment_bases[i])
+    body.write_int64_le(self.segment_sizes[i])
+    i = i + 1
   }
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
@@ -87,16 +95,23 @@ pub fn decode_manifest(data : Bytes) -> Manifest raise @core.MetaError {
   let next_offset = mf_u64(data, 16)
   let seg_count = mf_u32(data, 24)
   let bases : Array[UInt64] = []
+  let sizes : Array[Int64] = []
   let mut pos = 28
   let mut i = 0
   let n = seg_count.reinterpret_as_int()
   while i < n {
-    if pos + 8 > body_end {
+    if pos + 16 > body_end {
       raise @core.MetaError::Truncated(pos)
     }
     bases.push(mf_u64(data, pos))
-    pos = pos + 8
+    sizes.push(mf_i64(data, pos + 8))
+    pos = pos + 16
     i = i + 1
   }
-  { roll_size, next_offset, segment_bases: bases, }
+  {
+    roll_size,
+    next_offset,
+    segment_bases: bases,
+    segment_sizes: sizes,
+  }
 }

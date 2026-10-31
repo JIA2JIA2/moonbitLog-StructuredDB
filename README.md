@@ -128,7 +128,7 @@ u32 crc32          (仅覆盖 body)
 ### 持久化元数据（M8）
 
 - 每个段旁挂 `<name>.log.index`：保存该段计数与稀疏索引快照（含 CRC32），重开时可直接恢复，无需扫描数据。
-- 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（含 CRC32）。
+- 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（每段的 `base_offset` 与 `byte_size`，整体附 CRC32）。打开时据此校验每个段文件的真实大小，不符则回退全量恢复。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
 
 ### 目录锁与游标文件（M12）

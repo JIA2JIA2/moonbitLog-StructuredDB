@@ -64,6 +64,7 @@ pub(all) struct Manifest {
   roll_size : Int64
   next_offset : UInt64
   segment_bases : Array[UInt64]
+  segment_sizes : Array[Int64]
 }
 pub fn Manifest::encode(Self) -> Bytes
 

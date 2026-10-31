@@ -355,6 +355,28 @@ fn load_segment(
 }
 
 ///|
+/// The on-disk byte size of a segment's data file, or -1 when it is missing.
+/// Used to cross-check a segment against the size recorded in the manifest,
+/// which catches a truncated or otherwise tampered data file that a valid
+/// sidecar index would otherwise mask.
+fn segment_file_size(dir : String, base : UInt64) -> Int64 {
+  let path = dir + "/" + @segment.segment_file_name(base)
+  let opened = try {
+    Some(NativeFileLog::open(path))
+  } catch {
+    _ => None
+  }
+  match opened {
+    Some(f) => {
+      let s = f.size
+      f.close()
+      s
+    }
+    None => (-1 : Int64)
+  }
+}
+
+///|
 /// Open a log directory using the manifest + per-segment indexes for a fast
 /// path, falling back to full recovery when they are missing or stale. This is
 /// the preferred entry point for reopening an existing log.
@@ -378,13 +400,27 @@ pub fn open_log_dir(
         recover_log_dir(dir, roll_size, sync=sync)
       } else {
         let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
-        for base in m.segment_bases {
-          let seg = load_segment(dir, base)
+        let mut consistent = true
+        let mut i = 0
+        while i < m.segment_bases.length() {
+          let seg = load_segment(dir, m.segment_bases[i])
+          let actual = segment_file_size(dir, m.segment_bases[i])
+          if i >= m.segment_sizes.length() || actual != m.segment_sizes[i] {
+            consistent = false
+          }
           if seg.record_count > 0 {
             segs.push(seg)
           }
+          i = i + 1
         }
-        @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
+        if consistent {
+          @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
+        } else {
+          for seg in segs {
+            seg.writer.close()
+          }
+          recover_log_dir(dir, roll_size, sync=sync)
+        }
       }
     }
     None => recover_log_dir(dir, roll_size, sync=sync)
@@ -399,14 +435,17 @@ pub fn flush_meta(
   log : @log.Log[NativeFileLog, NativeFileLog],
 ) -> Unit raise @io.IoError {
   let bases : Array[UInt64] = []
+  let sizes : Array[Int64] = []
   for seg in log.segments {
     write_file(segment_index_path(dir, seg.base_offset), seg.to_meta().encode())
     bases.push(seg.base_offset)
+    sizes.push(seg.byte_size())
   }
   let manifest : @log.Manifest = {
     roll_size: log.roll_size,
     next_offset: log.next_offset(),
     segment_bases: bases,
+    segment_sizes: sizes,
   }
   write_file(dir + "/" + MANIFEST_NAME, manifest.encode())
 }
