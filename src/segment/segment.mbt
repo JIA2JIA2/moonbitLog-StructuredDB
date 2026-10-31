@@ -14,6 +14,7 @@ pub(all) struct Segment[W, R] {
   mut record_count : Int32
   mut size : Int64
   mut index : SparseIndex
+  mut meta_loaded : Bool
 }
 
 ///|
@@ -45,6 +46,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     record_count: 0,
     size: 0,
     index: SparseIndex::new(index_interval),
+    meta_loaded: false,
   }
 }
 

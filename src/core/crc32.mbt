@@ -1,7 +1,7 @@
 ///|
 /// CRC32 (IEEE 802.3, polynomial 0xEDB88320) computed bit-by-bit.
 /// A table-driven version can replace this later for throughput.
-fn crc32_range(data : Bytes, start : Int32, end : Int32) -> UInt32 {
+pub fn crc32_range(data : Bytes, start : Int32, end : Int32) -> UInt32 {
   let mut crc : UInt64 = (0xFFFFFFFF : UInt64)
   for i = start; i < end; i = i + 1 {
     crc = crc ^ data.at(i).to_uint64()

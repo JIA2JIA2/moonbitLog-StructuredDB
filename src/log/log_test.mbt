@@ -242,3 +242,37 @@ test "empty log get and scan_range return nothing" {
   let recs = log.scan_range((0 : UInt64), (10 : UInt64)) catch { _ => panic() }
   assert_eq(recs.length(), 0)
 }
+
+///|
+test "manifest roundtrips through encode/decode" {
+  let m : @log.Manifest = {
+    roll_size: (1024 : Int64),
+    next_offset: (42 : UInt64),
+    segment_bases: [(0 : UInt64), (10 : UInt64), (20 : UInt64)],
+  }
+  let bytes = m.encode()
+  let d = @log.decode_manifest(bytes) catch { _ => panic() }
+  assert_eq(d.roll_size, (1024 : Int64))
+  assert_eq(d.next_offset, (42 : UInt64))
+  assert_eq(d.segment_bases.length(), 3)
+  assert_eq(d.segment_bases[0], (0 : UInt64))
+  assert_eq(d.segment_bases[2], (20 : UInt64))
+}
+
+///|
+test "manifest decode rejects corrupt bytes" {
+  let m : @log.Manifest = {
+    roll_size: (8 : Int64),
+    next_offset: (1 : UInt64),
+    segment_bases: [(0 : UInt64)],
+  }
+  let bytes = m.encode()
+  let broken = @core.slice(bytes, 0, bytes.length() - 1) + b"\x00"
+  let mut raised = false
+  try {
+    let _ = @log.decode_manifest(broken)
+  } catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+}

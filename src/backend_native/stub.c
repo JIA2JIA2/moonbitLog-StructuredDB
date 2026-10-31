@@ -185,3 +185,62 @@ int32_t moonlog_closedir(int64_t handle) {
   }
   return (int32_t)closedir(d);
 }
+
+/*
+ * Whole-file helpers for persisted metadata (manifest / segment indexes).
+ */
+
+MOONBIT_FFI_EXPORT
+moonbit_bytes_t moonlog_read_file(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return moonbit_make_bytes_raw(0);
+  }
+  int fd = open(p, O_RDONLY);
+  free(p);
+  if (fd < 0) {
+    return moonbit_make_bytes_raw(0);
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) {
+    close(fd);
+    return moonbit_make_bytes_raw(0);
+  }
+  int32_t len = (int32_t)st.st_size;
+  moonbit_bytes_t buf = moonbit_make_bytes_raw(len);
+  ssize_t n = read(fd, buf, (size_t)len);
+  close(fd);
+  if (n < 0) {
+    return moonbit_make_bytes_raw(0);
+  }
+  if ((int32_t)n != len) {
+    moonbit_bytes_t out = moonbit_make_bytes_raw((int32_t)n);
+    if (n > 0) {
+      memcpy(out, buf, (size_t)n);
+    }
+    return out;
+  }
+  return buf;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  free(p);
+  if (fd < 0) {
+    return -1;
+  }
+  int32_t len = Moonbit_array_length(data);
+  ssize_t n = write(fd, data, (size_t)len);
+  int r = fsync(fd);
+  close(fd);
+  (void)r;
+  if (n < 0 || (int32_t)n != len) {
+    return -1;
+  }
+  return 0;
+}

@@ -7,6 +7,8 @@ import {
 }
 
 // Values
+pub fn decode_segment_meta(Bytes) -> SegmentMeta raise @core.MetaError
+
 pub fn segment_file_name(UInt64) -> String
 
 // Errors
@@ -25,8 +27,10 @@ pub(all) struct Segment[W, R] {
   mut record_count : Int32
   mut size : Int64
   mut index : SparseIndex
+  mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
+pub fn[W, R] Segment::apply_meta(Self[W, R], SegmentMeta) -> Unit
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
@@ -38,6 +42,17 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(Self[W, R]) -> Int32 raise @
 pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(Self[W, R]) -> Int32 raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R] Segment::to_meta(Self[W, R]) -> SegmentMeta
+
+pub(all) struct SegmentMeta {
+  base_offset : UInt64
+  next_offset : UInt64
+  record_count : UInt32
+  size : Int64
+  interval : Int32
+  entries : Array[IndexEntry]
+}
+pub fn SegmentMeta::encode(Self) -> Bytes
 
 pub(all) struct SparseIndex {
   interval : Int32

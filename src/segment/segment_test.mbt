@@ -261,3 +261,71 @@ test "get honours segment offset boundaries" {
     None => ()
   }
 }
+
+///|
+test "segment meta roundtrips through encode/decode" {
+  let seg = indexed_mem_segment((5 : UInt64), (2 : Int32))
+  for i = 0; i < 6; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let meta = seg.to_meta()
+  assert_eq(meta.base_offset, (5 : UInt64))
+  assert_eq(meta.next_offset, (11 : UInt64))
+  assert_eq(meta.record_count, (6 : UInt32))
+  assert_eq(meta.interval, 2)
+  assert_eq(meta.entries.length(), 3)
+  let bytes = meta.encode()
+  let decoded = @segment.decode_segment_meta(bytes) catch { _ => panic() }
+  assert_eq(decoded.base_offset, (5 : UInt64))
+  assert_eq(decoded.next_offset, (11 : UInt64))
+  assert_eq(decoded.record_count, (6 : UInt32))
+  assert_eq(decoded.size, meta.size)
+  assert_eq(decoded.interval, 2)
+  assert_eq(decoded.entries.length(), 3)
+  assert_eq(decoded.entries[0].record_index, (0 : UInt64))
+  assert_eq(decoded.entries[1].record_index, (2 : UInt64))
+}
+
+///|
+test "apply_meta restores counters and index and marks the segment" {
+  let src = indexed_mem_segment((0 : UInt64), (2 : Int32))
+  for i = 0; i < 6; i = i + 1 {
+    ignore(src.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let meta = src.to_meta()
+  let store = @backend_mem.MemLog::new()
+  let dst : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  assert_eq(dst.count(), 0)
+  assert_true(!dst.meta_loaded)
+  dst.apply_meta(meta)
+  assert_eq(dst.count(), 6)
+  assert_eq(dst.next_offset, (6 : UInt64))
+  assert_true(dst.meta_loaded)
+  assert_eq(dst.index.length(), 3)
+}
+
+///|
+test "segment meta decode rejects short and corrupt bytes" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  ignore(seg.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  let bytes = seg.to_meta().encode()
+  let mut short_raised = false
+  try {
+    let _ = @segment.decode_segment_meta(b"\x00\x00\x00\x00")
+  } catch {
+    _ => short_raised = true
+  }
+  assert_true(short_raised)
+  let broken = @core.slice(bytes, 0, bytes.length() - 1) + b"\x00"
+  let mut crc_raised = false
+  try {
+    let _ = @segment.decode_segment_meta(broken)
+  } catch {
+    _ => crc_raised = true
+  }
+  assert_true(crc_raised)
+}

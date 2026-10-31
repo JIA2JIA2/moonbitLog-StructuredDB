@@ -89,9 +89,7 @@ test "native log rolls into separate files and scans back" {
 fn clean_dir(dir : String) -> Unit {
   let names = @backend_native.list_dir(dir) catch { _ => return }
   for name in names {
-    if name.has_suffix(".log") {
-      ignore(@backend_native.remove_file(dir + "/" + name))
-    }
+    ignore(@backend_native.remove_file(dir + "/" + name))
   }
 }
 
@@ -179,6 +177,84 @@ test "recover_log_dir on an empty directory yields an empty log" {
   let o = log.append(b"k", b"v", (0 : Int64)) catch { _ => panic() }
   assert_eq(o, (0 : UInt64))
   for seg in log.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+fn remove_meta_files(dir : String) -> Unit {
+  let names = @backend_native.list_dir(dir) catch { _ => return }
+  for name in names {
+    if !name.has_suffix(".log") {
+      ignore(@backend_native.remove_file(dir + "/" + name))
+    }
+  }
+}
+
+///|
+test "open_log_dir uses persisted meta on the fast path" {
+  let dir = "/tmp/moonlog_open_fast"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  })
+  for i = 0; i < 5; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  assert_true(@backend_native.file_exists(dir + "/MANIFEST"))
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 5)
+  for seg in reopened.segments {
+    assert_true(seg.meta_loaded)
+  }
+  let recs = reopened.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 5)
+  assert_eq(recs[4].offset, (4 : UInt64))
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+test "open_log_dir falls back to recovery without meta" {
+  let dir = "/tmp/moonlog_open_fallback"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  })
+  for i = 0; i < 4; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  remove_meta_files(dir)
+  assert_true(!@backend_native.file_exists(dir + "/MANIFEST"))
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 4)
+  for seg in reopened.segments {
+    assert_true(!seg.meta_loaded)
+  }
+  for seg in reopened.segments {
     seg.writer.close()
   }
   clean_dir(dir)

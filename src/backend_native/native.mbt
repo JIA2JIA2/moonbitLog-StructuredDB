@@ -272,3 +272,139 @@ pub fn recover_log_dir(
   }
   @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs)
 }
+
+///|
+#borrow(path)
+extern "C" fn moonlog_read_file(path : Bytes) -> Bytes = "moonlog_read_file"
+
+///|
+#borrow(path, data)
+extern "C" fn moonlog_write_file(path : Bytes, data : Bytes) -> Int32 = "moonlog_write_file"
+
+///|
+/// Name of the directory-level manifest file.
+pub const MANIFEST_NAME : String = "MANIFEST"
+
+///|
+/// Read an entire file into `Bytes`. A missing or empty file yields empty bytes.
+pub fn read_file(path : String) -> Bytes {
+  moonlog_read_file(@utf8.encode(path))
+}
+
+///|
+/// Replace a file's contents (truncate + write + fsync).
+pub fn write_file(path : String, data : Bytes) -> Unit raise @io.IoError {
+  let r = moonlog_write_file(@utf8.encode(path), data)
+  if r < 0 {
+    raise @io.IoError::Syscall(r)
+  }
+}
+
+///|
+/// Path of a segment's persisted index sidecar.
+pub fn segment_index_path(dir : String, base : UInt64) -> String {
+  dir + "/" + @segment.segment_file_name(base) + ".index"
+}
+
+///|
+/// Remove a segment's data and index files (retention).
+pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
+  ignore(remove_file(dir + "/" + @segment.segment_file_name(base)))
+  ignore(remove_file(segment_index_path(dir, base)))
+}
+
+///|
+/// Load one segment, preferring its persisted index; falls back to a full
+/// recover scan when the index is missing or invalid.
+fn load_segment(
+  dir : String,
+  base : UInt64,
+) -> @segment.Segment[NativeFileLog, NativeFileLog] raise @io.IoError {
+  let f = NativeFileLog::open(dir + "/" + @segment.segment_file_name(base))
+  let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
+    f,
+    f,
+    base,
+  )
+  let ip = segment_index_path(dir, base)
+  let restored = if file_exists(ip) {
+    let meta = try {
+      Some(@segment.decode_segment_meta(read_file(ip)))
+    } catch {
+      _ => None
+    }
+    match meta {
+      Some(m) => {
+        if m.base_offset == base {
+          seg.apply_meta(m)
+          true
+        } else {
+          false
+        }
+      }
+      None => false
+    }
+  } else {
+    false
+  }
+  if !restored {
+    ignore(seg.recover())
+  }
+  seg
+}
+
+///|
+/// Open a log directory using the manifest + per-segment indexes for a fast
+/// path, falling back to full recovery when they are missing or stale. This is
+/// the preferred entry point for reopening an existing log.
+pub fn open_log_dir(
+  dir : String,
+  roll_size : Int64,
+) -> @log.Log[NativeFileLog, NativeFileLog] raise @io.IoError {
+  let mpath = dir + "/" + MANIFEST_NAME
+  if !file_exists(mpath) {
+    return recover_log_dir(dir, roll_size)
+  }
+  let manifest = try {
+    Some(@log.decode_manifest(read_file(mpath)))
+  } catch {
+    _ => None
+  }
+  match manifest {
+    Some(m) => {
+      if m.roll_size != roll_size {
+        recover_log_dir(dir, roll_size)
+      } else {
+        let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
+        for base in m.segment_bases {
+          let seg = load_segment(dir, base)
+          if seg.record_count > 0 {
+            segs.push(seg)
+          }
+        }
+        @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs)
+      }
+    }
+    None => recover_log_dir(dir, roll_size)
+  }
+}
+
+///|
+/// Persist the manifest and every segment's index so the next `open_log_dir`
+/// can skip the data scan.
+pub fn flush_meta(
+  dir : String,
+  log : @log.Log[NativeFileLog, NativeFileLog],
+) -> Unit raise @io.IoError {
+  let bases : Array[UInt64] = []
+  for seg in log.segments {
+    write_file(segment_index_path(dir, seg.base_offset), seg.to_meta().encode())
+    bases.push(seg.base_offset)
+  }
+  let manifest : @log.Manifest = {
+    roll_size: log.roll_size,
+    next_offset: log.next_offset(),
+    segment_bases: bases,
+  }
+  write_file(dir + "/" + MANIFEST_NAME, manifest.encode())
+}

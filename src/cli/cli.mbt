@@ -49,7 +49,7 @@ fn parse_count(s : String) -> Int32 raise @io.IoError {
 ///|
 fn open_log(dir : String) -> CliLog raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  @backend_native.recover_log_dir(dir, ROLL_SIZE)
+  @backend_native.open_log_dir(dir, ROLL_SIZE)
 }
 
 ///|
@@ -78,6 +78,7 @@ fn cmd_put(dir : String, key : String, value : String) -> Unit raise @io.IoError
   let log = open_log(dir)
   let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
   println("offset " + off.to_string())
+  @backend_native.flush_meta(dir, log)
   close_log(log)
 }
 
@@ -86,6 +87,7 @@ fn cmd_delete(dir : String, key : String) -> Unit raise @io.IoError {
   let log = open_log(dir)
   let off = log.delete(@utf8.encode(key), now_ms())
   println("offset " + off.to_string())
+  @backend_native.flush_meta(dir, log)
   close_log(log)
 }
 
@@ -138,11 +140,11 @@ fn cmd_prune(dir : String, keep : String) -> Unit raise @io.IoError {
   let log = open_log(dir)
   let n = parse_count(keep)
   let dropped = log.retain_last(n, seg => {
-    let path = dir + "/" + @segment.segment_file_name(seg.base_offset)
-    ignore(@backend_native.remove_file(path))
+    @backend_native.remove_segment_files(dir, seg.base_offset)
     seg.writer.close()
   })
   println("dropped " + dropped.to_string())
+  @backend_native.flush_meta(dir, log)
   close_log(log)
 }
 

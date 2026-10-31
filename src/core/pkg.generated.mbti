@@ -10,12 +10,21 @@ pub fn body_len_at(Bytes, Int32) -> Int32 raise DecodeError
 
 pub fn crc32(Bytes) -> UInt32
 
+pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
+
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
 
 pub fn slice(Bytes, Int32, Int32) -> Bytes
 
 // Errors
 pub(all) suberror DecodeError {
+  Truncated(Int32)
+  BadCrc(UInt32, UInt32)
+}
+
+pub(all) suberror MetaError {
+  BadMagic
+  BadVersion(UInt32)
   Truncated(Int32)
   BadCrc(UInt32, UInt32)
 }
