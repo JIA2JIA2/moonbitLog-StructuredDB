@@ -34,6 +34,7 @@ pub(all) struct Log[W, R] {
   roll_size : Int64
   mut next_offset : UInt64
   make : (UInt64) -> @segment.Segment[W, R] raise @io.IoError
+  sync : SyncPolicy
 }
 pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::build_key_index(Self[W, R]) -> KeyIndex raise @io.IoError
@@ -43,10 +44,11 @@ pub fn[W, R] Log::drop_before(Self[W, R], UInt64, (@segment.Segment[W, R]) -> Un
 pub fn[W, R : @io.LogReader] Log::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest(Self[W, R], KeyIndex, Bytes) -> @core.Record? raise @io.IoError
-pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError) -> Self[W, R]
+pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64
-pub fn[W, R] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]]) -> Self[W, R]
+pub fn[W, R] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]], sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R] Log::retain_last(Self[W, R], Int32, (@segment.Segment[W, R]) -> Unit) -> Int32
+pub fn[W, R] Log::retain_max_bytes(Self[W, R], Int64, (@segment.Segment[W, R]) -> Unit) -> Int32
 pub fn[W, R : @io.LogReader] Log::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
@@ -58,6 +60,13 @@ pub(all) struct Manifest {
   segment_bases : Array[UInt64]
 }
 pub fn Manifest::encode(Self) -> Bytes
+
+pub(all) enum SyncPolicy {
+  Never
+  Always
+} derive(Eq)
+pub fn SyncPolicy::equal(Self, Self) -> Bool
+pub fn SyncPolicy::not_equal(Self, Self) -> Bool
 
 // Type aliases
 pub type MakeSegment[W, R] = (UInt64) -> @segment.Segment[W, R] raise @io.IoError

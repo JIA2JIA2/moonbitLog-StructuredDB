@@ -3,6 +3,17 @@
 pub type MakeSegment[W, R] = (UInt64) -> @segment.Segment[W, R] raise @io.IoError
 
 ///|
+/// Durability policy for appends: `Never` leaves flushing to the caller,
+/// `Always` fsyncs after every appended record.
+pub(all) enum SyncPolicy {
+  Never
+  Always
+} derive(Eq)
+
+///|
+pub extend SyncPolicy with Eq::{equal, not_equal}
+
+///|
 /// Multi-segment append-only log. Records receive globally monotonic offsets;
 /// when the active segment grows past `roll_size` bytes a new segment is
 /// created and subsequent records go there. Segments are never modified once
@@ -12,11 +23,16 @@ pub(all) struct Log[W, R] {
   roll_size : Int64
   mut next_offset : UInt64
   make : MakeSegment[W, R]
+  sync : SyncPolicy
 }
 
 ///|
-pub fn[W, R] Log::new(roll_size : Int64, make : MakeSegment[W, R]) -> Log[W, R] {
-  { segments: [], roll_size, next_offset: 0, make, }
+pub fn[W, R] Log::new(
+  roll_size : Int64,
+  make : MakeSegment[W, R],
+  sync~ : SyncPolicy = SyncPolicy::Never,
+) -> Log[W, R] {
+  { segments: [], roll_size, next_offset: 0, make, sync, }
 }
 
 ///|
@@ -27,12 +43,13 @@ pub fn[W, R] Log::recover(
   roll_size : Int64,
   make : MakeSegment[W, R],
   segments : Array[@segment.Segment[W, R]],
+  sync~ : SyncPolicy = SyncPolicy::Never,
 ) -> Log[W, R] {
   let mut next : UInt64 = (0 : UInt64)
   if segments.length() > 0 {
     next = segments[segments.length() - 1].next_offset
   }
-  { segments, roll_size, next_offset: next, make, }
+  { segments, roll_size, next_offset: next, make, sync, }
 }
 
 ///|
@@ -79,6 +96,9 @@ pub fn[W : @io.LogWriter, R] Log::append(
   }
   let active = self.segments[self.segments.length() - 1]
   let offset = active.append(key, value, timestamp, kind=kind)
+  if self.sync is SyncPolicy::Always {
+    active.writer.flush()
+  }
   self.next_offset = offset + (1 : UInt64)
   offset
 }
@@ -224,6 +244,36 @@ pub fn[W, R] Log::retain_last(
       dropped = dropped + 1
     } else {
       kept.push(self.segments[i])
+    }
+  }
+  self.segments = kept
+  dropped
+}
+
+///|
+/// Retention by total bytes: drop the oldest rolled-over segments until the
+/// remaining bytes are at most `max_bytes`. The active segment is never
+/// dropped. Returns the number dropped.
+pub fn[W, R] Log::retain_max_bytes(
+  self : Log[W, R],
+  max_bytes : Int64,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 {
+  let n = self.segments.length()
+  let mut total : Int64 = 0
+  for seg in self.segments {
+    total = total + seg.size
+  }
+  let kept : Array[@segment.Segment[W, R]] = []
+  let mut dropped = 0
+  for i = 0; i < n; i = i + 1 {
+    let seg = self.segments[i]
+    if i < n - 1 && total > max_bytes {
+      on_drop(seg)
+      total = total - seg.size
+      dropped = dropped + 1
+    } else {
+      kept.push(seg)
     }
   }
   self.segments = kept

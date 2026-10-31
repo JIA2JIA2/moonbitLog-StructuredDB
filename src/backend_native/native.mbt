@@ -250,6 +250,7 @@ pub fn open_segment_in_dir(
 pub fn recover_log_dir(
   dir : String,
   roll_size : Int64,
+  sync~ : @log.SyncPolicy = @log.SyncPolicy::Never,
 ) -> @log.Log[NativeFileLog, NativeFileLog] raise @io.IoError {
   let names = list_dir(dir)
   let mut segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
@@ -270,7 +271,7 @@ pub fn recover_log_dir(
       }
     }
   }
-  @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs)
+  @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
 }
 
 ///|
@@ -360,10 +361,11 @@ fn load_segment(
 pub fn open_log_dir(
   dir : String,
   roll_size : Int64,
+  sync~ : @log.SyncPolicy = @log.SyncPolicy::Never,
 ) -> @log.Log[NativeFileLog, NativeFileLog] raise @io.IoError {
   let mpath = dir + "/" + MANIFEST_NAME
   if !file_exists(mpath) {
-    return recover_log_dir(dir, roll_size)
+    return recover_log_dir(dir, roll_size, sync=sync)
   }
   let manifest = try {
     Some(@log.decode_manifest(read_file(mpath)))
@@ -373,7 +375,7 @@ pub fn open_log_dir(
   match manifest {
     Some(m) => {
       if m.roll_size != roll_size {
-        recover_log_dir(dir, roll_size)
+        recover_log_dir(dir, roll_size, sync=sync)
       } else {
         let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
         for base in m.segment_bases {
@@ -382,10 +384,10 @@ pub fn open_log_dir(
             segs.push(seg)
           }
         }
-        @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs)
+        @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
       }
     }
-    None => recover_log_dir(dir, roll_size)
+    None => recover_log_dir(dir, roll_size, sync=sync)
   }
 }
 

@@ -11,7 +11,8 @@
 - **范围扫描**：`Segment::scan_range` / `Log::scan_range` 支持半开区间 `[from, to)`。
 - **崩溃恢复**：`Segment::recover` 顺序解码、遇 torn/CRC 失败的尾部即截断到最后一个完好边界并重建索引与计数；native 侧 `recover_log_dir` 打开目录恢复全部 `*.log` 段。
 - **Tombstone**：`Log::delete` 追加删除标记记录，历史不被改写。
-- **保留策略**：`Log::drop_before` / `Log::retain_last` 以整段删除的方式回收旧数据。
+- **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes`（按 offset / 段数 / 总字节）以整段删除方式回收旧数据。
+- **可配置持久化**：`SyncPolicy::Always` 让每次 append 后 `fsync`；CLI 用 `MOONLOG_SYNC=1` 开启。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **CLI**：native 命令行工具覆盖上述能力。
@@ -49,6 +50,7 @@ moonlog <command> <dir> [args...]
   scan <dir> [from] [to]        列出 [from, to) 区间记录
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
+  prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
   cursor <dir> <start> <limit>  按批读取消费游标
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   compact <dir>                 折叠为 live 记录并重写目录

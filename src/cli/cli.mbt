@@ -20,7 +20,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|cursor|compact|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|cursor|compact|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -47,9 +47,24 @@ fn parse_count(s : String) -> Int32 raise @io.IoError {
 }
 
 ///|
+/// Durability policy selected by the MOONLOG_SYNC environment variable
+/// (`1` / `always` -> fsync every append).
+fn desired_sync() -> @log.SyncPolicy {
+  match @env.get_env_var("MOONLOG_SYNC") {
+    Some(v) =>
+      if v == "1" || v == "always" {
+        @log.SyncPolicy::Always
+      } else {
+        @log.SyncPolicy::Never
+      }
+    None => @log.SyncPolicy::Never
+  }
+}
+
+///|
 fn open_log(dir : String) -> CliLog raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  @backend_native.open_log_dir(dir, ROLL_SIZE)
+  @backend_native.open_log_dir(dir, ROLL_SIZE, sync=desired_sync())
 }
 
 ///|
@@ -149,6 +164,21 @@ fn cmd_prune(dir : String, keep : String) -> Unit raise @io.IoError {
 }
 
 ///|
+fn cmd_prune_bytes(dir : String, max : String) -> Unit raise @io.IoError {
+  let limit = @string.parse_int64(max) catch {
+    _ => raise @io.IoError::Invalid("invalid bytes: " + max)
+  }
+  let log = open_log(dir)
+  let dropped = log.retain_max_bytes(limit, seg => {
+    @backend_native.remove_segment_files(dir, seg.base_offset)
+    seg.writer.close()
+  })
+  println("dropped " + dropped.to_string())
+  @backend_native.flush_meta(dir, log)
+  close_log(log)
+}
+
+///|
 fn cmd_cursor(dir : String, start : String, limit : String) -> Unit raise @io.IoError {
   let log = open_log(dir)
   let cur = @log.ConsumerCursor::new(parse_offset(start))
@@ -231,6 +261,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_prune(args[2], args[3])
+    }
+  } else if cmd == "prune-bytes" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_prune_bytes(args[2], args[3])
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {

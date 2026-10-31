@@ -259,3 +259,33 @@ test "open_log_dir falls back to recovery without meta" {
   }
   clean_dir(dir)
 }
+
+///|
+test "open_log_dir accepts an Always sync policy" {
+  let dir = "/tmp/moonlog_sync_always"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  }, sync=@log.SyncPolicy::Always)
+  for i = 0; i < 3; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64), sync=@log.SyncPolicy::Always) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 3)
+  let recs = reopened.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

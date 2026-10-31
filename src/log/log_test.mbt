@@ -347,3 +347,44 @@ test "snapshot folds to latest puts with renumbered offsets" {
   assert_eq(snap[1].key, b"c")
   assert_eq(snap[1].value, b"4")
 }
+
+///|
+test "retain_max_bytes drops oldest segments until under the limit" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 20; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 3)
+  let mut total : Int64 = 0
+  for seg in log.segments {
+    total = total + seg.size
+  }
+  let limit = total / 2
+  let dropped_bases : Array[UInt64] = []
+  let dropped = log.retain_max_bytes(limit, seg => {
+    dropped_bases.push(seg.base_offset)
+  })
+  assert_true(dropped >= 1)
+  assert_eq(dropped, dropped_bases.length())
+  let mut remaining : Int64 = 0
+  for seg in log.segments {
+    remaining = remaining + seg.size
+  }
+  assert_true(remaining <= limit || log.segment_count() == 1)
+}
+
+///|
+test "sync policy Always flushes on append" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+    sync=@log.SyncPolicy::Always,
+  )
+  ignore(log.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  assert_eq(log.count(), 1)
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 1)
+}
