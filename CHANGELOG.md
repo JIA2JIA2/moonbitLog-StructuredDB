@@ -17,6 +17,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   recovery scan when it does not match.
 - **Runnable examples (M17)**：`examples/mem_demo` demonstrates the in-memory
   backend end to end on wasm, js and native.
+- **Batch append (M18)**：`Log::append_batch` and the `put-batch` CLI command
+  append several records in one call.
+- **Integrity check (M19)**：`Log::verify` (with `VerifyReport`) and the `fsck`
+  CLI command sweep the log for segment gaps, offset jumps and decode errors.
+- **Named cursors (M20)**：`save_named_cursor` / `load_named_cursor` and the
+  `cursor-save` / `cursor-load` CLI commands persist independent consumer
+  positions as `CURSOR.<name>` files.
 
 ## 0.1.0 - 2026-10-31
 

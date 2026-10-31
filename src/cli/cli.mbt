@@ -17,6 +17,8 @@
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
+///   cursor-save <dir> <name> <pos>   persist a named consumer position
+///   cursor-load <dir> <name>         read a named consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
 ///   compact <dir>                    rewrite the directory with live keys
 ///   fsck <dir>                       verify record/offset integrity
@@ -30,7 +32,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|cursor-save|cursor-load|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -303,6 +305,31 @@ fn cmd_cursor_commit(dir : String, position : String) -> Unit raise @io.IoError 
 }
 
 ///|
+/// Persist a named consumer cursor position (`CURSOR.<name>`).
+fn cmd_cursor_save(
+  dir : String,
+  name : String,
+  position : String,
+) -> Unit raise @io.IoError {
+  if name.length() == 0 {
+    raise @io.IoError::Invalid("cursor name must not be empty")
+  }
+  let pos = parse_offset(position)
+  run_locked(dir, true, () => @backend_native.save_named_cursor(dir, name, pos))
+  println("cursor " + name + " " + pos.to_string())
+}
+
+///|
+/// Read a named consumer cursor position (`CURSOR.<name>`).
+fn cmd_cursor_load(dir : String, name : String) -> Unit raise @io.IoError {
+  if name.length() == 0 {
+    raise @io.IoError::Invalid("cursor name must not be empty")
+  }
+  let pos = @backend_native.load_named_cursor(dir, name)
+  println("cursor " + name + " " + pos.to_string())
+}
+
+///|
 fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -407,6 +434,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_cursor_commit(args[2], args[3])
+    }
+  } else if cmd == "cursor-save" {
+    if args.length() < 5 {
+      println(USAGE)
+    } else {
+      cmd_cursor_save(args[2], args[3], args[4])
+    }
+  } else if cmd == "cursor-load" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_cursor_load(args[2], args[3])
     }
   } else {
     println(USAGE)

@@ -336,6 +336,33 @@ test "corrupt cursor file falls back to zero" {
 }
 
 ///|
+test "named cursor positions round-trip independently" {
+  let dir = "/tmp/moonlog_named_cursor"
+  ignore(@backend_native.ensure_dir(dir))
+  ignore(
+    @backend_native.remove_file(@backend_native.named_cursor_path(dir, "alice")),
+  )
+  ignore(
+    @backend_native.remove_file(@backend_native.named_cursor_path(dir, "bob")),
+  )
+  assert_eq(@backend_native.load_named_cursor(dir, "alice"), (0 : UInt64))
+  @backend_native.save_named_cursor(dir, "alice", (7 : UInt64)) catch {
+    _ => panic()
+  }
+  @backend_native.save_named_cursor(dir, "bob", (3 : UInt64)) catch {
+    _ => panic()
+  }
+  assert_eq(@backend_native.load_named_cursor(dir, "alice"), (7 : UInt64))
+  assert_eq(@backend_native.load_named_cursor(dir, "bob"), (3 : UInt64))
+  ignore(
+    @backend_native.remove_file(@backend_native.named_cursor_path(dir, "alice")),
+  )
+  ignore(
+    @backend_native.remove_file(@backend_native.named_cursor_path(dir, "bob")),
+  )
+}
+
+///|
 test "open_log_dir detects a truncated segment and recovers" {
   let dir = "/tmp/moonlog_manifest_size"
   ignore(@backend_native.ensure_dir(dir))

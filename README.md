@@ -58,6 +58,8 @@ moonlog <command> <dir> [args...]
   prune-before <dir> <timestamp> 回收末条记录早于 timestamp 的段
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
+  cursor-save <dir> <name> <pos> 持久化命名消费游标位置
+  cursor-load <dir> <name>      读取命名消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   compact <dir>                 折叠为 live 记录并重写目录
   fsck <dir>                    校验记录/offset 完整性
@@ -89,7 +91,7 @@ $EXE scan /tmp/log
 | `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
-| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、目录锁 |
+| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` / `save_named_cursor` | `backend_native` | 文件后端、打开快路径、目录锁、命名游标 |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
 
@@ -169,6 +171,7 @@ u32 crc32          (仅覆盖 body)
 - M17 `examples/mem_demo` 可运行示例（wasm/js/native）
 - M18 批量写入 `Log::append_batch` 与 CLI `put-batch`
 - M19 完整性校验 `Log::verify` 与 CLI `fsck`
+- M20 命名消费者游标（`cursor-save` / `cursor-load`）
 
 ## 许可
 

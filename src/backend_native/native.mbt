@@ -475,6 +475,34 @@ pub fn save_cursor(dir : String, position : UInt64) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Path of a named consumer cursor's position file (`CURSOR.<name>`), letting
+/// several independent consumers track their own committed positions.
+pub fn named_cursor_path(dir : String, name : String) -> String {
+  dir + "/CURSOR." + name
+}
+
+///|
+/// Read a named consumer position, defaulting to 0 when absent or corrupt.
+pub fn load_named_cursor(dir : String, name : String) -> UInt64 {
+  let data = read_file(named_cursor_path(dir, name))
+  if data.length() == 0 {
+    (0 : UInt64)
+  } else {
+    @log.decode_cursor(data) catch { _ => (0 : UInt64) }
+  }
+}
+
+///|
+/// Persist a named consumer position (truncate + write + fsync).
+pub fn save_named_cursor(
+  dir : String,
+  name : String,
+  position : UInt64,
+) -> Unit raise @io.IoError {
+  write_file(named_cursor_path(dir, name), @log.encode_cursor(position))
+}
+
+///|
 extern "C" fn moonlog_flock(fd : Int32, exclusive : Int32) -> Int32 = "moonlog_flock"
 
 ///|
