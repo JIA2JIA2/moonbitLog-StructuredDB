@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MoonBit
+        uses: moonbitlang/setup-moonbit@v1
+
+      - name: Show toolchain version
+        run: moon version
+
+      - name: Type-check (native)
+        run: moon check --target native
+
+      - name: Build native (includes CLI)
+        run: moon build --target native
+
+      - name: Test (wasm)
+        run: moon test
+
+      - name: Test (native)
+        run: moon test --target native
+
+      - name: Benchmark (native)
+        run: moon bench --target native

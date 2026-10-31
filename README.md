@@ -16,6 +16,7 @@
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
+- **工程化**：property/fuzz 随机截断与损坏恢复测试、`moon bench` 基准、GitHub Actions CI。
 - **CLI**：native 命令行工具覆盖上述能力。
 
 ## 包结构
@@ -36,6 +37,7 @@
 moon build --target native   # 构建（含 CLI）
 moon test                    # wasm 目标测试
 moon test --target native    # native 目标测试
+moon bench --target native   # 基准：追加 / 点查 / 范围扫描 / 恢复
 ```
 
 ## CLI 用法
@@ -68,6 +70,40 @@ $EXE put /tmp/log user:2 bob
 $EXE delete /tmp/log user:2
 $EXE scan /tmp/log
 ```
+
+## API 概览
+
+| 类型 / 函数 | 包 | 用途 |
+| --- | --- | --- |
+| `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
+| `Log::append` / `Log::delete` | `log` | 追加记录 / tombstone，返回全局 offset |
+| `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
+| `Log::retain_last` / `retain_max_bytes` / `drop_before` | `log` | 段级保留策略 |
+| `Log::build_key_index` / `get_latest` / `snapshot` | `log` | KV 逻辑视图 / 折叠为 live 记录 |
+| `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
+| `SyncPolicy` | `log` | `Never` / `Always` 持久化策略 |
+| `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
+| `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
+| `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
+| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、目录锁 |
+| `Record` / `crc32` | `core` | 记录编解码 |
+| `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
+
+## 在 wasm / JS 中使用
+
+内存后端 `backend_mem` 不依赖 native FFI，可直接在 wasm / js 目标构建运行（`moon test` 即在该目标下执行）。构造一个内存日志：
+
+```moonbit
+let store = @backend_mem.MemLog::new()
+let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+  1_048_576,
+  base => @segment.Segment::new(store, store, base),
+)
+ignore(log.append(b"user:1", b"alice", 0))
+let recs = log.scan()
+```
+
+需要真实文件持久化时改用 `backend_native`（仅 native 目标），二者接口一致，业务代码无需改动。
 
 ## 磁盘格式
 
@@ -113,6 +149,7 @@ u32 crc32          (仅覆盖 body)
 - M10 key 索引、快照与 `compact`
 - M11 可配置 durability（`SyncPolicy`）与按字节保留
 - M12 `flock` 目录锁、读快照与 CLI 游标持久化
+- M13 property/fuzz 恢复测试、`moon bench`、CI 与 API/CHANGELOG 文档
 
 ## 许可
 
