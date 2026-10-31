@@ -238,7 +238,11 @@ pub fn open_segment_in_dir(
   base : UInt64,
 ) -> @segment.Segment[NativeFileLog, NativeFileLog] raise @io.IoError {
   let path = dir + "/" + @segment.segment_file_name(base)
+  let existed = file_exists(path)
   let f = NativeFileLog::open(path)
+  if !existed {
+    fsync_dir(dir)
+  }
   @segment.Segment::new(f, f, base)
 }
 
@@ -357,6 +361,7 @@ fn write_file_atomic(
 pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
   ignore(remove_file(dir + "/" + @segment.segment_file_name(base)))
   ignore(remove_file(segment_index_path(dir, base)))
+  ignore(fsync_dir(dir) catch { _ => () })
 }
 
 ///|
@@ -493,9 +498,13 @@ pub fn flush_meta(
 }
 
 ///|
+/// Name of the default consumer-cursor position file.
+pub const CURSOR_NAME : String = "CURSOR"
+
+///|
 /// File under a log directory holding the CLI's committed consumer position.
 pub fn cursor_path(dir : String) -> String {
-  dir + "/CURSOR"
+  dir + "/" + CURSOR_NAME
 }
 
 ///|
@@ -513,16 +522,23 @@ pub fn load_cursor(dir : String) -> UInt64 {
 }
 
 ///|
-/// Persist a consumer position (truncate + write + fsync).
+/// Persist a consumer position (atomic replace, so a crash leaves either the
+/// previous position or the new one).
 pub fn save_cursor(dir : String, position : UInt64) -> Unit raise @io.IoError {
-  write_file(cursor_path(dir), @log.encode_cursor(position))
+  write_file_atomic(dir, CURSOR_NAME, @log.encode_cursor(position))
+}
+
+///|
+/// File name of a named consumer cursor's position file (`CURSOR.<name>`).
+fn named_cursor_name(name : String) -> String {
+  CURSOR_NAME + "." + name
 }
 
 ///|
 /// Path of a named consumer cursor's position file (`CURSOR.<name>`), letting
 /// several independent consumers track their own committed positions.
 pub fn named_cursor_path(dir : String, name : String) -> String {
-  dir + "/CURSOR." + name
+  dir + "/" + named_cursor_name(name)
 }
 
 ///|
@@ -539,13 +555,13 @@ pub fn load_named_cursor(dir : String, name : String) -> UInt64 {
 }
 
 ///|
-/// Persist a named consumer position (truncate + write + fsync).
+/// Persist a named consumer position (atomic replace).
 pub fn save_named_cursor(
   dir : String,
   name : String,
   position : UInt64,
 ) -> Unit raise @io.IoError {
-  write_file(named_cursor_path(dir, name), @log.encode_cursor(position))
+  write_file_atomic(dir, named_cursor_name(name), @log.encode_cursor(position))
 }
 
 ///|

@@ -474,3 +474,23 @@ test "flush_meta replaces metadata atomically without temp leftovers" {
   }
   clean_dir(dir)
 }
+
+///|
+test "cursor writes are atomic and leave no temp files" {
+  let dir = "/tmp/moonlog_cursor_atomic"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  @backend_native.save_cursor(dir, (9 : UInt64)) catch {
+    _ => panic()
+  }
+  @backend_native.save_named_cursor(dir, "alice", (4 : UInt64)) catch {
+    _ => panic()
+  }
+  let names = @backend_native.list_dir(dir)
+  for name in names {
+    assert_true(!name.has_suffix(".tmp"))
+  }
+  assert_eq(@backend_native.load_cursor(dir), (9 : UInt64))
+  assert_eq(@backend_native.load_named_cursor(dir, "alice"), (4 : UInt64))
+  clean_dir(dir)
+}

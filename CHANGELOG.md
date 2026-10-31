@@ -29,6 +29,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   never leave a half-written metadata file.
 - **Group commit (M22)**：`SyncPolicy::Batch` defers fsync to the end of
   `append_batch`, and `Log::flush` exposes an explicit fsync point.
+- **Creation/deletion hardening (M23)**：newly created segment files and
+  retention deletions fsync the directory, and cursor files are written
+  atomically.
 
 ## 0.1.0 - 2026-10-31
 

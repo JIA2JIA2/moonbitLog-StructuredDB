@@ -149,7 +149,7 @@ u32 crc32          (仅覆盖 body)
 ### 目录锁与游标文件（M12）
 
 - `LOCK`：`flock` 建议锁的载体。写者取独占锁，读者取共享锁，均以非阻塞方式获取，冲突即快速失败而非死等；`compact` 会保留该文件。
-- `CURSOR`：CLI 持久化的消费游标位置。编码为 `u32 magic("MLCU") + u64 position + u32 crc32`，损坏或缺失时回退为 `0`。
+- `CURSOR` / `CURSOR.<name>`：CLI 持久化的（命名）消费游标位置。编码为 `u32 magic("MLCU") + u64 position + u32 crc32`，损坏或缺失时回退为 `0`；写入采用原子替换。
 
 ## 里程碑
 
@@ -175,6 +175,7 @@ u32 crc32          (仅覆盖 body)
 - M20 命名消费者游标（`cursor-save` / `cursor-load`）
 - M21 元数据原子写（tmp + fsync + rename + fsync 目录）
 - M22 组提交：`SyncPolicy::Batch` 与 `Log::flush`（批量写只 fsync 一次）
+- M23 创建/删除加固：新建段与删除段后 fsync 目录，游标原子写
 
 ## 许可
 
