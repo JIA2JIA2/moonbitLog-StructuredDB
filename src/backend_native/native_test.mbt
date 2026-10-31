@@ -494,3 +494,35 @@ test "cursor writes are atomic and leave no temp files" {
   assert_eq(@backend_native.load_named_cursor(dir, "alice"), (4 : UInt64))
   clean_dir(dir)
 }
+
+///|
+test "named cursors can be listed and removed" {
+  let dir = "/tmp/moonlog_cursor_list"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  @backend_native.save_named_cursor(dir, "alice", (1 : UInt64)) catch {
+    _ => panic()
+  }
+  @backend_native.save_named_cursor(dir, "bob", (2 : UInt64)) catch {
+    _ => panic()
+  }
+  let names = @backend_native.list_named_cursors(dir) catch { _ => panic() }
+  assert_eq(names.length(), 2)
+  let mut saw_alice = false
+  let mut saw_bob = false
+  for name in names {
+    if name == "alice" {
+      saw_alice = true
+    }
+    if name == "bob" {
+      saw_bob = true
+    }
+  }
+  assert_true(saw_alice)
+  assert_true(saw_bob)
+  @backend_native.remove_named_cursor(dir, "alice")
+  assert_eq(@backend_native.load_named_cursor(dir, "alice"), (0 : UInt64))
+  let remaining = @backend_native.list_named_cursors(dir) catch { _ => panic() }
+  assert_eq(remaining.length(), 1)
+  clean_dir(dir)
+}

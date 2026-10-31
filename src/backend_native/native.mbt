@@ -502,6 +502,10 @@ pub fn flush_meta(
 pub const CURSOR_NAME : String = "CURSOR"
 
 ///|
+/// File-name prefix shared by named consumer cursors (`CURSOR.<name>`).
+pub const CURSOR_PREFIX : String = "CURSOR."
+
+///|
 /// File under a log directory holding the CLI's committed consumer position.
 pub fn cursor_path(dir : String) -> String {
   dir + "/" + CURSOR_NAME
@@ -531,7 +535,7 @@ pub fn save_cursor(dir : String, position : UInt64) -> Unit raise @io.IoError {
 ///|
 /// File name of a named consumer cursor's position file (`CURSOR.<name>`).
 fn named_cursor_name(name : String) -> String {
-  CURSOR_NAME + "." + name
+  CURSOR_PREFIX + name
 }
 
 ///|
@@ -562,6 +566,29 @@ pub fn save_named_cursor(
   position : UInt64,
 ) -> Unit raise @io.IoError {
   write_file_atomic(dir, named_cursor_name(name), @log.encode_cursor(position))
+}
+
+///|
+/// Names of all persisted named consumer cursors in `dir`, without the
+/// `CURSOR.` prefix.
+pub fn list_named_cursors(dir : String) -> Array[String] raise @io.IoError {
+  let out : Array[String] = []
+  for name in list_dir(dir) {
+    if name.has_prefix(CURSOR_PREFIX) {
+      match name.strip_prefix(CURSOR_PREFIX) {
+        Some(suffix) => out.push(suffix.to_owned())
+        None => ()
+      }
+    }
+  }
+  out
+}
+
+///|
+/// Delete a named consumer cursor's position file.
+pub fn remove_named_cursor(dir : String, name : String) -> Unit {
+  ignore(remove_file(named_cursor_path(dir, name)))
+  ignore(fsync_dir(dir) catch { _ => () })
 }
 
 ///|

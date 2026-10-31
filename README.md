@@ -61,6 +61,8 @@ moonlog <command> <dir> [args...]
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
   cursor-load <dir> <name>      读取命名消费游标位置
+  cursor-list <dir>             列出全部命名消费游标位置
+  cursor-drop <dir> <name>      删除命名消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
   compact <dir>                 折叠为 live 记录并重写目录
@@ -93,7 +95,8 @@ $EXE scan /tmp/log
 | `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
-| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` / `save_named_cursor` | `backend_native` | 文件后端、打开快路径、目录锁、命名游标 |
+| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、目录锁 |
+| `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
 
@@ -179,6 +182,7 @@ u32 crc32          (仅覆盖 body)
 - M22 组提交：`SyncPolicy::Batch` 与 `Log::flush`（批量写只 fsync 一次）
 - M23 创建/删除加固：新建段与删除段后 fsync 目录，游标原子写
 - M26 记录级 TTL：`Log::get_latest_at` / `Log::scan_live` 与 CLI `getkey-live` / `prune-expired`
+- M27 命名游标管理：`list_named_cursors` / `remove_named_cursor` 与 CLI `cursor-list` / `cursor-drop`
 
 ## 许可
 

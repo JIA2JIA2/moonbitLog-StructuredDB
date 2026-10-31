@@ -35,6 +35,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Record TTL (M26)**：`Log::get_latest_at` / `Log::scan_live` filter records
   older than a ttl at a given `now`, with `getkey-live` / `prune-expired` CLI
   commands.
+- **Named cursor management (M27)**：`list_named_cursors` /
+  `remove_named_cursor` and the `cursor-list` / `cursor-drop` CLI commands.
 
 ## 0.1.0 - 2026-10-31
 
