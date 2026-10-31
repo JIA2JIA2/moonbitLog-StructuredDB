@@ -27,7 +27,12 @@ pub fn[W, R] Segment::new(
   reader : R,
   base_offset : UInt64,
 ) -> Segment[W, R] {
-  Segment::new_with_index_interval(writer, reader, base_offset, DEFAULT_INDEX_INTERVAL)
+  Segment::new_with_index_interval(
+    writer,
+    reader,
+    base_offset,
+    DEFAULT_INDEX_INTERVAL,
+  )
 }
 
 ///|
@@ -157,7 +162,7 @@ pub fn[W, R : @io.LogReader] Segment::for_each(
     let loaded = self.load_record_at(pos)
     match loaded {
       None => go = false
-      Some((rec, next)) => {
+      Some((rec, next)) =>
         if rec.offset >= hi {
           go = false
         } else {
@@ -166,7 +171,6 @@ pub fn[W, R : @io.LogReader] Segment::for_each(
           }
           pos = next
         }
-      }
     }
   }
 }
@@ -219,7 +223,7 @@ pub fn[W, R : @io.LogReader] Segment::get(
     let loaded = self.load_record_at(pos)
     match loaded {
       None => go = false
-      Some((rec, next)) => {
+      Some((rec, next)) =>
         if rec.offset == offset {
           result = Some(rec)
           go = false
@@ -228,7 +232,6 @@ pub fn[W, R : @io.LogReader] Segment::get(
         } else {
           pos = next
         }
-      }
     }
   }
   result

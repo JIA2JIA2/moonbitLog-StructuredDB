@@ -271,7 +271,12 @@ pub fn recover_log_dir(
       }
     }
   }
-  @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
+  @log.Log::recover(
+    roll_size,
+    base => open_segment_in_dir(dir, base),
+    segs,
+    sync~,
+  )
 }
 
 ///|
@@ -323,26 +328,21 @@ fn load_segment(
 ) -> @segment.Segment[NativeFileLog, NativeFileLog] raise @io.IoError {
   let f = NativeFileLog::open(dir + "/" + @segment.segment_file_name(base))
   let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
-    f,
-    f,
-    base,
+    f, f, base,
   )
   let ip = segment_index_path(dir, base)
   let restored = if file_exists(ip) {
-    let meta = try {
-      Some(@segment.decode_segment_meta(read_file(ip)))
-    } catch {
+    let meta = Some(@segment.decode_segment_meta(read_file(ip))) catch {
       _ => None
     }
     match meta {
-      Some(m) => {
+      Some(m) =>
         if m.base_offset == base {
           seg.apply_meta(m)
           true
         } else {
           false
         }
-      }
       None => false
     }
   } else {
@@ -361,11 +361,7 @@ fn load_segment(
 /// sidecar index would otherwise mask.
 fn segment_file_size(dir : String, base : UInt64) -> Int64 {
   let path = dir + "/" + @segment.segment_file_name(base)
-  let opened = try {
-    Some(NativeFileLog::open(path))
-  } catch {
-    _ => None
-  }
+  let opened = Some(NativeFileLog::open(path)) catch { _ => None }
   match opened {
     Some(f) => {
       let s = f.size
@@ -387,17 +383,15 @@ pub fn open_log_dir(
 ) -> @log.Log[NativeFileLog, NativeFileLog] raise @io.IoError {
   let mpath = dir + "/" + MANIFEST_NAME
   if !file_exists(mpath) {
-    return recover_log_dir(dir, roll_size, sync=sync)
+    return recover_log_dir(dir, roll_size, sync~)
   }
-  let manifest = try {
-    Some(@log.decode_manifest(read_file(mpath)))
-  } catch {
+  let manifest = Some(@log.decode_manifest(read_file(mpath))) catch {
     _ => None
   }
   match manifest {
-    Some(m) => {
+    Some(m) =>
       if m.roll_size != roll_size {
-        recover_log_dir(dir, roll_size, sync=sync)
+        recover_log_dir(dir, roll_size, sync~)
       } else {
         let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
         let mut consistent = true
@@ -414,16 +408,20 @@ pub fn open_log_dir(
           i = i + 1
         }
         if consistent {
-          @log.Log::recover(roll_size, base => open_segment_in_dir(dir, base), segs, sync=sync)
+          @log.Log::recover(
+            roll_size,
+            base => open_segment_in_dir(dir, base),
+            segs,
+            sync~,
+          )
         } else {
           for seg in segs {
             seg.writer.close()
           }
-          recover_log_dir(dir, roll_size, sync=sync)
+          recover_log_dir(dir, roll_size, sync~)
         }
       }
-    }
-    None => recover_log_dir(dir, roll_size, sync=sync)
+    None => recover_log_dir(dir, roll_size, sync~)
   }
 }
 
@@ -464,7 +462,9 @@ pub fn load_cursor(dir : String) -> UInt64 {
   if data.length() == 0 {
     (0 : UInt64)
   } else {
-    @log.decode_cursor(data) catch { _ => (0 : UInt64) }
+    @log.decode_cursor(data) catch {
+      _ => (0 : UInt64)
+    }
   }
 }
 
@@ -488,7 +488,9 @@ pub fn load_named_cursor(dir : String, name : String) -> UInt64 {
   if data.length() == 0 {
     (0 : UInt64)
   } else {
-    @log.decode_cursor(data) catch { _ => (0 : UInt64) }
+    @log.decode_cursor(data) catch {
+      _ => (0 : UInt64)
+    }
   }
 }
 
@@ -517,7 +519,10 @@ pub(all) struct DirLock {
 ///|
 /// Acquire the `LOCK` file in `dir`. `exclusive` selects a writer lock;
 /// otherwise a shared reader lock is taken.
-pub fn DirLock::acquire(dir : String, exclusive : Bool) -> DirLock raise @io.IoError {
+pub fn DirLock::acquire(
+  dir : String,
+  exclusive : Bool,
+) -> DirLock raise @io.IoError {
   let path = dir + "/LOCK"
   let fd = moonlog_open_rw(@utf8.encode(path))
   if fd < 0 {

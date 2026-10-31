@@ -6,7 +6,7 @@ fn prop_lcg(state : UInt64) -> UInt64 {
 }
 
 ///|
-fn prop_bytes(n : Int) -> Bytes {
+fn prop_bytes(n : Int32) -> Bytes {
   let buf = @buffer.Buffer::Buffer()
   for i = 0; i < n; i = i + 1 {
     buf.write_byte((i % 251).to_byte())
@@ -41,7 +41,9 @@ test "random tail truncation always recovers an exact prefix" {
     let total = seg.byte_size()
     s = prop_lcg(s)
     let cut = (s % (total.reinterpret_as_uint64() + 1)).reinterpret_as_int64()
-    store.truncate(cut) catch { _ => panic() }
+    store.truncate(cut) catch {
+      _ => panic()
+    }
     let seg2 : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
       store,
       store,
@@ -95,7 +97,8 @@ test "random in-body corruption truncates to the damaged record" {
     let start = if victim == 0 { (0 : Int64) } else { ends[victim - 1] }
     let span = ends[victim] - start - (4 : Int64)
     s = prop_lcg(s)
-    let flip = (start + (4 : Int64)).to_int() + (s % span.reinterpret_as_uint64()).to_int()
+    let flip = (start + (4 : Int64)).to_int() +
+      (s % span.reinterpret_as_uint64()).to_int()
     let buf = @buffer.Buffer::Buffer()
     for i = 0; i < raw.length(); i = i + 1 {
       if i == flip {

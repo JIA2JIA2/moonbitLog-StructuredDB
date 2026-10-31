@@ -102,7 +102,9 @@ test "native recover_log_dir ignores a torn tail and keeps appending" {
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
   ] = @log.Log::new((1_000_000 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
   })
   ignore(log.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
   ignore(log.append(b"k", b"b", (1 : Int64)) catch { _ => panic() })
@@ -137,7 +139,9 @@ test "native recover_log_dir rebuilds every rolled segment" {
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
   ] = @log.Log::new((100 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
   })
   for i = 0; i < 8; i = i + 1 {
     ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
@@ -201,12 +205,16 @@ test "open_log_dir uses persisted meta on the fast path" {
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
   ] = @log.Log::new((1_000_000 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
   })
   for i = 0; i < 5; i = i + 1 {
     ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
   }
-  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
   for seg in log.segments {
     seg.writer.close()
   }
@@ -236,12 +244,16 @@ test "open_log_dir falls back to recovery without meta" {
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
   ] = @log.Log::new((1_000_000 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
   })
   for i = 0; i < 4; i = i + 1 {
     ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
   }
-  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
   for seg in log.segments {
     seg.writer.close()
   }
@@ -268,17 +280,29 @@ test "open_log_dir accepts an Always sync policy" {
   let log : @log.Log[
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
-  ] = @log.Log::new((1_000_000 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
-  }, sync=@log.SyncPolicy::Always)
+  ] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => {
+      @backend_native.open_segment_in_dir(dir, base) catch {
+        _ => panic()
+      }
+    },
+    sync=@log.SyncPolicy::Always,
+  )
   for i = 0; i < 3; i = i + 1 {
     ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
   }
-  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
   for seg in log.segments {
     seg.writer.close()
   }
-  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64), sync=@log.SyncPolicy::Always) catch {
+  let reopened = @backend_native.open_log_dir(
+    dir,
+    (1_000_000 : Int64),
+    sync=@log.SyncPolicy::Always,
+  ) catch {
     _ => panic()
   }
   assert_eq(reopened.count(), 3)
@@ -317,9 +341,13 @@ test "cursor position round-trips through the cursor file" {
   ignore(@backend_native.ensure_dir(dir))
   ignore(@backend_native.remove_file(@backend_native.cursor_path(dir)))
   assert_eq(@backend_native.load_cursor(dir), (0 : UInt64))
-  @backend_native.save_cursor(dir, (42 : UInt64)) catch { _ => panic() }
+  @backend_native.save_cursor(dir, (42 : UInt64)) catch {
+    _ => panic()
+  }
   assert_eq(@backend_native.load_cursor(dir), (42 : UInt64))
-  @backend_native.save_cursor(dir, (0 : UInt64)) catch { _ => panic() }
+  @backend_native.save_cursor(dir, (0 : UInt64)) catch {
+    _ => panic()
+  }
   assert_eq(@backend_native.load_cursor(dir), (0 : UInt64))
   ignore(@backend_native.remove_file(@backend_native.cursor_path(dir)))
 }
@@ -371,19 +399,25 @@ test "open_log_dir detects a truncated segment and recovers" {
     @backend_native.NativeFileLog,
     @backend_native.NativeFileLog,
   ] = @log.Log::new((1_000_000 : Int64), base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
   })
   for i = 0; i < 6; i = i + 1 {
     ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
   }
-  @backend_native.flush_meta(dir, log) catch { _ => panic() }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
   let size = log.segments[0].byte_size()
   for seg in log.segments {
     seg.writer.close()
   }
   let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
   let f = @backend_native.NativeFileLog::open(path) catch { _ => panic() }
-  f.truncate(size / (2 : Int64)) catch { _ => panic() }
+  f.truncate(size / (2 : Int64)) catch {
+    _ => panic()
+  }
   f.close()
   let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
     _ => panic()

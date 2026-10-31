@@ -150,11 +150,7 @@ pub fn decode_record(
     raise DecodeError::Truncated(pos)
   }
   let flag = data.at(body_start)
-  let kind = if flag == 1 {
-    RecordKind::Delete
-  } else {
-    RecordKind::Put
-  }
+  let kind = if flag == 1 { RecordKind::Delete } else { RecordKind::Put }
   let offset = read_u64_le(data, body_start + 1)
   let timestamp = read_i64_le(data, body_start + 9)
   let key_len = u32_as_int(read_u32_le(data, body_start + 17))

@@ -95,7 +95,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
     self.segments.push(seg)
   }
   let active = self.segments[self.segments.length() - 1]
-  let offset = active.append(key, value, timestamp, kind=kind)
+  let offset = active.append(key, value, timestamp, kind~)
   if self.sync is SyncPolicy::Always {
     active.writer.flush()
   }
@@ -345,9 +345,7 @@ pub(all) struct VerifyReport {
 /// contiguously and that every record decodes with the expected offset. The
 /// first inconsistency (a segment gap, an offset jump, or a decode error) is
 /// reported via `first_bad_offset`; a healthy log leaves it empty.
-pub fn[W, R : @io.LogReader] Log::verify(
-  self : Log[W, R],
-) -> VerifyReport {
+pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
   let mut expected : UInt64 = 0
   let mut records : Int32 = 0
   let mut bad_found = false
@@ -357,9 +355,7 @@ pub fn[W, R : @io.LogReader] Log::verify(
       bad_found = true
       bad_at = expected
     }
-    let recs = try {
-      seg.scan()
-    } catch {
+    let recs = seg.scan() catch {
       _ => {
         if !bad_found {
           bad_found = true
@@ -380,6 +376,10 @@ pub fn[W, R : @io.LogReader] Log::verify(
   {
     segments: self.segments.length(),
     records,
-    first_bad_offset: if bad_found { Some(bad_at) } else { None },
+    first_bad_offset: if bad_found {
+      Some(bad_at)
+    } else {
+      None
+    },
   }
 }

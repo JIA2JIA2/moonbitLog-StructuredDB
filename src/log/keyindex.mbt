@@ -73,11 +73,7 @@ pub fn[W, R : @io.LogReader] Log::snapshot(
   self.for_each((0 : UInt64), self.next_offset, rec => {
     if !rec.is_delete() {
       match index.latest(rec.key) {
-        Some(off) => {
-          if off == rec.offset {
-            live.push(rec)
-          }
-        }
+        Some(off) => if off == rec.offset { live.push(rec) }
         None => ()
       }
     }

@@ -6,7 +6,9 @@
 ///   moon run examples/mem_demo --target native
 ///   moon run examples/mem_demo --target wasm
 fn show(b : Bytes) -> String {
-  @utf8.decode(b) catch { _ => "<binary>" }
+  @utf8.decode(b) catch {
+    _ => "<binary>"
+  }
 }
 
 ///|

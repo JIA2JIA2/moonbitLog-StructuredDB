@@ -26,7 +26,10 @@
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
 /// CLI invocation never observes a half-written directory.
-type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFileLog]
+type CliLog = @log.Log[
+  @backend_native.NativeFileLog,
+  @backend_native.NativeFileLog,
+]
 
 ///|
 const ROLL_SIZE : Int64 = 1_048_576
@@ -41,7 +44,9 @@ fn now_ms() -> Int64 {
 
 ///|
 fn bytes_to_string(b : Bytes) -> String {
-  @utf8.decode(b) catch { _ => "<binary:" + b.length().to_string() + ">" }
+  @utf8.decode(b) catch {
+    _ => "<binary:" + b.length().to_string() + ">"
+  }
 }
 
 ///|
@@ -114,7 +119,11 @@ fn print_record(rec : @core.Record) -> Unit {
 }
 
 ///|
-fn cmd_put(dir : String, key : String, value : String) -> Unit raise @io.IoError {
+fn cmd_put(
+  dir : String,
+  key : String,
+  value : String,
+) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
     let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
@@ -173,7 +182,11 @@ fn cmd_get(dir : String, offset : String) -> Unit raise @io.IoError {
 }
 
 ///|
-fn cmd_scan(dir : String, from : String?, to : String?) -> Unit raise @io.IoError {
+fn cmd_scan(
+  dir : String,
+  from : String?,
+  to : String?,
+) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let lo = match from {
@@ -278,7 +291,11 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
 ///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
-fn cmd_cursor(dir : String, start : String, limit : String) -> Unit raise @io.IoError {
+fn cmd_cursor(
+  dir : String,
+  start : String,
+  limit : String,
+) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let from = if start == "-" || start == "auto" {
       @backend_native.load_cursor(dir)
@@ -455,11 +472,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
 ///|
 fn main {
   let args = @env.args()
-  try {
-    dispatch(args)
-  } catch {
+  dispatch(args) catch {
     @io.IoError::Closed => println("error: io closed")
-    @io.IoError::OutOfBounds(o) => println("error: out of bounds " + o.to_string())
+    @io.IoError::OutOfBounds(o) =>
+      println("error: out of bounds " + o.to_string())
     @io.IoError::Corrupt(o) => println("error: corrupt at " + o.to_string())
     @io.IoError::Syscall(c) => println("error: syscall " + c.to_string())
     @io.IoError::Invalid(m) => println("error: " + m)

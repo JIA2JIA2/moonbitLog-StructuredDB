@@ -108,10 +108,5 @@ pub fn decode_manifest(data : Bytes) -> Manifest raise @core.MetaError {
     pos = pos + 16
     i = i + 1
   }
-  {
-    roll_size,
-    next_offset,
-    segment_bases: bases,
-    segment_sizes: sizes,
-  }
+  { roll_size, next_offset, segment_bases: bases, segment_sizes: sizes, }
 }

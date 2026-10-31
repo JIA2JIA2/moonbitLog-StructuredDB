@@ -140,7 +140,10 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
 ///|
 /// Restore counters and the sparse index from persisted metadata, marking the
 /// segment as loaded from metadata (so recovery can be skipped).
-pub fn[W, R] Segment::apply_meta(self : Segment[W, R], meta : SegmentMeta) -> Unit {
+pub fn[W, R] Segment::apply_meta(
+  self : Segment[W, R],
+  meta : SegmentMeta,
+) -> Unit {
   self.base_offset = meta.base_offset
   self.next_offset = meta.next_offset
   self.record_count = meta.record_count.reinterpret_as_int()

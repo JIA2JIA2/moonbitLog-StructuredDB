@@ -1,5 +1,7 @@
 ///|
-fn bench_new_log(roll : Int64) -> @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] {
+fn bench_new_log(
+  roll : Int64,
+) -> @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] {
   @log.Log::new(roll, base => {
     let store = @backend_mem.MemLog::new()
     @segment.Segment::new(store, store, base)
@@ -9,7 +11,7 @@ fn bench_new_log(roll : Int64) -> @log.Log[@backend_mem.MemLog, @backend_mem.Mem
 ///|
 fn bench_fill_append(
   log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog],
-  n : Int,
+  n : Int32,
 ) -> Unit {
   for i = 0; i < n; i = i + 1 {
     ignore(log.append(b"key", b"value", i.to_int64()) catch { _ => panic() })
