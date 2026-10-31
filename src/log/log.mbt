@@ -121,6 +121,27 @@ pub fn[W, R : @io.LogReader] Log::get(
 }
 
 ///|
+/// Stream records in `[from, to)` across segments to `f`, without building a
+/// full array. Segments that cannot intersect the range are skipped.
+pub fn[W, R : @io.LogReader] Log::for_each(
+  self : Log[W, R],
+  from : UInt64,
+  to : UInt64,
+  f : (@core.Record) -> Unit,
+) -> Unit raise @io.IoError {
+  if to <= from {
+    return
+  }
+  for seg in self.segments {
+    let base = seg.base_offset
+    let seg_end = base + seg.record_count.to_uint64()
+    if seg_end > from && base < to {
+      seg.for_each(from, to, f)
+    }
+  }
+}
+
+///|
 /// Decode every record in every segment, in append order.
 pub fn[W, R : @io.LogReader] Log::scan(
   self : Log[W, R],
@@ -144,19 +165,7 @@ pub fn[W, R : @io.LogReader] Log::scan_range(
   to : UInt64,
 ) -> Array[@core.Record] raise @io.IoError {
   let out : Array[@core.Record] = []
-  if to <= from {
-    return out
-  }
-  for seg in self.segments {
-    let base = seg.base_offset
-    let seg_end = base + seg.record_count.to_uint64()
-    if seg_end > from && base < to {
-      let recs = seg.scan_range(from, to)
-      for rec in recs {
-        out.push(rec)
-      }
-    }
-  }
+  self.for_each(from, to, rec => out.push(rec))
   out
 }
 

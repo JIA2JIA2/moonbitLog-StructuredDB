@@ -329,3 +329,41 @@ test "segment meta decode rejects short and corrupt bytes" {
   }
   assert_true(crc_raised)
 }
+
+///|
+test "for_each streams the same records as scan" {
+  let seg = indexed_mem_segment((0 : UInt64), (2 : Int32))
+  for i = 0; i < 5; i = i + 1 {
+    ignore(seg.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let collected : Array[@core.Record] = []
+  seg.for_each((0 : UInt64), (5 : UInt64), rec => collected.push(rec))
+  let scanned = seg.scan() catch { _ => panic() }
+  assert_eq(collected.length(), scanned.length())
+  let mut i = 0
+  while i < collected.length() {
+    assert_eq(collected[i].offset, scanned[i].offset)
+    i = i + 1
+  }
+}
+
+///|
+test "scan reads values larger than the read chunk" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  let buf = @buffer.Buffer::Buffer()
+  for i = 0; i < 8000; i = i + 1 {
+    buf.write_byte((65 : Byte))
+  }
+  let big = buf.to_bytes()
+  ignore(seg.append(b"k", big, (0 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"k", b"small", (1 : Int64)) catch { _ => panic() })
+  let recs = seg.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 2)
+  assert_eq(recs[0].value.length(), 8000)
+  assert_eq(recs[1].value, b"small")
+  let hit = seg.get((0 : UInt64)) catch { _ => panic() }
+  match hit {
+    Some(rec) => assert_eq(rec.value.length(), 8000)
+    None => panic()
+  }
+}

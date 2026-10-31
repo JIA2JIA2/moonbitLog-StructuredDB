@@ -276,3 +276,22 @@ test "manifest decode rejects corrupt bytes" {
   }
   assert_true(raised)
 }
+
+///|
+test "log for_each aggregates across segments" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let collected : Array[@core.Record] = []
+  log.for_each((0 : UInt64), log.next_offset(), rec => collected.push(rec))
+  assert_eq(collected.length(), 8)
+  let mut i = 0
+  while i < 8 {
+    assert_eq(collected[i].offset.to_int(), i)
+    i = i + 1
+  }
+}

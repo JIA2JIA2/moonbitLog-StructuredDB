@@ -115,32 +115,82 @@ fn[W, R : @io.LogReader] Segment::load_record_at(
   if pos < (0 : Int64) || pos + (4 : Int64) > total {
     return None
   }
-  let head = self.reader.read_at(pos, 4)
-  let body_len = @core.body_len_at(head, 0) catch { _ => return None }
+  let remaining = total - pos
+  let want = if remaining > (4096 : Int64) { (4096 : Int64) } else { remaining }
+  let chunk = self.reader.read_at(pos, want.to_int())
+  let body_len = @core.body_len_at(chunk, 0) catch { _ => return None }
   let full_len = (4 : Int64) + body_len.to_int64() + (4 : Int64)
   if pos + full_len > total {
     return None
   }
-  let data = self.reader.read_at(pos, full_len.to_int())
+  let data = if full_len <= want {
+    chunk
+  } else {
+    self.reader.read_at(pos, full_len.to_int())
+  }
   let (rec, next) = @core.decode_record(data, 0) catch { _ => return None }
   Some((rec, pos + next.to_int64()))
 }
 
 ///|
-/// Decode every record in this segment, in append order.
+/// Stream every record in `[from, to)` (clamped to this segment) to `f`, one at
+/// a time, without materialising the segment in memory.
+pub fn[W, R : @io.LogReader] Segment::for_each(
+  self : Segment[W, R],
+  from : UInt64,
+  to : UInt64,
+  f : (@core.Record) -> Unit,
+) -> Unit raise @io.IoError {
+  let seg_end = self.base_offset + self.record_count.to_uint64()
+  let lo = if from < self.base_offset { self.base_offset } else { from }
+  let hi = if to > seg_end { seg_end } else { to }
+  if lo >= hi {
+    return
+  }
+  let rel = lo - self.base_offset
+  let mut pos : Int64 = match self.index.floor(rel) {
+    Some(e) => e.position
+    None => (0 : Int64)
+  }
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) => {
+        if rec.offset >= hi {
+          go = false
+        } else {
+          if rec.offset >= lo {
+            f(rec)
+          }
+          pos = next
+        }
+      }
+    }
+  }
+}
+
+///|
+/// Decode every record actually present in this segment, in append order.
+/// Walks records from the start of the readable bytes to the end, so it does
+/// not depend on the in-memory `record_count` (which a freshly opened segment
+/// may not have yet). Memory tracks the result, not the segment size.
 pub fn[W, R : @io.LogReader] Segment::scan(
   self : Segment[W, R],
 ) -> Array[@core.Record] raise @io.IoError {
-  let total = self.reader.length()
-  let data = self.reader.read_at(0, total.to_int())
   let out : Array[@core.Record] = []
-  let mut pos = 0
-  while pos < data.length() {
-    let (rec, next) = @core.decode_record(data, pos) catch {
-      _ => raise @io.IoError::Corrupt(pos.to_int64())
+  let mut pos : Int64 = 0
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) => {
+        out.push(rec)
+        pos = next
+      }
     }
-    out.push(rec)
-    pos = next
   }
   out
 }
@@ -193,34 +243,7 @@ pub fn[W, R : @io.LogReader] Segment::scan_range(
   to : UInt64,
 ) -> Array[@core.Record] raise @io.IoError {
   let out : Array[@core.Record] = []
-  let seg_end = self.base_offset + self.record_count.to_uint64()
-  let lo = if from < self.base_offset { self.base_offset } else { from }
-  let hi = if to > seg_end { seg_end } else { to }
-  if lo >= hi {
-    return out
-  }
-  let rel = lo - self.base_offset
-  let mut pos : Int64 = match self.index.floor(rel) {
-    Some(e) => e.position
-    None => (0 : Int64)
-  }
-  let mut go = true
-  while go {
-    let loaded = self.load_record_at(pos)
-    match loaded {
-      None => go = false
-      Some((rec, next)) => {
-        if rec.offset >= hi {
-          go = false
-        } else {
-          if rec.offset >= lo {
-            out.push(rec)
-          }
-          pos = next
-        }
-      }
-    }
-  }
+  self.for_each(from, to, rec => out.push(rec))
   out
 }
 

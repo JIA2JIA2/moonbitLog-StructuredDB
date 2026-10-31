@@ -7,4 +7,5 @@ import {
 import {
   "moonlog/lsdb/src/backend_mem",
   "moonlog/lsdb/src/core",
+  "moonbitlang/core/buffer",
 } for "test"
