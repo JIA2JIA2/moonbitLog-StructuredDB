@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 
 static char *moonlog_c_path(moonbit_bytes_t path) {
@@ -243,4 +244,10 @@ int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
     return -1;
   }
   return 0;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_flock(int32_t fd, int32_t exclusive) {
+  int op = exclusive ? LOCK_EX : LOCK_SH;
+  return (int32_t)flock(fd, op | LOCK_NB);
 }

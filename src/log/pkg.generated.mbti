@@ -9,7 +9,11 @@ import {
 }
 
 // Values
+pub fn decode_cursor(Bytes) -> UInt64 raise @core.MetaError
+
 pub fn decode_manifest(Bytes) -> Manifest raise @core.MetaError
+
+pub fn encode_cursor(UInt64) -> Bytes
 
 // Errors
 

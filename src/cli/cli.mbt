@@ -12,15 +12,22 @@
 ///   scan <dir> [from] [to]           list records in [from, to)
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
-///   cursor <dir> <start> <limit>     poll a consumer cursor batch
+///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
+///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
+///   cursor-commit <dir> <position>   persist the consumer position
+///   getkey <dir> <key>               fetch the latest value for a key
+///   compact <dir>                    rewrite the directory with live keys
 ///   stats <dir>                      print record/segment counts
+///
+/// Writers take an exclusive directory lock; readers take a shared one, so a
+/// CLI invocation never observes a half-written directory.
 type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFileLog]
 
 ///|
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|cursor|compact|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|cursor|cursor-commit|compact|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -75,6 +82,19 @@ fn close_log(log : CliLog) -> Unit {
 }
 
 ///|
+/// Run `action` while holding the directory lock (exclusive for writers).
+fn run_locked(
+  dir : String,
+  exclusive : Bool,
+  action : () -> Unit raise @io.IoError,
+) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  let lock = @backend_native.DirLock::acquire(dir, exclusive)
+  action()
+  lock.release()
+}
+
+///|
 fn print_record(rec : @core.Record) -> Unit {
   let kind = if rec.is_delete() { "DEL" } else { "PUT" }
   println(
@@ -90,77 +110,89 @@ fn print_record(rec : @core.Record) -> Unit {
 
 ///|
 fn cmd_put(dir : String, key : String, value : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
-  println("offset " + off.to_string())
-  @backend_native.flush_meta(dir, log)
-  close_log(log)
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
+    println("offset " + off.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
 }
 
 ///|
 fn cmd_delete(dir : String, key : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let off = log.delete(@utf8.encode(key), now_ms())
-  println("offset " + off.to_string())
-  @backend_native.flush_meta(dir, log)
-  close_log(log)
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let off = log.delete(@utf8.encode(key), now_ms())
+    println("offset " + off.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
 }
 
 ///|
 fn cmd_get(dir : String, offset : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let off = parse_offset(offset)
-  match log.get(off) {
-    Some(rec) => print_record(rec)
-    None => println("not found")
-  }
-  close_log(log)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let off = parse_offset(offset)
+    match log.get(off) {
+      Some(rec) => print_record(rec)
+      None => println("not found")
+    }
+    close_log(log)
+  })
 }
 
 ///|
 fn cmd_scan(dir : String, from : String?, to : String?) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let lo = match from {
-    Some(s) => parse_offset(s)
-    None => (0 : UInt64)
-  }
-  let hi = match to {
-    Some(s) => parse_offset(s)
-    None => log.next_offset()
-  }
-  let recs = log.scan_range(lo, hi)
-  for rec in recs {
-    print_record(rec)
-  }
-  println("(" + recs.length().to_string() + " records)")
-  close_log(log)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let lo = match from {
+      Some(s) => parse_offset(s)
+      None => (0 : UInt64)
+    }
+    let hi = match to {
+      Some(s) => parse_offset(s)
+      None => log.next_offset()
+    }
+    let recs = log.scan_range(lo, hi)
+    for rec in recs {
+      print_record(rec)
+    }
+    println("(" + recs.length().to_string() + " records)")
+    close_log(log)
+  })
 }
 
 ///|
 fn cmd_recover(dir : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  println(
-    "records " +
-    log.count().to_string() +
-    " segments " +
-    log.segment_count().to_string() +
-    " next_offset " +
-    log.next_offset().to_string(),
-  )
-  close_log(log)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    println(
+      "records " +
+      log.count().to_string() +
+      " segments " +
+      log.segment_count().to_string() +
+      " next_offset " +
+      log.next_offset().to_string(),
+    )
+    close_log(log)
+  })
 }
 
 ///|
 fn cmd_prune(dir : String, keep : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let n = parse_count(keep)
-  let dropped = log.retain_last(n, seg => {
-    @backend_native.remove_segment_files(dir, seg.base_offset)
-    seg.writer.close()
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let n = parse_count(keep)
+    let dropped = log.retain_last(n, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("dropped " + dropped.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
   })
-  println("dropped " + dropped.to_string())
-  @backend_native.flush_meta(dir, log)
-  close_log(log)
 }
 
 ///|
@@ -168,61 +200,86 @@ fn cmd_prune_bytes(dir : String, max : String) -> Unit raise @io.IoError {
   let limit = @string.parse_int64(max) catch {
     _ => raise @io.IoError::Invalid("invalid bytes: " + max)
   }
-  let log = open_log(dir)
-  let dropped = log.retain_max_bytes(limit, seg => {
-    @backend_native.remove_segment_files(dir, seg.base_offset)
-    seg.writer.close()
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let dropped = log.retain_max_bytes(limit, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("dropped " + dropped.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
   })
-  println("dropped " + dropped.to_string())
-  @backend_native.flush_meta(dir, log)
-  close_log(log)
 }
 
 ///|
+/// Poll a consumer cursor batch. `start` may be `-` to resume from the
+/// persisted position written by `cursor-commit`.
 fn cmd_cursor(dir : String, start : String, limit : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let cur = @log.ConsumerCursor::new(parse_offset(start))
-  let recs = cur.poll(log, parse_count(limit))
-  for rec in recs {
-    print_record(rec)
-  }
-  println("cursor " + cur.position().to_string())
-  close_log(log)
+  run_locked(dir, false, () => {
+    let from = if start == "-" || start == "auto" {
+      @backend_native.load_cursor(dir)
+    } else {
+      parse_offset(start)
+    }
+    let log = open_log(dir)
+    let cur = @log.ConsumerCursor::new(from)
+    let recs = cur.poll(log, parse_count(limit))
+    for rec in recs {
+      print_record(rec)
+    }
+    println("cursor " + cur.position().to_string())
+    close_log(log)
+  })
+}
+
+///|
+/// Persist a consumer cursor position so a later `cursor -` resumes there.
+fn cmd_cursor_commit(dir : String, position : String) -> Unit raise @io.IoError {
+  let pos = parse_offset(position)
+  run_locked(dir, true, () => @backend_native.save_cursor(dir, pos))
+  println("cursor " + pos.to_string())
 }
 
 ///|
 fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let index = log.build_key_index()
-  match log.get_latest(index, @utf8.encode(key)) {
-    Some(rec) => print_record(rec)
-    None => println("not found")
-  }
-  close_log(log)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let index = log.build_key_index()
+    match log.get_latest(index, @utf8.encode(key)) {
+      Some(rec) => print_record(rec)
+      None => println("not found")
+    }
+    close_log(log)
+  })
 }
 
 ///|
 /// Rewrite the directory with only the live keys (latest puts), dropping
 /// tombstones and superseded history, then refresh the manifest.
 fn cmd_compact(dir : String) -> Unit raise @io.IoError {
-  let log = open_log(dir)
-  let snap = log.snapshot()
-  for seg in log.segments {
-    seg.writer.close()
-  }
-  let names = @backend_native.list_dir(dir)
-  for name in names {
-    ignore(@backend_native.remove_file(dir + "/" + name))
-  }
-  let fresh : CliLog = @log.Log::new(ROLL_SIZE, base => {
-    @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let snap = log.snapshot()
+    for seg in log.segments {
+      seg.writer.close()
+    }
+    let names = @backend_native.list_dir(dir)
+    for name in names {
+      if name != "LOCK" {
+        ignore(@backend_native.remove_file(dir + "/" + name))
+      }
+    }
+    let fresh : CliLog = @log.Log::new(ROLL_SIZE, base => {
+      @backend_native.open_segment_in_dir(dir, base) catch { _ => panic() }
+    })
+    for rec in snap {
+      ignore(fresh.append(rec.key, rec.value, rec.timestamp) catch { _ => panic() })
+    }
+    @backend_native.flush_meta(dir, fresh)
+    println("compacted " + snap.length().to_string() + " records")
+    close_log(fresh)
   })
-  for rec in snap {
-    ignore(fresh.append(rec.key, rec.value, rec.timestamp) catch { _ => panic() })
-  }
-  @backend_native.flush_meta(dir, fresh)
-  println("compacted " + snap.length().to_string() + " records")
-  close_log(fresh)
 }
 
 ///|
@@ -282,6 +339,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "compact" {
     cmd_compact(args[2])
+  } else if cmd == "cursor-commit" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_cursor_commit(args[2], args[3])
+    }
   } else {
     println(USAGE)
   }

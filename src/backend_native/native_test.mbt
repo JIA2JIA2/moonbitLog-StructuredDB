@@ -289,3 +289,48 @@ test "open_log_dir accepts an Always sync policy" {
   }
   clean_dir(dir)
 }
+
+///|
+test "dir lock serializes writers and reopens after release" {
+  let dir = "/tmp/moonlog_lock_test"
+  ignore(@backend_native.ensure_dir(dir))
+  let lock = @backend_native.DirLock::acquire(dir, true) catch { _ => panic() }
+  assert_true(lock.held)
+  let blocked = try {
+    let second = @backend_native.DirLock::acquire(dir, true)
+    second.release()
+    false
+  } catch {
+    _ => true
+  }
+  assert_true(blocked)
+  lock.release()
+  assert_true(!lock.held)
+  let again = @backend_native.DirLock::acquire(dir, true) catch { _ => panic() }
+  again.release()
+  ignore(@backend_native.remove_file(dir + "/LOCK"))
+}
+
+///|
+test "cursor position round-trips through the cursor file" {
+  let dir = "/tmp/moonlog_cursor_test"
+  ignore(@backend_native.ensure_dir(dir))
+  ignore(@backend_native.remove_file(@backend_native.cursor_path(dir)))
+  assert_eq(@backend_native.load_cursor(dir), (0 : UInt64))
+  @backend_native.save_cursor(dir, (42 : UInt64)) catch { _ => panic() }
+  assert_eq(@backend_native.load_cursor(dir), (42 : UInt64))
+  @backend_native.save_cursor(dir, (0 : UInt64)) catch { _ => panic() }
+  assert_eq(@backend_native.load_cursor(dir), (0 : UInt64))
+  ignore(@backend_native.remove_file(@backend_native.cursor_path(dir)))
+}
+
+///|
+test "corrupt cursor file falls back to zero" {
+  let dir = "/tmp/moonlog_cursor_corrupt"
+  ignore(@backend_native.ensure_dir(dir))
+  @backend_native.write_file(@backend_native.cursor_path(dir), b"not-a-cursor") catch {
+    _ => panic()
+  }
+  assert_eq(@backend_native.load_cursor(dir), (0 : UInt64))
+  ignore(@backend_native.remove_file(@backend_native.cursor_path(dir)))
+}

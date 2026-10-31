@@ -13,8 +13,9 @@
 - **Tombstone**：`Log::delete` 追加删除标记记录，历史不被改写。
 - **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes`（按 offset / 段数 / 总字节）以整段删除方式回收旧数据。
 - **可配置持久化**：`SyncPolicy::Always` 让每次 append 后 `fsync`；CLI 用 `MOONLOG_SYNC=1` 开启。
-- **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读。
+- **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
+- **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
 - **CLI**：native 命令行工具覆盖上述能力。
 
 ## 包结构
@@ -51,7 +52,8 @@ moonlog <command> <dir> [args...]
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
-  cursor <dir> <start> <limit>  按批读取消费游标
+  cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
+  cursor-commit <dir> <position> 持久化消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   compact <dir>                 折叠为 live 记录并重写目录
   stats <dir>                   打印记录/段计数
@@ -92,6 +94,11 @@ u32 crc32          (仅覆盖 body)
 - 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（含 CRC32）。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
 
+### 目录锁与游标文件（M12）
+
+- `LOCK`：`flock` 建议锁的载体。写者取独占锁，读者取共享锁，均以非阻塞方式获取，冲突即快速失败而非死等；`compact` 会保留该文件。
+- `CURSOR`：CLI 持久化的消费游标位置。编码为 `u32 magic("MLCU") + u64 position + u32 crc32`，损坏或缺失时回退为 `0`。
+
 ## 里程碑
 
 - M0/M1 脚手架、记录编码与内存后端、单段 append
@@ -100,6 +107,12 @@ u32 crc32          (仅覆盖 body)
 - M4 崩溃恢复（torn-tail 截断）
 - M5 tombstone、保留策略、消费游标
 - M6 CLI 与文档
+- M7 边界测试与显式 CLI 参数校验
+- M8 段索引与目录 manifest 持久化（打开免全量扫描）
+- M9 流式段读取与 `for_each`（收敛 IO）
+- M10 key 索引、快照与 `compact`
+- M11 可配置 durability（`SyncPolicy`）与按字节保留
+- M12 `flock` 目录锁、读快照与 CLI 游标持久化
 
 ## 许可
 

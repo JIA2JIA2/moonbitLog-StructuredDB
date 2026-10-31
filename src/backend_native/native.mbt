@@ -410,3 +410,65 @@ pub fn flush_meta(
   }
   write_file(dir + "/" + MANIFEST_NAME, manifest.encode())
 }
+
+///|
+/// File under a log directory holding the CLI's committed consumer position.
+pub fn cursor_path(dir : String) -> String {
+  dir + "/CURSOR"
+}
+
+///|
+/// Read the persisted consumer position, defaulting to 0 when the file is
+/// missing or fails its checksum.
+pub fn load_cursor(dir : String) -> UInt64 {
+  let data = read_file(cursor_path(dir))
+  if data.length() == 0 {
+    (0 : UInt64)
+  } else {
+    @log.decode_cursor(data) catch { _ => (0 : UInt64) }
+  }
+}
+
+///|
+/// Persist a consumer position (truncate + write + fsync).
+pub fn save_cursor(dir : String, position : UInt64) -> Unit raise @io.IoError {
+  write_file(cursor_path(dir), @log.encode_cursor(position))
+}
+
+///|
+extern "C" fn moonlog_flock(fd : Int32, exclusive : Int32) -> Int32 = "moonlog_flock"
+
+///|
+/// A directory-level advisory lock (via `flock`) used to serialize writers.
+/// Acquisition is non-blocking, so a conflicting holder fails fast instead of
+/// dead-locking.
+pub(all) struct DirLock {
+  fd : Int32
+  mut held : Bool
+}
+
+///|
+/// Acquire the `LOCK` file in `dir`. `exclusive` selects a writer lock;
+/// otherwise a shared reader lock is taken.
+pub fn DirLock::acquire(dir : String, exclusive : Bool) -> DirLock raise @io.IoError {
+  let path = dir + "/LOCK"
+  let fd = moonlog_open_rw(@utf8.encode(path))
+  if fd < 0 {
+    raise @io.IoError::Syscall(fd)
+  }
+  let flag = if exclusive { 1 } else { 0 }
+  let r = moonlog_flock(fd, flag)
+  if r < 0 {
+    ignore(moonlog_close(fd))
+    raise @io.IoError::Syscall(r)
+  }
+  { fd, held: true, }
+}
+
+///|
+pub fn DirLock::release(self : DirLock) -> Unit {
+  if self.held {
+    ignore(moonlog_close(self.fd))
+    self.held = false
+  }
+}
