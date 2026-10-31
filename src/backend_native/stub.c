@@ -247,6 +247,21 @@ int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
 }
 
 MOONBIT_FFI_EXPORT
+int32_t moonlog_rename(moonbit_bytes_t from, moonbit_bytes_t to) {
+  char *a = moonlog_c_path(from);
+  char *b = moonlog_c_path(to);
+  if (a == NULL || b == NULL) {
+    free(a);
+    free(b);
+    return -1;
+  }
+  int r = rename(a, b);
+  free(a);
+  free(b);
+  return r;
+}
+
+MOONBIT_FFI_EXPORT
 int32_t moonlog_flock(int32_t fd, int32_t exclusive) {
   int op = exclusive ? LOCK_EX : LOCK_SH;
   return (int32_t)flock(fd, op | LOCK_NB);

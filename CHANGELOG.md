@@ -24,6 +24,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Named cursors (M20)**：`save_named_cursor` / `load_named_cursor` and the
   `cursor-save` / `cursor-load` CLI commands persist independent consumer
   positions as `CURSOR.<name>` files.
+- **Atomic metadata (M21)**：the manifest and per-segment indexes are replaced
+  atomically (write temp → fsync → rename → fsync directory), so a crash can
+  never leave a half-written metadata file.
 
 ## 0.1.0 - 2026-10-31
 

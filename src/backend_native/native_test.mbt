@@ -430,3 +430,47 @@ test "open_log_dir detects a truncated segment and recovers" {
   }
   clean_dir(dir)
 }
+
+///|
+test "flush_meta replaces metadata atomically without temp leftovers" {
+  let dir = "/tmp/moonlog_atomic_meta"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 3; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  let names = @backend_native.list_dir(dir)
+  for name in names {
+    assert_true(!name.has_suffix(".tmp"))
+  }
+  assert_true(
+    @backend_native.file_exists(dir + "/" + @backend_native.MANIFEST_NAME),
+  )
+  assert_true(
+    @backend_native.file_exists(
+      @backend_native.segment_index_path(dir, (0 : UInt64)),
+    ),
+  )
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 3)
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

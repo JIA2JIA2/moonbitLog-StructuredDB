@@ -288,6 +288,10 @@ extern "C" fn moonlog_read_file(path : Bytes) -> Bytes = "moonlog_read_file"
 extern "C" fn moonlog_write_file(path : Bytes, data : Bytes) -> Int32 = "moonlog_write_file"
 
 ///|
+#borrow(from, to)
+extern "C" fn moonlog_rename(from : Bytes, to : Bytes) -> Int32 = "moonlog_rename"
+
+///|
 /// Name of the directory-level manifest file.
 pub const MANIFEST_NAME : String = "MANIFEST"
 
@@ -307,9 +311,45 @@ pub fn write_file(path : String, data : Bytes) -> Unit raise @io.IoError {
 }
 
 ///|
+/// File name of a segment's persisted index sidecar.
+fn segment_index_name(base : UInt64) -> String {
+  @segment.segment_file_name(base) + ".index"
+}
+
+///|
 /// Path of a segment's persisted index sidecar.
 pub fn segment_index_path(dir : String, base : UInt64) -> String {
-  dir + "/" + @segment.segment_file_name(base) + ".index"
+  dir + "/" + segment_index_name(base)
+}
+
+///|
+/// fsync a directory so that a preceding create/rename within it is durable.
+fn fsync_dir(path : String) -> Unit raise @io.IoError {
+  let fd = moonlog_open_ro(@utf8.encode(path))
+  if fd < 0 {
+    raise @io.IoError::Syscall(fd)
+  }
+  ignore(moonlog_fsync(fd))
+  ignore(moonlog_close(fd))
+}
+
+///|
+/// Durably replace `dir/name` with `data` without ever exposing a half-written
+/// file: write to `dir/name.tmp`, fsync it, rename it over the target, then
+/// fsync the directory. A crash at any step leaves either the previous file or
+/// the new one — never a torn mixture.
+fn write_file_atomic(
+  dir : String,
+  name : String,
+  data : Bytes,
+) -> Unit raise @io.IoError {
+  let tmp = dir + "/" + name + ".tmp"
+  write_file(tmp, data)
+  let rc = moonlog_rename(@utf8.encode(tmp), @utf8.encode(dir + "/" + name))
+  if rc < 0 {
+    raise @io.IoError::Syscall(rc)
+  }
+  fsync_dir(dir)
 }
 
 ///|
@@ -435,7 +475,11 @@ pub fn flush_meta(
   let bases : Array[UInt64] = []
   let sizes : Array[Int64] = []
   for seg in log.segments {
-    write_file(segment_index_path(dir, seg.base_offset), seg.to_meta().encode())
+    write_file_atomic(
+      dir,
+      segment_index_name(seg.base_offset),
+      seg.to_meta().encode(),
+    )
     bases.push(seg.base_offset)
     sizes.push(seg.byte_size())
   }
@@ -445,7 +489,7 @@ pub fn flush_meta(
     segment_bases: bases,
     segment_sizes: sizes,
   }
-  write_file(dir + "/" + MANIFEST_NAME, manifest.encode())
+  write_file_atomic(dir, MANIFEST_NAME, manifest.encode())
 }
 
 ///|
