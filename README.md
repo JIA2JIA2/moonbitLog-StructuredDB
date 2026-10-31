@@ -11,7 +11,7 @@
 - **范围扫描**：`Segment::scan_range` / `Log::scan_range` 支持半开区间 `[from, to)`。
 - **崩溃恢复**：`Segment::recover` 顺序解码、遇 torn/CRC 失败的尾部即截断到最后一个完好边界并重建索引与计数；native 侧 `recover_log_dir` 打开目录恢复全部 `*.log` 段。
 - **Tombstone**：`Log::delete` 追加删除标记记录，历史不被改写。
-- **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes`（按 offset / 段数 / 总字节）以整段删除方式回收旧数据。
+- **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes` / `Log::retain_before`（按 offset / 段数 / 总字节 / 时间戳）以整段删除方式回收旧数据。
 - **可配置持久化**：`SyncPolicy::Always` 让每次 append 后 `fsync`；CLI 用 `MOONLOG_SYNC=1` 开启。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
@@ -54,6 +54,7 @@ moonlog <command> <dir> [args...]
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
+  prune-before <dir> <timestamp> 回收末条记录早于 timestamp 的段
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
@@ -78,7 +79,7 @@ $EXE scan /tmp/log
 | `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
 | `Log::append` / `Log::delete` | `log` | 追加记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
-| `Log::retain_last` / `retain_max_bytes` / `drop_before` | `log` | 段级保留策略 |
+| `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `get_latest` / `snapshot` / `compact` | `log` | KV 逻辑视图 / 折叠 live 记录 / 原地重写 |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` | `log` | `Never` / `Always` 持久化策略 |

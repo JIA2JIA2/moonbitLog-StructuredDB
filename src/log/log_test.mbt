@@ -424,3 +424,28 @@ test "log compact folds to the live view and drops old segments" {
     None => ()
   }
 }
+
+///|
+test "retain_before drops segments whose last record predates the cutoff" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 6; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let before = log.segment_count()
+  let dropped_bases : Array[UInt64] = []
+  let dropped = log.retain_before((25 : Int64), seg => {
+    dropped_bases.push(seg.base_offset)
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(dropped, dropped_bases.length())
+  assert_true(dropped >= 1)
+  assert_true(log.segment_count() < before)
+  let recs = log.scan() catch { _ => panic() }
+  assert_true(recs.length() >= 1)
+  assert_eq(recs[recs.length() - 1].timestamp, (50 : Int64))
+}

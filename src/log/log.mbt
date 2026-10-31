@@ -279,3 +279,38 @@ pub fn[W, R] Log::retain_max_bytes(
   self.segments = kept
   dropped
 }
+
+///|
+/// Retention by timestamp: drop every rolled-over segment whose last record is
+/// older than `cutoff`, invoking `on_drop` for each. Assumes timestamps are
+/// non-decreasing across the log (the usual append-only event ordering); the
+/// active (last) segment is never dropped. Returns the number dropped.
+pub fn[W, R : @io.LogReader] Log::retain_before(
+  self : Log[W, R],
+  cutoff : Int64,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 raise @io.IoError {
+  let kept : Array[@segment.Segment[W, R]] = []
+  let mut dropped = 0
+  let n = self.segments.length()
+  for i = 0; i < n; i = i + 1 {
+    let seg = self.segments[i]
+    let expired = if seg.record_count > 0 {
+      let last = seg.base_offset + (seg.record_count - 1).to_uint64()
+      match seg.get(last) {
+        Some(rec) => rec.timestamp < cutoff
+        None => false
+      }
+    } else {
+      true
+    }
+    if i < n - 1 && expired {
+      on_drop(seg)
+      dropped = dropped + 1
+    } else {
+      kept.push(seg)
+    }
+  }
+  self.segments = kept
+  dropped
+}

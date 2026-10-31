@@ -13,6 +13,7 @@
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
+///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
@@ -27,7 +28,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|cursor|cursor-commit|compact|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -213,6 +214,24 @@ fn cmd_prune_bytes(dir : String, max : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Drop segments whose last record predates `cutoff` (timestamp-based retention).
+fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
+  let cutoff = @string.parse_int64(ts) catch {
+    _ => raise @io.IoError::Invalid("invalid timestamp: " + ts)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let dropped = log.retain_before(cutoff, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("dropped " + dropped.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
 fn cmd_cursor(dir : String, start : String, limit : String) -> Unit raise @io.IoError {
@@ -312,6 +331,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_prune_bytes(args[2], args[3])
+    }
+  } else if cmd == "prune-before" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_prune_before(args[2], args[3])
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {
