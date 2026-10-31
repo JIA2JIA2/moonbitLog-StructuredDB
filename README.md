@@ -60,6 +60,7 @@ moonlog <command> <dir> [args...]
   cursor-commit <dir> <position> 持久化消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   compact <dir>                 折叠为 live 记录并重写目录
+  fsck <dir>                    校验记录/offset 完整性
   stats <dir>                   打印记录/段计数
 ```
 
@@ -85,6 +86,7 @@ $EXE scan /tmp/log
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` | `log` | `Never` / `Always` 持久化策略 |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
+| `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
 | `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、目录锁 |
@@ -166,6 +168,7 @@ u32 crc32          (仅覆盖 body)
 - M16 manifest 记录段字节大小并在打开时校验
 - M17 `examples/mem_demo` 可运行示例（wasm/js/native）
 - M18 批量写入 `Log::append_batch` 与 CLI `put-batch`
+- M19 完整性校验 `Log::verify` 与 CLI `fsck`
 
 ## 许可
 

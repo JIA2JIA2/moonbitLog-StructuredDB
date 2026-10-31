@@ -331,3 +331,55 @@ pub fn[W, R : @io.LogReader] Log::retain_before(
   self.segments = kept
   dropped
 }
+
+///|
+/// Result of a full-log integrity sweep.
+pub(all) struct VerifyReport {
+  segments : Int32
+  records : Int32
+  first_bad_offset : UInt64?
+}
+
+///|
+/// Sweep the whole log in order, checking that segments are laid out
+/// contiguously and that every record decodes with the expected offset. The
+/// first inconsistency (a segment gap, an offset jump, or a decode error) is
+/// reported via `first_bad_offset`; a healthy log leaves it empty.
+pub fn[W, R : @io.LogReader] Log::verify(
+  self : Log[W, R],
+) -> VerifyReport {
+  let mut expected : UInt64 = 0
+  let mut records : Int32 = 0
+  let mut bad_found = false
+  let mut bad_at : UInt64 = 0
+  for seg in self.segments {
+    if !bad_found && seg.base_offset != expected {
+      bad_found = true
+      bad_at = expected
+    }
+    let recs = try {
+      seg.scan()
+    } catch {
+      _ => {
+        if !bad_found {
+          bad_found = true
+          bad_at = expected
+        }
+        []
+      }
+    }
+    for rec in recs {
+      if !bad_found && rec.offset != expected {
+        bad_found = true
+        bad_at = expected
+      }
+      expected = expected + (1 : UInt64)
+      records = records + 1
+    }
+  }
+  {
+    segments: self.segments.length(),
+    records,
+    first_bad_offset: if bad_found { Some(bad_at) } else { None },
+  }
+}

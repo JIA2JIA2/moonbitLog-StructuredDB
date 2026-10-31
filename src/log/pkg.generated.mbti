@@ -60,6 +60,7 @@ pub fn[W, R : @io.LogReader] Log::scan(Self[W, R]) -> Array[@core.Record] raise 
 pub fn[W, R : @io.LogReader] Log::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R : @io.LogReader] Log::verify(Self[W, R]) -> VerifyReport
 
 pub(all) struct Manifest {
   roll_size : Int64
@@ -75,6 +76,12 @@ pub(all) enum SyncPolicy {
 } derive(Eq)
 pub fn SyncPolicy::equal(Self, Self) -> Bool
 pub fn SyncPolicy::not_equal(Self, Self) -> Bool
+
+pub(all) struct VerifyReport {
+  segments : Int32
+  records : Int32
+  first_bad_offset : UInt64?
+}
 
 // Type aliases
 pub type MakeSegment[W, R] = (UInt64) -> @segment.Segment[W, R] raise @io.IoError

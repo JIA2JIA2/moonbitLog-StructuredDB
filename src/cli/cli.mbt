@@ -19,6 +19,7 @@
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
 ///   compact <dir>                    rewrite the directory with live keys
+///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir>                      print record/segment counts
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
@@ -29,7 +30,7 @@ type CliLog = @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFile
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|scan|recover|prune|prune-bytes|prune-before|cursor|cursor-commit|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -207,6 +208,22 @@ fn cmd_recover(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Sweep the log and report whether offsets are contiguous throughout.
+fn cmd_fsck(dir : String) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let report = log.verify()
+    println("segments " + report.segments.to_string())
+    println("records " + report.records.to_string())
+    match report.first_bad_offset {
+      Some(off) => println("corrupt: offset mismatch at " + off.to_string())
+      None => println("ok")
+    }
+    close_log(log)
+  })
+}
+
+///|
 fn cmd_prune(dir : String, keep : String) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
@@ -351,6 +368,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     cmd_scan(args[2], from, to)
   } else if cmd == "recover" || cmd == "stats" {
     cmd_recover(args[2])
+  } else if cmd == "fsck" {
+    cmd_fsck(args[2])
   } else if cmd == "prune" {
     if args.length() < 4 {
       println(USAGE)

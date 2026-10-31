@@ -476,3 +476,37 @@ test "append_batch assigns contiguous offsets across rolls" {
   let recs = log.scan() catch { _ => panic() }
   assert_eq(recs[3].value, b"4")
 }
+
+///|
+test "verify reports a healthy multi-segment log" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 6; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let report = log.verify()
+  assert_eq(report.segments, log.segment_count())
+  assert_eq(report.records, 6)
+  match report.first_bad_offset {
+    Some(_) => panic()
+    None => ()
+  }
+}
+
+///|
+test "verify on an empty log is healthy" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  let report = log.verify()
+  assert_eq(report.segments, 0)
+  assert_eq(report.records, 0)
+  match report.first_bad_offset {
+    Some(_) => panic()
+    None => ()
+  }
+}
