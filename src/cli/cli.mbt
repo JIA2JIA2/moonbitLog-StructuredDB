@@ -41,7 +41,7 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
-///   fsck <dir>                       verify record/offset integrity
+///   fsck <dir> [fast]                verify integrity (fast skips record decoding)
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
@@ -449,11 +449,15 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
 }
 
 ///|
-/// Sweep the log and report whether offsets are contiguous throughout.
-fn cmd_fsck(dir : String) -> Unit raise @io.IoError {
+/// Sweep the log and report whether offsets are contiguous throughout. With
+/// `fast`, only segment metadata and stored whole-segment checksums are
+/// checked (no record decoding) — much cheaper on large directories, but it
+/// cannot detect corruption inside individual records.
+fn cmd_fsck(dir : String, fast : Bool) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
-    let report = log.verify()
+    let report = if fast { log.verify_fast() } else { log.verify() }
+    println("mode " + (if fast { "fast" } else { "full" }))
     println("segments " + report.segments.to_string())
     println("records " + report.records.to_string())
     let mut ok = true
@@ -992,7 +996,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let json = args.length() > 3 && args[3] == "json"
     cmd_stats(args[2], json)
   } else if cmd == "fsck" {
-    cmd_fsck(args[2])
+    let fast = args.length() > 3 && args[3] == "fast"
+    cmd_fsck(args[2], fast)
   } else if cmd == "prune" {
     if args.length() < 4 {
       println(USAGE)

@@ -654,6 +654,64 @@ pub(all) struct VerifyReport {
 }
 
 ///|
+/// Fast integrity check that decodes no record bodies: verifies segment
+/// contiguity, per-segment counter consistency, and the stored whole-segment
+/// CRC32 where available. Much cheaper than `verify` on large directories, but
+/// it cannot detect corruption inside individual records that have no recorded
+/// segment checksum. The report shape matches `verify`.
+pub fn[W, R : @io.LogReader] Log::verify_fast(self : Log[W, R]) -> VerifyReport {
+  let mut expected : UInt64 = 0
+  let mut records : Int32 = 0
+  let mut bad_found = false
+  let mut bad_at : UInt64 = 0
+  let mut bad_ck_found = false
+  let mut bad_ck_at : UInt64 = 0
+  for seg in self.segments {
+    if !bad_found && seg.base_offset != expected {
+      bad_found = true
+      bad_at = expected
+    }
+    if seg.has_checksum() {
+      let stored = seg.stored_checksum()
+      let actual = Some(seg.compute_checksum()) catch { _ => None }
+      match actual {
+        Some(a) =>
+          if a != stored && !bad_ck_found {
+            bad_ck_found = true
+            bad_ck_at = seg.base_offset
+          }
+        None =>
+          if !bad_ck_found {
+            bad_ck_found = true
+            bad_ck_at = seg.base_offset
+          }
+      }
+    }
+    let count = seg.record_count
+    if !bad_found && seg.base_offset + count.to_uint64() != seg.next_offset {
+      bad_found = true
+      bad_at = seg.next_offset
+    }
+    expected = seg.next_offset
+    records = records + count
+  }
+  {
+    segments: self.segments.length(),
+    records,
+    first_bad_offset: if bad_found {
+      Some(bad_at)
+    } else {
+      None
+    },
+    first_bad_checksum: if bad_ck_found {
+      Some(bad_ck_at)
+    } else {
+      None
+    },
+  }
+}
+
+///|
 /// Sweep the whole log in order, checking that segments are laid out
 /// contiguously and that every record decodes with the expected offset. The
 /// first inconsistency (a segment gap, an offset jump, or a decode error) is

@@ -1362,3 +1362,33 @@ test "scan_time_range uses ts samples on a large sorted segment" {
   }
   assert_eq(none.length(), 0)
 }
+
+///|
+test "verify_fast agrees with verify and detects checksum damage" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  for seg in log.segments {
+    seg.set_checksum(seg.compute_checksum() catch { _ => panic() })
+  }
+  let fast = log.verify_fast()
+  let full = log.verify()
+  assert_eq(fast.segments, full.segments)
+  assert_eq(fast.records, full.records)
+  match fast.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  let crc = log.segments[0].stored_checksum()
+  log.segments[0].set_checksum(crc ^ (1 : UInt32))
+  let bad = log.verify_fast()
+  match bad.first_bad_checksum {
+    Some(base) => assert_eq(base, log.segments[0].base_offset)
+    None => panic()
+  }
+}

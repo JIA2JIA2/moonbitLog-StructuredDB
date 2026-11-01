@@ -1080,3 +1080,58 @@ test "property: native randomized ops with crash injection match the model" {
   }
   clean_dir(dir)
 }
+
+///|
+test "verify_fast detects data corruption via segment checksums" {
+  let dir = "/tmp/moonlog_verify_fast"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  let ok = reopened.verify_fast()
+  match ok.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  // Flip a byte in the first segment's data file (manifest size unchanged).
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let data = @backend_native.read_file(path)
+  let head : Bytes = if data.at(0).to_int() == 0 { b"\x01" } else { b"\x00" }
+  @backend_native.write_file(path, head + @core.slice(data, 1, data.length())) catch {
+    _ => panic()
+  }
+  let reopened2 = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  let bad = reopened2.verify_fast()
+  match bad.first_bad_checksum {
+    Some(base) => assert_eq(base, (0 : UInt64))
+    None => panic()
+  }
+  for seg in reopened2.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

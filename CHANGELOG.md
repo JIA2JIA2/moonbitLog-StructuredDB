@@ -16,6 +16,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   many-segment directory no longer pays an fsync per segment per write.
   **Behaviour change**: `flush()` is now idempotent — calling it again without
   new appends is a no-op.
+- **`fsck fast` (M74)**：`Log::verify_fast` checks segment contiguity, counter
+  consistency and the stored whole-segment CRC32 without decoding record
+  bodies; exposed as `fsck <dir> fast`. It cannot detect corruption inside
+  individual records — `fsck <dir>` (full) remains the thorough check.
 - **Point-lookup folding (M68)**：`snapshot` / `scan_live` collect the live view
   through the key index (one point lookup per live key, then sorted by offset)
   instead of a second full scan, which pays off once many records have been

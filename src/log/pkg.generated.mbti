@@ -87,6 +87,7 @@ pub fn[W, R] Log::set_cursor_guard(Self[W, R], UInt64?) -> Unit
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::tail(Self[W, R], Int32) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::verify(Self[W, R]) -> VerifyReport
+pub fn[W, R : @io.LogReader] Log::verify_fast(Self[W, R]) -> VerifyReport
 
 pub(all) struct Manifest {
   roll_size : Int64
