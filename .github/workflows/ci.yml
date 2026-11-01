@@ -40,11 +40,27 @@ jobs:
       - name: Test (wasm)
         run: moon test
 
-      - name: Test (native)
-        run: moon test --target native
+      - name: Test (native, with coverage)
+        run: moon test --enable-coverage --target native
+
+      - name: Coverage summary
+        run: |
+          moon coverage report -f summary | tee coverage_summary.txt
+          {
+            echo '## Coverage (native)'
+            echo '```'
+            cat coverage_summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Benchmark (native)
-        run: moon bench --target native
+        run: moon bench --target native | tee bench_results.txt
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench_results.txt
 
       - name: CLI smoke test
         run: |
@@ -55,8 +71,10 @@ jobs:
           "$EXE" put-batch "$D" user:2 bob user:3 carol
           "$EXE" getkey "$D" user:1
           "$EXE" cursor-save "$D" consumer-a 2
-          "$EXE" cursor-load "$D" consumer-a
+          "$EXE" cursor-drop "$D" consumer-a
           "$EXE" fsck "$D"
+          "$EXE" export "$D" /tmp/moonlog-export.tmp
+          "$EXE" import "$(mktemp -d)" /tmp/moonlog-export.tmp
           "$EXE" compact "$D"
           "$EXE" fsck "$D"
           "$EXE" recover "$D"

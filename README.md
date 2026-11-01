@@ -38,6 +38,8 @@ moon build --target native   # 构建（含 CLI）
 moon test                    # wasm 目标测试
 moon test --target native    # native 目标测试
 moon bench --target native   # 基准：追加 / 点查 / 范围扫描 / 恢复
+moon test --enable-coverage --target native   # native 覆盖率采集
+moon coverage report -f summary               # 覆盖率摘要
 ```
 
 ## CLI 用法
@@ -189,6 +191,7 @@ u32 crc32          (仅覆盖 body)
 - M28 导出/导入：`Log::export_bytes` / `Log::import_bytes` 与 CLI `export` / `import`
 - M24 自适应稀疏索引间隔：`index_interval_for` 按 `roll_size` 估算
 - M25 读取路径：实测读缓存比直接 pread 慢约 3.7×，故保留直接 `pread`；新增 native 顺序扫描基准
+- M29 CI 增强：native 覆盖率摘要 + bench 结果归档
 
 ## 许可
 

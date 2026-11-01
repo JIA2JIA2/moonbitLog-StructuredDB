@@ -47,6 +47,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   measured ~3.7× slower than direct `pread` (MoonBit `Bytes` slicing copies
   byte-by-byte), so reads keep using `pread`; a native sequential-scan
   benchmark was added to guard the decision.
+- **CI coverage and benchmarks (M29)**：CI now collects native code coverage
+  into the run summary and archives benchmark results as an artifact.
 
 ## 0.1.0 - 2026-10-31
 
