@@ -11,6 +11,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   offset map (with tombstone flags), persisted to a `.keys` sidecar by
   `flush_meta`. Reopening loads it directly (falling back to a rebuild scan when
   missing or corrupt), so key-index-based reads no longer re-scan segments.
+- **Table-driven CRC32 (M48)**：`crc32` now uses a 256-entry lookup table built
+  once at load instead of a bit-by-bit loop.
 
 ## 0.3.0 - 2026-11-01
 

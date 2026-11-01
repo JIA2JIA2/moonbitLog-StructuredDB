@@ -238,6 +238,7 @@ u32 crc32          (仅覆盖 body)
 - M44 原子批量写入：`Log::append_batch_atomic` 失败时整体回滚（删除批中新建段、截断并重建原活跃段、恢复 offset 空间）
 - M45 可观测性：`Log::segment_summaries` 暴露每段计数 / 大小 / 压缩标志 / 时间跨度；CLI `stats` 打印逐段信息并支持 `stats <dir> json`
 - M47 持久化 key 索引：每段内存维护 key→最新 offset（含 tombstone 标志），`flush_meta` 写入 `.keys` sidecar；重开直接加载（缺失/损坏回退重建扫描），`build_key_index` 不再全量扫段
+- M48 表驱动 CRC32：`crc32` 改为加载时构建 256 项查表，替代逐位计算
 
 ## 许可
 
