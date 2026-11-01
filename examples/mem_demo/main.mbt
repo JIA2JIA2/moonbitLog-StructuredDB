@@ -39,7 +39,7 @@ fn main {
   }
 
   println("== live keys ==")
-  let index = log.build_key_index() catch { _ => panic() }
+  let index = log.build_key_index()
   for key in [b"user:1", b"user:2"] {
     let latest = log.get_latest(index, key) catch { _ => panic() }
     match latest {

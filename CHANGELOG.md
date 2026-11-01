@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **Persisted key index (M47)**：each segment keeps an in-memory key → latest
+  offset map (with tombstone flags), persisted to a `.keys` sidecar by
+  `flush_meta`. Reopening loads it directly (falling back to a rebuild scan when
+  missing or corrupt), so key-index-based reads no longer re-scan segments.
+
 ## 0.3.0 - 2026-11-01
 
 ### Added

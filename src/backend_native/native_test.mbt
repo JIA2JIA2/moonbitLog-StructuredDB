@@ -681,3 +681,56 @@ test "compress_log_dir compresses rolled segments and they reopen read-only" {
   }
   clean_dir(dir)
 }
+
+///|
+test "flush_meta persists the key index and reopen reads it back" {
+  let dir = "/tmp/moonlog_keystore"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  let keys : Array[Bytes] = [
+    b"k0", b"k1", b"k2", b"k3", b"k4", b"k5", b"k6", b"k7",
+  ]
+  let values : Array[Bytes] = [
+    b"v0", b"v1", b"v2", b"v3", b"v4", b"v5", b"v6", b"v7",
+  ]
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(keys[i], values[i], i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let names = @backend_native.list_dir(dir) catch { _ => panic() }
+  let mut saw_keys = false
+  for name in names {
+    if name.has_suffix(".keys") {
+      saw_keys = true
+    }
+  }
+  assert_true(saw_keys)
+  let reopened = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 8)
+  let index = reopened.build_key_index()
+  let got = reopened.get_latest(index, b"k3") catch { _ => panic() }
+  match got {
+    Some(rec) => assert_eq(rec.value, b"v3")
+    None => panic()
+  }
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

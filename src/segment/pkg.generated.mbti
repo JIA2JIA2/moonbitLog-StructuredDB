@@ -2,6 +2,7 @@
 package "moonlog/lsdb/src/segment"
 
 import {
+  "moonbitlang/core/hashmap",
   "moonlog/lsdb/src/core",
   "moonlog/lsdb/src/io",
 }
@@ -47,6 +48,7 @@ pub(all) struct Segment[W, R] {
   mut crc_known : Bool
   mut compressed : Bool
   mut raw_size : Int64
+  mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
@@ -54,12 +56,16 @@ pub fn[W, R] Segment::apply_meta(Self[W, R], SegmentMeta) -> Unit
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R : @io.LogReader] Segment::compute_checksum(Self[W, R]) -> UInt32 raise @io.IoError
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
+pub fn[W, R] Segment::each_key(Self[W, R], (Bytes, UInt64, Bool) -> Unit) -> Unit
+pub fn[W, R] Segment::encode_keys(Self[W, R]) -> Bytes
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
 pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
+pub fn[W, R] Segment::key_count(Self[W, R]) -> Int32
+pub fn[W, R] Segment::load_keys(Self[W, R], Bytes) -> Unit raise @core.MetaError
 pub fn[W, R] Segment::mark_compressed(Self[W, R], Int64) -> Unit
 pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
 pub fn[W, R] Segment::may_contain(Self[W, R], Bytes) -> Bool

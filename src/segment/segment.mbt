@@ -22,6 +22,7 @@ pub(all) struct Segment[W, R] {
   mut crc_known : Bool
   mut compressed : Bool
   mut raw_size : Int64
+  mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
 }
 
@@ -67,6 +68,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     crc_known: false,
     compressed: false,
     raw_size: 0,
+    keys: @hashmap.HashMap::HashMap([]),
     meta_loaded: false,
   }
 }
@@ -190,12 +192,33 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   let bytes = rec.encode()
   ignore(self.writer.append(bytes))
   self.bloom.add(key)
+  self.keys.set(key, (offset, kind is @core.RecordKind::Delete))
   self.note_timestamp(timestamp)
   self.next_offset = offset + (1 : UInt64)
   self.record_count = self.record_count + 1
   self.size = self.size + bytes.length().to_int64()
   self.crc_known = false
   offset
+}
+
+///|
+/// Call `f` for each key in this segment with the offset of its latest record
+/// in the segment and whether that record is a tombstone, without decoding
+/// record bodies.
+pub fn[W, R] Segment::each_key(
+  self : Segment[W, R],
+  f : (Bytes, UInt64, Bool) -> Unit,
+) -> Unit {
+  self.keys.each(fn(_k, v) {
+    let (off, del) = v
+    f(_k, off, del)
+  })
+}
+
+///|
+/// Number of distinct keys recorded in this segment.
+pub fn[W, R] Segment::key_count(self : Segment[W, R]) -> Int32 {
+  self.keys.length()
 }
 
 ///|
@@ -373,6 +396,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
 ) -> Int32 raise @io.IoError {
   self.index.reset()
   self.bloom = BloomFilter::new()
+  self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
   let total = self.reader.length()
   let mut pos : Int64 = 0
@@ -384,6 +408,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
       None => go = false
       Some((rec, next)) => {
         self.bloom.add(rec.key)
+        self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
@@ -411,6 +436,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
 ) -> Int32 raise @io.IoError {
   self.index.reset()
   self.bloom = BloomFilter::new()
+  self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
   let total = self.reader.length()
   let mut pos : Int64 = 0
@@ -430,6 +456,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
         }
         last = rec.offset
         self.bloom.add(rec.key)
+        self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)

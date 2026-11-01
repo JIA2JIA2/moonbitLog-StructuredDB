@@ -2,6 +2,7 @@ import {
   "moonlog/lsdb/src/core",
   "moonlog/lsdb/src/io",
   "moonbitlang/core/buffer",
+  "moonbitlang/core/hashmap",
 }
 
 import {

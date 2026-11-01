@@ -40,18 +40,20 @@ fn KeyIndex::drop(self : KeyIndex, key : Bytes) -> Unit {
 }
 
 ///|
-/// Build the live key index by scanning the whole log (tombstones remove keys).
-pub fn[W, R : @io.LogReader] Log::build_key_index(
-  self : Log[W, R],
-) -> KeyIndex raise @io.IoError {
+/// Build the live key index from the segments' in-memory key maps (each holds
+/// its keys' latest offsets), so no record bodies are re-decoded. A tombstone
+/// in a newer segment hides an older put.
+pub fn[W, R] Log::build_key_index(self : Log[W, R]) -> KeyIndex {
   let index = KeyIndex::new()
-  self.for_each((0 : UInt64), self.next_offset, rec => {
-    if rec.is_delete() {
-      index.drop(rec.key)
-    } else {
-      index.put(rec.key, rec.offset)
-    }
-  })
+  for seg in self.segments {
+    seg.each_key((k, off, del) => {
+      if del {
+        index.drop(k)
+      } else {
+        index.put(k, off)
+      }
+    })
+  }
   let keys : Array[Bytes] = []
   for k in index.entries.keys() {
     keys.push(k)

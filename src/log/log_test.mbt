@@ -312,7 +312,7 @@ test "key index tracks latest puts and honours tombstones" {
   ignore(log.append(b"b", b"3", (2 : Int64)) catch { _ => panic() })
   ignore(log.delete(b"b", (3 : Int64)) catch { _ => panic() })
   ignore(log.append(b"c", b"4", (4 : Int64)) catch { _ => panic() })
-  let idx = log.build_key_index() catch { _ => panic() }
+  let idx = log.build_key_index()
   assert_eq(idx.size(), 2)
   let a = log.get_latest(idx, b"a") catch { _ => panic() }
   match a {
@@ -421,7 +421,7 @@ test "log compact folds to the live view and drops old segments" {
   assert_eq(recs[0].key, b"a")
   assert_eq(recs[0].value, b"2")
   assert_eq(recs[1].key, b"b")
-  let idx = log.build_key_index() catch { _ => panic() }
+  let idx = log.build_key_index()
   assert_eq(idx.size(), 2)
   let gone = log.get_latest(idx, b"c") catch { _ => panic() }
   match gone {
@@ -614,7 +614,7 @@ test "get_latest_at honours ttl while scan_live filters expired keys" {
   )
   ignore(log.append(b"a", b"1", (1_000 : Int64)) catch { _ => panic() })
   ignore(log.append(b"b", b"2", (5_000 : Int64)) catch { _ => panic() })
-  let index = log.build_key_index() catch { _ => panic() }
+  let index = log.build_key_index()
 
   // now = 6000, ttl = 2000: `a` (age 5000) expired, `b` (age 1000) still live.
   let a = log.get_latest_at(index, b"a", (6_000 : Int64), (2_000 : Int64)) catch {
@@ -667,7 +667,7 @@ test "export/import round-trips the record stream" {
     assert_eq(src_recs[i].kind, dst_recs[i].kind)
   }
   // The imported tombstone still hides the key.
-  let idx = dst.build_key_index() catch { _ => panic() }
+  let idx = dst.build_key_index()
   let gone = dst.get_latest(idx, b"a") catch { _ => panic() }
   match gone {
     Some(_) => panic()
@@ -822,7 +822,7 @@ test "key index is binary-safe for keys with invalid utf8 bytes" {
   )
   ignore(log.append(b"\xff", b"ff", (0 : Int64)) catch { _ => panic() })
   ignore(log.append(b"\xfe", b"fe", (1 : Int64)) catch { _ => panic() })
-  let idx = log.build_key_index() catch { _ => panic() }
+  let idx = log.build_key_index()
   assert_eq(idx.size(), 2)
   let ff = log.get_latest(idx, b"\xff") catch { _ => panic() }
   match ff {

@@ -413,3 +413,39 @@ test "segment meta round-trips the data checksum" {
   ignore(seg.append(b"k2", b"v2", (1 : Int64)) catch { _ => panic() })
   assert_true(!seg.has_checksum())
 }
+
+///|
+test "segment key index round-trips through encode/load" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  ignore(seg.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"a", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(
+    seg.append(b"b", b"", (3 : Int64), kind=@core.RecordKind::Delete) catch {
+      _ => panic()
+    },
+  )
+  let bytes = seg.encode_keys()
+  let store = @backend_mem.MemLog::new()
+  let dst : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  dst.load_keys(bytes) catch {
+    _ => panic()
+  }
+  assert_eq(dst.key_count(), 2)
+  let mut a_off : UInt64 = 0
+  let mut b_del = false
+  dst.each_key((k, off, del) => {
+    if k == b"a" {
+      a_off = off
+    }
+    if k == b"b" {
+      b_del = del
+    }
+  })
+  assert_eq(a_off, (2 : UInt64))
+  assert_true(b_del)
+}

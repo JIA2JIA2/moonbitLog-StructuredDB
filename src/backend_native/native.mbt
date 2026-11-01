@@ -451,6 +451,7 @@ fn load_compressed_segment(
               f, f, base,
             )
             seg.apply_meta(m)
+            load_segment_keys(dir, base, seg)
             Some(seg)
           } else {
             None
@@ -516,6 +517,40 @@ pub fn segment_index_path(dir : String, base : UInt64) -> String {
 }
 
 ///|
+/// File name of a segment's persisted key index.
+fn segment_keys_name(base : UInt64) -> String {
+  @segment.segment_file_name(base) + ".keys"
+}
+
+///|
+/// Path of a segment's persisted key index.
+fn segment_keys_path(dir : String, base : UInt64) -> String {
+  dir + "/" + segment_keys_name(base)
+}
+
+///|
+/// Load a segment's persisted key index into memory, falling back to a full
+/// rebuild scan when the sidecar is missing or invalid.
+fn load_segment_keys(
+  dir : String,
+  base : UInt64,
+  seg : @segment.Segment[NativeFileLog, NativeFileLog],
+) -> Unit {
+  let kp = segment_keys_path(dir, base)
+  let loaded = if file_exists(kp) {
+    Some(seg.load_keys(read_file(kp))) catch {
+      _ => None
+    }
+  } else {
+    None
+  }
+  match loaded {
+    Some(_) => ()
+    None => ignore(seg.rebuild_index() catch { _ => 0 })
+  }
+}
+
+///|
 /// fsync a directory so that a preceding create/rename within it is durable.
 fn fsync_dir(path : String) -> Unit raise @io.IoError {
   let fd = moonlog_open_ro(@utf8.encode(path))
@@ -550,6 +585,7 @@ fn write_file_atomic(
 pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
   ignore(remove_file(dir + "/" + @segment.segment_file_name(base)))
   ignore(remove_file(segment_index_path(dir, base)))
+  ignore(remove_file(segment_keys_path(dir, base)))
   ignore(fsync_dir(dir) catch { _ => () })
 }
 
@@ -586,7 +622,10 @@ fn load_segment(
     f, f, base,
   )
   match valid {
-    Some(m) => seg.apply_meta(m)
+    Some(m) => {
+      seg.apply_meta(m)
+      load_segment_keys(dir, base, seg)
+    }
     None => ignore(seg.recover())
   }
   seg
@@ -690,6 +729,11 @@ pub fn flush_meta(
       dir,
       segment_index_name(seg.base_offset),
       seg.to_meta().encode(),
+    )
+    write_file_atomic(
+      dir,
+      segment_keys_name(seg.base_offset),
+      seg.encode_keys(),
     )
     bases.push(seg.base_offset)
     let stored = if seg.is_compressed() {
