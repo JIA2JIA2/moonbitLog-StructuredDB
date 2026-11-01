@@ -53,6 +53,14 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   added to the README and a release-triggered workflow verifies and publishes
   the package to mooncakes.io.
 
+### Fixed
+
+- **Flush durability（post-M30 review）**：`Log::flush` now fsyncs **every**
+  segment, so `SyncPolicy::Batch` — and `import_bytes` — make rolled-over
+  segments durable; previously only the active segment was fsynced, leaving a
+  cross-segment batch only partially durable. The CLI `MOONLOG_SYNC` variable
+  now also accepts `batch`.
+
 ## 0.1.0 - 2026-10-31
 
 First complete release of the append-only event log database, built up over

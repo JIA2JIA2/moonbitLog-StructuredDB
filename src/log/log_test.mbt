@@ -674,3 +674,23 @@ test "export/import round-trips the record stream" {
     None => ()
   }
 }
+
+///|
+test "sync policy Batch fsyncs every segment at the batch tail" {
+  let counter : FlushCounter = { n: 0, }
+  let log : @log.Log[FlushSpy, FlushSpy] = @log.Log::new(
+    (60 : Int64),
+    base => spy_segment(counter, base),
+    sync=@log.SyncPolicy::Batch,
+  )
+  let batch : Array[(Bytes, Bytes, Int64)] = [
+    (b"a", b"1", (0 : Int64)),
+    (b"b", b"2", (1 : Int64)),
+    (b"c", b"3", (2 : Int64)),
+    (b"d", b"4", (3 : Int64)),
+  ]
+  ignore(log.append_batch(batch) catch { _ => panic() })
+  let segs = log.segment_count()
+  assert_true(segs >= 2)
+  assert_eq(counter.n, segs)
+}

@@ -71,12 +71,15 @@ fn parse_count(s : String) -> Int32 raise @io.IoError {
 
 ///|
 /// Durability policy selected by the MOONLOG_SYNC environment variable
-/// (`1` / `always` -> fsync every append).
+/// (`1` / `always` -> fsync every append; `batch` -> fsync at batch / flush
+/// points; anything else -> no explicit fsync).
 fn desired_sync() -> @log.SyncPolicy {
   match @env.get_env_var("MOONLOG_SYNC") {
     Some(v) =>
       if v == "1" || v == "always" {
         @log.SyncPolicy::Always
+      } else if v == "batch" {
+        @log.SyncPolicy::Batch
       } else {
         @log.SyncPolicy::Never
       }

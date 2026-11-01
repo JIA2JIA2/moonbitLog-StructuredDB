@@ -221,6 +221,7 @@ u32 crc32          (仅覆盖 body)
 - M25 读取路径：实测读缓存比直接 pread 慢约 3.7×，故保留直接 `pread`；新增 native 顺序扫描基准
 - M29 CI 增强：native 覆盖率摘要 + bench 结果归档
 - M30 架构文档与发布工作流（release 触发 `moon publish`）
+- M31 审阅修复：`Log::flush` 刷所有段、`import_bytes` 批量落盘、CLI 支持 `MOONLOG_SYNC=batch`
 
 ## 许可
 
