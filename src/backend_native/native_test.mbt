@@ -906,3 +906,167 @@ test "open_log_dir rebuilds keys when manifest and sidecars are missing" {
   }
   clean_dir(dir)
 }
+
+///|
+/// Deterministic property test on the real file backend: randomized
+/// put/delete/check sequences with rolling segments, plus periodic crash
+/// injection — the last segment's data file is truncated by a few bytes (a
+/// torn tail), so the manifest size check fails and the reopen path runs a
+/// full recovery. The in-memory model is rebuilt from the surviving record
+/// count.
+test "property: native randomized ops with crash injection match the model" {
+  let dir = "/tmp/moonlog_prop_native"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let keys : Array[Bytes] = [
+    b"k0", b"k1", b"k2", b"k3", b"k4", b"k5", b"k6", b"k7", b"k8", b"k9", b"ka",
+    b"kb", b"kc", b"kd", b"ke", b"kf",
+  ]
+  let values : Array[Bytes] = [
+    b"v0", b"v1", b"v2", b"v3", b"v4", b"v5", b"v6", b"v7", b"v8", b"v9", b"va",
+    b"vb", b"vc", b"vd", b"ve", b"vf",
+  ]
+  let model : Array[Bytes?] = Array::make(16, (None : Bytes?))
+  let ops : Array[(Int32, Int32, Int32)] = []
+  let mut log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (200 : Int64)) catch { _ => panic() }
+  let check_all = fn(
+    l : @log.Log[@backend_native.NativeFileLog, @backend_native.NativeFileLog],
+  ) -> Unit raise {
+    let idx = l.build_key_index()
+    for i = 0; i < 16; i = i + 1 {
+      let got = l.get_latest(idx, keys[i]) catch { _ => panic() }
+      match model[i] {
+        Some(expected) =>
+          match got {
+            Some(rec) =>
+              if rec.value != expected {
+                println(
+                  "MISMATCH ki=" +
+                  i.to_string() +
+                  " expected=" +
+                  (@utf8.decode(expected) catch { _ => "<bin>" }) +
+                  " got=" +
+                  (@utf8.decode(rec.value) catch { _ => "<bin>" }),
+                )
+                assert_eq(rec.value, expected)
+              }
+            None => {
+              println("MISSING ki=" + i.to_string())
+              panic()
+            }
+          }
+        None =>
+          match got {
+            Some(rec) => {
+              println("EXTRA ki=" + i.to_string())
+              panic()
+            }
+            None => ()
+          }
+      }
+    }
+  }
+  let mut x : UInt64 = 0xDEADBEEFCAFEBABE
+  let mut step = 0
+  while step < 300 {
+    if step % 60 == 59 {
+      // Torn-tail injection: fsync everything, then chop a few bytes off the
+      // LAST segment's data file so the manifest size check fails and the
+      // reopen path runs a full recovery.
+      @backend_native.flush_meta(dir, log) catch {
+        _ => panic()
+      }
+      let last = log.segments[log.segments.length() - 1]
+      let path = dir + "/" + @segment.segment_file_name(last.base_offset)
+      let data = @backend_native.read_file(path)
+      if data.length() > 12 {
+        @backend_native.write_file(
+          path,
+          @core.slice(data, 0, data.length() - 3),
+        ) catch {
+          _ => panic()
+        }
+      }
+      for seg in log.segments {
+        seg.writer.close()
+      }
+      let reopened = @backend_native.open_log_dir(dir, (200 : Int64)) catch {
+        _ => panic()
+      }
+      let survive = reopened.count()
+      // The torn tail only ever eats the most recently appended record(s) and
+      // leaves no offset holes, so drop the trailing ops and rebuild the model
+      // from what actually survived.
+      while ops.length() > survive {
+        ignore(ops.pop())
+      }
+      for i = 0; i < 16; i = i + 1 {
+        model[i] = (None : Bytes?)
+      }
+      for op in ops {
+        let (kd, ki, vi) = op
+        if kd == 0 {
+          model[ki] = Some(values[vi])
+        } else {
+          model[ki] = (None : Bytes?)
+        }
+      }
+      log = reopened
+      check_all(log) catch {
+        _ => panic()
+      }
+    }
+    x = x ^ (x << 13)
+    x = x ^ (x >> 7)
+    x = x ^ (x << 17)
+    let roll = ((x >> 32) & 0x7FFFFFFF).to_int() % 100
+    let ki = ((x >> 40) & 0xF).to_int()
+    let k = keys[ki]
+    if roll < 60 {
+      let vi = step % 16
+      let v = values[vi]
+      ignore(log.append(k, v, step.to_int64()) catch { _ => panic() })
+      ops.push((0, ki, vi))
+      model[ki] = Some(v)
+    } else if roll < 85 {
+      ignore(log.delete(k, step.to_int64()) catch { _ => panic() })
+      ops.push((1, ki, 0))
+      model[ki] = (None : Bytes?)
+    } else {
+      let idx = log.build_key_index()
+      let got = log.get_latest(idx, k) catch { _ => panic() }
+      match model[ki] {
+        Some(expected) =>
+          match got {
+            Some(rec) => assert_eq(rec.value, expected)
+            None => panic()
+          }
+        None =>
+          match got {
+            Some(_) => panic()
+            None => ()
+          }
+      }
+    }
+    step = step + 1
+  }
+  check_all(log) catch {
+    _ => panic()
+  }
+  let report = log.verify()
+  match report.first_bad_offset {
+    Some(_) => panic()
+    None => ()
+  }
+  match report.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
