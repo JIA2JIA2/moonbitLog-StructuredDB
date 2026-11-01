@@ -447,6 +447,52 @@ pub fn[W, R] Log::retain_max_bytes(
 }
 
 ///|
+/// Whether every record in `seg` has been superseded by a later record for the
+/// same key (a newer put, or a tombstone), so dropping the segment loses no
+/// live data.
+fn[W, R : @io.LogReader] segment_all_superseded(
+  seg : @segment.Segment[W, R],
+  index : KeyIndex,
+) -> Bool raise @io.IoError {
+  let end = seg.base_offset + seg.record_count.to_uint64()
+  let mut all = true
+  seg.for_each(seg.base_offset, end, rec => {
+    match index.latest(rec.key) {
+      Some(off) => if off <= rec.offset { all = false }
+      None => ()
+    }
+  })
+  all
+}
+
+///|
+/// Drop rolled-over segments every record of which has been superseded by a
+/// later record for the same key, so removing them loses no live data. The
+/// active (last) segment is never dropped. Returns the number dropped.
+pub fn[W, R : @io.LogReader] Log::prune_superseded(
+  self : Log[W, R],
+  index : KeyIndex,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 raise @io.IoError {
+  let kept : Array[@segment.Segment[W, R]] = []
+  let mut dropped = 0
+  let n = self.segments.length()
+  let mut i = 0
+  while i < n {
+    let seg = self.segments[i]
+    if i < n - 1 && segment_all_superseded(seg, index) {
+      on_drop(seg)
+      dropped = dropped + 1
+    } else {
+      kept.push(seg)
+    }
+    i = i + 1
+  }
+  self.segments = kept
+  dropped
+}
+
+///|
 /// Retention by timestamp: drop every rolled-over segment whose last record is
 /// older than `cutoff`, invoking `on_drop` for each. Assumes timestamps are
 /// non-decreasing across the log (the usual append-only event ordering); the

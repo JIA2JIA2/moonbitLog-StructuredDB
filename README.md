@@ -62,6 +62,7 @@ moonlog <command> <dir> [args...]
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
   prune-before <dir> <timestamp> 回收末条记录早于 timestamp 的段
   prune-expired <dir> <ttl>     回收末条记录早于 now-ttl 的段
+  prune-superseded <dir>        回收所有记录均被后续覆盖的段
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
@@ -241,6 +242,7 @@ u32 crc32          (仅覆盖 body)
 - M48 表驱动 CRC32：`crc32` 改为加载时构建 256 项查表，替代逐位计算
 - M49 段内时间索引：段记录 timestamp 是否非递减（meta v6 持久化）；`scan_time_range` 对有序段二分定位 `[lo, hi)` 的 offset 窗口，无序段回退线性过滤
 - M50 段压缩增强：新增纯 MoonBit LZSS（`core.lz_compress` / `lz_decompress`，4 KiB 窗口）与 RLE 并存；CLI `compress <dir> [rle|lzss]` 可选算法（默认 lzss），meta v7 记录算法以正确解压
+- M51 冗余段回收：`Log::prune_superseded` 删除所有记录均被后续覆盖（同 key 更新 / tombstone）的已 roll 段，回收空间且不重排 offset；CLI `prune-superseded`
 
 ## 许可
 

@@ -21,6 +21,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (4 KiB window) complement RLE. The `compress` CLI command takes an optional
   `rle` / `lzss` (default) argument, and metadata v7 records which algorithm a
   segment uses so it is decompressed correctly on reopen.
+- **Superseded-segment GC (M51)**：`Log::prune_superseded` drops rolled-over
+  segments every record of which a later record supersedes (same-key put or
+  tombstone), reclaiming space without renumbering offsets; exposed as the
+  `prune-superseded` CLI command.
 
 ## 0.3.0 - 2026-11-01
 

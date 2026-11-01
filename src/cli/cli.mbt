@@ -20,6 +20,7 @@
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
+///   prune-superseded <dir>           drop segments fully superseded by later records
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
@@ -48,7 +49,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -476,6 +477,23 @@ fn cmd_prune_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Drop rolled-over segments whose records have all been superseded by later
+/// records for the same key (no live data is lost).
+fn cmd_prune_superseded(dir : String) -> Unit raise @io.IoError {
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let index = log.build_key_index()
+    let dropped = log.prune_superseded(index, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("dropped " + dropped.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
 fn cmd_cursor(
@@ -777,6 +795,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_prune_expired(args[2], args[3])
+    }
+  } else if cmd == "prune-superseded" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      cmd_prune_superseded(args[2])
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {

@@ -1042,3 +1042,32 @@ test "scan_time_range bisects sorted segments and scans unsorted ones" {
   assert_eq(mid.length(), 1)
   assert_eq(mid[0].key, b"c")
 }
+
+///|
+test "prune_superseded drops only fully-superseded segments" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (50 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"1", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"2", (2 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (3 : Int64)) catch { _ => panic() })
+  assert_true(log.segment_count() >= 2)
+  let before = log.segment_count()
+  let index = log.build_key_index()
+  let dropped = log.prune_superseded(index, _seg => ()) catch { _ => panic() }
+  assert_true(dropped >= 1)
+  assert_true(log.segment_count() < before)
+  let idx2 = log.build_key_index()
+  let a = log.get_latest(idx2, b"a") catch { _ => panic() }
+  match a {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+  let b = log.get_latest(idx2, b"b") catch { _ => panic() }
+  match b {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+}

@@ -61,6 +61,7 @@ pub fn[W, R : @io.LogReader] Log::get_many(Self[W, R], Array[Bytes]) -> Array[@c
 pub fn[W : @io.LogWriter, R] Log::import_bytes(Self[W, R], Bytes) -> Int32 raise @io.IoError
 pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64
+pub fn[W, R : @io.LogReader] Log::prune_superseded(Self[W, R], KeyIndex, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]], sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R : @io.LogReader] Log::retain_before(Self[W, R], Int64, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::retain_last(Self[W, R], Int32, (@segment.Segment[W, R]) -> Unit) -> Int32
