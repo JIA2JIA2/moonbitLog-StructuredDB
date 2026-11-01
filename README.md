@@ -271,6 +271,7 @@ u32 crc32          (仅覆盖 body)
 - M65 sidecar 写放大优化：段级 `meta_dirty` 标志，`flush_meta` 只重写有变更段（新 roll / checksum / 压缩）的 `.index`/`.keys`，干净已 roll 段跳过
 - M66 发布 0.5.0：property 测试、TTL 折叠、CAS、sidecar 写放大优化随包发布
 - M67 native property 测试：文件后端随机操作 + 周期性注入 torn tail（fsync 后截断最后段数据文件），模型按存活记录数重建
+- M68 live 折叠点查化：`snapshot` / `scan_live` 经 key 索引逐 key 点查（按 offset 排序保持输出顺序），替代二次全量扫描
 
 ## 许可
 

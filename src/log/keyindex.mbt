@@ -147,18 +147,25 @@ pub fn[W, R : @io.LogReader] Log::snapshot(
   self : Log[W, R],
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
-  let live : Array[@core.Record] = []
-  self.for_each((0 : UInt64), self.next_offset, rec => {
-    if !rec.is_delete() {
-      match index.latest(rec.key) {
-        Some(off) => if off == rec.offset { live.push(rec) }
-        None => ()
-      }
+  let collected : Array[@core.Record] = []
+  for off in index.entries.values() {
+    match self.get(off) {
+      Some(rec) => if !rec.is_delete() { collected.push(rec) }
+      None => ()
+    }
+  }
+  collected.sort_by(fn(a, b) {
+    if a.offset < b.offset {
+      -1
+    } else if a.offset > b.offset {
+      1
+    } else {
+      0
     }
   })
   let out : Array[@core.Record] = []
   let mut i = 0
-  for rec in live {
+  for rec in collected {
     out.push({
       offset: i.to_uint64(),
       timestamp: rec.timestamp,
@@ -263,15 +270,22 @@ pub fn[W, R : @io.LogReader] Log::scan_live(
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
   let out : Array[@core.Record] = []
-  self.for_each((0 : UInt64), self.next_offset, rec => {
-    if !rec.is_delete() {
-      match index.latest(rec.key) {
-        Some(off) =>
-          if off == rec.offset && now - rec.timestamp <= ttl {
-            out.push(rec)
-          }
-        None => ()
-      }
+  for off in index.entries.values() {
+    match self.get(off) {
+      Some(rec) =>
+        if !rec.is_delete() && now - rec.timestamp <= ttl {
+          out.push(rec)
+        }
+      None => ()
+    }
+  }
+  out.sort_by(fn(a, b) {
+    if a.offset < b.offset {
+      -1
+    } else if a.offset > b.offset {
+      1
+    } else {
+      0
     }
   })
   out

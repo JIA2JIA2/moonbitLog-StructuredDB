@@ -11,6 +11,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   test now also runs against the file backend, periodically simulating a torn
   tail (truncating the last segment's data file after fsync) and rebuilding the
   model from the surviving record count.
+- **Point-lookup folding (M68)**：`snapshot` / `scan_live` collect the live view
+  through the key index (one point lookup per live key, then sorted by offset)
+  instead of a second full scan, which pays off once many records have been
+  superseded or deleted.
 
 ## 0.5.0 - 2026-11-01
 
