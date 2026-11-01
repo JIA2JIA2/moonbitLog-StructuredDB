@@ -1293,3 +1293,38 @@ test "compare_and_swap enforces the expected value" {
   }
   assert_eq(log.count(), 3)
 }
+
+///|
+test "scan_time_range uses ts samples on a large sorted segment" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (10_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 100; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_eq(log.segment_count(), 1)
+  assert_true(log.segments[0].is_ts_sorted())
+  // 100 records with interval 32 means the ts sample array is non-empty, so
+  // this exercises the sample-based binary search path.
+  let mid = log.scan_time_range((150 : Int64), (350 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(mid.length(), 20)
+  assert_eq(mid[0].timestamp, (150 : Int64))
+  assert_eq(mid[19].timestamp, (340 : Int64))
+  let head = log.scan_time_range((0 : Int64), (10 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(head.length(), 1)
+  assert_eq(head[0].timestamp, (0 : Int64))
+  let tail = log.scan_time_range((990 : Int64), (2000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(tail.length(), 1)
+  assert_eq(tail[0].timestamp, (990 : Int64))
+  let none = log.scan_time_range((995 : Int64), (2000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(none.length(), 0)
+}
