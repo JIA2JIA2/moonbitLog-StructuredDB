@@ -557,6 +557,9 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(
     on_drop(a)
     on_drop(b)
     let combined = (self.make)(a.base_offset)
+    if combined.byte_size() > (0 : Int64) {
+      raise @io.IoError::Corrupt((0 : Int64))
+    }
     for rec in ra {
       ignore(combined.append(rec.key, rec.value, rec.timestamp, kind=rec.kind))
     }
