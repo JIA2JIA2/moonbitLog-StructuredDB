@@ -75,7 +75,7 @@ moonlog <command> <dir> [args...]
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   fsck <dir>                    校验记录/offset 完整性
-stats <dir>                   打印记录/段计数
+stats <dir> [json]            打印逐段统计（可选 JSON）
 ```
 
 持久性与 `MOONLOG_SYNC`：CLI 写入默认 `Always`，即命令返回时数据已 fsync 落盘；设 `MOONLOG_SYNC=batch` 改为批量 / 导入时一次 fsync，设 `MOONLOG_SYNC=never`（或 `0`）关闭显式 fsync（仅依赖 OS 回写）。
@@ -233,6 +233,7 @@ u32 crc32          (仅覆盖 body)
 - M42 缓冲写合并：`NativeFileLog` 把小追加合并成更少的 `pwrite`；读取 / flush / truncate / close 与写元数据前先 drain，写命令返回时文件大小与逻辑大小一致
 - M43 段压缩：纯 MoonBit RLE（`core.rle_compress` / `core.rle_decompress`）；CLI `compress` 原地压缩所有已 roll 段（meta v5 记录压缩标志与原始大小），打开时透明解压为只读视图，旧版本 meta 读为未压缩
 - M44 原子批量写入：`Log::append_batch_atomic` 失败时整体回滚（删除批中新建段、截断并重建原活跃段、恢复 offset 空间）
+- M45 可观测性：`Log::segment_summaries` 暴露每段计数 / 大小 / 压缩标志 / 时间跨度；CLI `stats` 打印逐段信息并支持 `stats <dir> json`
 
 ## 许可
 

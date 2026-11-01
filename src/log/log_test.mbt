@@ -987,3 +987,27 @@ test "append_batch_atomic rolls back every record on failure" {
   let recs = log.scan() catch { _ => panic() }
   assert_eq(recs.length(), 0)
 }
+
+///|
+test "segment_summaries reports one row per segment with totals" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 6; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let rows = log.segment_summaries()
+  assert_eq(rows.length(), log.segment_count())
+  let mut total = 0
+  let mut bytes : Int64 = 0
+  for row in rows {
+    total = total + row.records
+    bytes = bytes + row.bytes
+    assert_true(!row.compressed)
+    assert_true(row.has_span)
+  }
+  assert_eq(total, log.count())
+  assert_true(bytes > (0 : Int64))
+}

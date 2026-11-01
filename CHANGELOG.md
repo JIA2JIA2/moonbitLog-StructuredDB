@@ -49,6 +49,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Atomic batch append (M44)**：`Log::append_batch_atomic` discards the whole
   batch on failure — dropping segments created by the batch, truncating and
   rebuilding the previously active segment, and restoring the offset space.
+- **Observability: per-segment stats (M45)**：`Log::segment_summaries` exposes
+  each segment's record count, byte size, compression flag and time span; the
+  `stats` CLI command prints them and accepts `json` as a second argument for
+  machine-readable output.
 
 ## 0.2.0 - 2026-10-31
 

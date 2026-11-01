@@ -73,6 +73,7 @@ pub fn[W, R : @io.LogReader] Log::scan_range(Self[W, R], UInt64, UInt64) -> Arra
 pub fn[W, R : @io.LogReader] Log::scan_reverse(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::scan_time_range(Self[W, R], Int64, Int64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
+pub fn[W, R] Log::segment_summaries(Self[W, R]) -> Array[SegmentSummary]
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::tail(Self[W, R], Int32) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::verify(Self[W, R]) -> VerifyReport
@@ -84,6 +85,16 @@ pub(all) struct Manifest {
   segment_sizes : Array[Int64]
 }
 pub fn Manifest::encode(Self) -> Bytes
+
+pub(all) struct SegmentSummary {
+  base_offset : UInt64
+  records : Int32
+  bytes : Int64
+  compressed : Bool
+  has_span : Bool
+  min_ts : Int64
+  max_ts : Int64
+}
 
 pub(all) enum SyncPolicy {
   Never

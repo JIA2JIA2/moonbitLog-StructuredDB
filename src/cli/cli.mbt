@@ -35,7 +35,7 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compress <dir>                   RLE-compress every rolled-over segment
 ///   fsck <dir>                       verify record/offset integrity
-///   stats <dir>                      print record/segment counts
+///   stats <dir> [json]               print record/segment counts (optionally JSON)
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
 /// CLI invocation never observes a half-written directory.
@@ -312,6 +312,67 @@ fn cmd_recover(dir : String) -> Unit raise @io.IoError {
       " next_offset " +
       log.next_offset().to_string(),
     )
+    close_log(log)
+  })
+}
+
+///|
+/// Print per-segment statistics: total counts plus one line per segment. With
+/// a second argument of `json`, emit the same information as JSON.
+fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let detail = log.segment_summaries()
+    if json {
+      let mut s = "{\"records\":" +
+        log.count().to_string() +
+        ",\"segments\":" +
+        log.segment_count().to_string() +
+        ",\"next_offset\":" +
+        log.next_offset().to_string() +
+        ",\"detail\":["
+      let mut first = true
+      for seg in detail {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"base\":" +
+          seg.base_offset.to_string() +
+          ",\"records\":" +
+          seg.records.to_string() +
+          ",\"bytes\":" +
+          seg.bytes.to_string() +
+          ",\"compressed\":" +
+          (if seg.compressed { "true" } else { "false" })
+        if seg.has_span {
+          s = s +
+            ",\"min_ts\":" +
+            seg.min_ts.to_string() +
+            ",\"max_ts\":" +
+            seg.max_ts.to_string()
+        }
+        s = s + "}"
+      }
+      println(s + "]}")
+    } else {
+      println("records " + log.count().to_string())
+      println("segments " + log.segment_count().to_string())
+      println("next_offset " + log.next_offset().to_string())
+      for seg in detail {
+        println(
+          "seg " +
+          seg.base_offset.to_string() +
+          " records=" +
+          seg.records.to_string() +
+          " bytes=" +
+          seg.bytes.to_string() +
+          " compressed=" +
+          (if seg.compressed { "true" } else { "false" }),
+        )
+      }
+    }
     close_log(log)
   })
 }
@@ -678,8 +739,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       cmd_tail(args[2], args[3])
     }
-  } else if cmd == "recover" || cmd == "stats" {
+  } else if cmd == "recover" {
     cmd_recover(args[2])
+  } else if cmd == "stats" {
+    let json = args.length() > 3 && args[3] == "json"
+    cmd_stats(args[2], json)
   } else if cmd == "fsck" {
     cmd_fsck(args[2])
   } else if cmd == "prune" {

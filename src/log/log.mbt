@@ -587,3 +587,34 @@ pub fn[W : @io.LogWriter, R] Log::import_bytes(
   }
   n
 }
+
+///|
+/// A read-only summary of one segment, for observability.
+pub(all) struct SegmentSummary {
+  base_offset : UInt64
+  records : Int32
+  bytes : Int64
+  compressed : Bool
+  has_span : Bool
+  min_ts : Int64
+  max_ts : Int64
+}
+
+///|
+/// Summarize every segment (counts, sizes, compression and time span) without
+/// decoding record bodies.
+pub fn[W, R] Log::segment_summaries(self : Log[W, R]) -> Array[SegmentSummary] {
+  let out : Array[SegmentSummary] = []
+  for seg in self.segments {
+    out.push({
+      base_offset: seg.base_offset,
+      records: seg.count(),
+      bytes: seg.byte_size(),
+      compressed: seg.is_compressed(),
+      has_span: seg.has_time_range(),
+      min_ts: seg.min_timestamp(),
+      max_ts: seg.max_timestamp(),
+    })
+  }
+  out
+}
