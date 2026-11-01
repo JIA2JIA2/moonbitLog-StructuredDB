@@ -1,6 +1,6 @@
 name = "moonlog/lsdb"
 
-version = "0.8.0"
+version = "0.1.0"
 
 readme = "README.md"
 
