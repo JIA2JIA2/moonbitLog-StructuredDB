@@ -511,6 +511,47 @@ pub fn[W, R : @io.LogReader] Log::count_superseded(
 }
 
 ///|
+/// Merge the two oldest segments whenever they are offset-contiguous, repeating
+/// until the log holds at most `max_segments` segments or no contiguous pair
+/// remains. Logical offsets are preserved (the combined segment starts at the
+/// first segment's base). The older segments are handed to `on_drop`. Returns
+/// the number of merges performed.
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(
+  self : Log[W, R],
+  max_segments : Int32,
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 raise @io.IoError {
+  let mut merged = 0
+  while self.segments.length() >= 2 && self.segments.length() > max_segments {
+    let a = self.segments[0]
+    let b = self.segments[1]
+    if b.base_offset != a.base_offset + a.record_count.to_uint64() {
+      break
+    }
+    let ra = a.scan() catch { _ => break }
+    let rb = b.scan() catch { _ => break }
+    on_drop(a)
+    on_drop(b)
+    let combined = (self.make)(a.base_offset)
+    for rec in ra {
+      ignore(combined.append(rec.key, rec.value, rec.timestamp, kind=rec.kind))
+    }
+    for rec in rb {
+      ignore(combined.append(rec.key, rec.value, rec.timestamp, kind=rec.kind))
+    }
+    let rebuilt : Array[@segment.Segment[W, R]] = [combined]
+    let mut i = 2
+    while i < self.segments.length() {
+      rebuilt.push(self.segments[i])
+      i = i + 1
+    }
+    self.segments = rebuilt
+    merged = merged + 1
+  }
+  merged
+}
+
+///|
 /// Retention by timestamp: drop every rolled-over segment whose last record is
 /// older than `cutoff`, invoking `on_drop` for each. Assumes timestamps are
 /// non-decreasing across the log (the usual append-only event ordering); the

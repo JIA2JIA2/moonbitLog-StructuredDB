@@ -63,6 +63,7 @@ moonlog <command> <dir> [args...]
   prune-before <dir> <timestamp> 回收末条记录早于 timestamp 的段
   prune-expired <dir> <ttl>     回收末条记录早于 now-ttl 的段
   prune-superseded <dir>        回收所有记录均被后续覆盖的段
+  merge <dir> <max-segments>    将连续的已 roll 段合并至不超过 N 段
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
@@ -255,6 +256,7 @@ u32 crc32          (仅覆盖 body)
 - M55 文档与 native 示例：新增 `examples/native_demo`（文件后端端到端演示）；README 补齐本轮（M47–M54）能力说明
 - M56 旧格式兼容性测试：构造 v1–v7 各历史版本的段元数据字节，断言当前解码器均可正确读取（锁定向后兼容）
 - M57 崩溃一致性测试：损坏 `.index`、删除 `MANIFEST` / `.index` / `.keys` 后，断言 `open_log_dir` 仍能从段数据恢复记录并重建 key 索引
+- M58 段合并：`Log::merge_segments` 将 offset 连续的已 roll 段合并为更少的段（保留逻辑 offset）；CLI `merge <dir> <max-segments>`
 
 ## 许可
 

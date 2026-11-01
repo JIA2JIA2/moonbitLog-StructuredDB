@@ -1108,3 +1108,31 @@ test "build_key_index reads no record bodies" {
   assert_eq(index.size(), 1)
   assert_eq(cr.reads, 0)
 }
+
+///|
+test "merge_segments combines contiguous rolled segments preserving offsets" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 6; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let before = log.segment_count()
+  let merged = log.merge_segments(1, _seg => ()) catch { _ => panic() }
+  assert_true(merged >= 1)
+  assert_true(log.segment_count() < before)
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 6)
+  let mut i = 0
+  while i < 6 {
+    assert_eq(recs[i].offset, i.to_uint64())
+    i = i + 1
+  }
+  let r = log.get((3 : UInt64)) catch { _ => panic() }
+  match r {
+    Some(rec) => assert_eq(rec.offset, (3 : UInt64))
+    None => panic()
+  }
+}

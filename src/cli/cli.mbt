@@ -21,6 +21,7 @@
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
 ///   prune-superseded <dir>           drop segments fully superseded by later records
+///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
@@ -49,7 +50,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -514,6 +515,24 @@ fn cmd_prune_superseded(dir : String, dry_run : Bool) -> Unit raise @io.IoError 
 }
 
 ///|
+/// Merge contiguous rolled-over segments until at most `max_segments` remain.
+fn cmd_merge(dir : String, max_str : String) -> Unit raise @io.IoError {
+  let max = @string.parse_int(max_str) catch {
+    _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let merged = log.merge_segments(max, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    println("merged " + merged.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
 fn cmd_cursor(
@@ -846,6 +865,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_prune_superseded(args[2], args.length() > 3 && args[3] == "dry-run")
+    }
+  } else if cmd == "merge" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_merge(args[2], args[3])
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {
