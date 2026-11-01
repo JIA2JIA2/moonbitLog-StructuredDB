@@ -3,11 +3,18 @@
 /// raw bytes (binary-safe); tombstones remove keys, so only live puts remain.
 pub(all) struct KeyIndex {
   entries : @hashmap.HashMap[Bytes, UInt64]
+  mut sorted_keys : Array[Bytes]
 }
 
 ///|
 pub fn KeyIndex::new() -> KeyIndex {
-  { entries: @hashmap.HashMap::HashMap([]), }
+  { entries: @hashmap.HashMap::HashMap([]), sorted_keys: [], }
+}
+
+///|
+/// The live keys in ascending byte order. Populated by `build_key_index`.
+pub fn KeyIndex::sorted_keys(self : KeyIndex) -> Array[Bytes] {
+  self.sorted_keys
 }
 
 ///|
@@ -45,6 +52,12 @@ pub fn[W, R : @io.LogReader] Log::build_key_index(
       index.put(rec.key, rec.offset)
     }
   })
+  let keys : Array[Bytes] = []
+  for k in index.entries.keys() {
+    keys.push(k)
+  }
+  keys.sort_by(fn(a, b) { bytes_cmp(a, b) })
+  index.sorted_keys = keys
   index
 }
 
@@ -209,6 +222,22 @@ fn bytes_starts_with(a : Bytes, b : Bytes) -> Bool {
 }
 
 ///|
+/// The first index `i` in the ascending `keys` where `keys[i] >= target`.
+fn lower_bound(keys : Array[Bytes], target : Bytes) -> Int32 {
+  let mut lo = 0
+  let mut hi = keys.length()
+  while lo < hi {
+    let mid = (lo + hi) / 2
+    if bytes_cmp(keys[mid], target) < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
+  }
+  lo
+}
+
+///|
 /// The latest live record for every key that begins with `prefix`, sorted
 /// ascending by key bytes. Tombstoned keys are excluded; superseded puts lose
 /// to the newest one.
@@ -217,16 +246,24 @@ pub fn[W, R : @io.LogReader] Log::scan_prefix(
   prefix : Bytes,
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
+  let keys = index.sorted_keys()
   let out : Array[@core.Record] = []
-  self.for_each((0 : UInt64), self.next_offset, rec => {
-    if !rec.is_delete() && bytes_starts_with(rec.key, prefix) {
-      match index.latest(rec.key) {
-        Some(off) => if off == rec.offset { out.push(rec) }
-        None => ()
-      }
+  let mut i = lower_bound(keys, prefix)
+  while i < keys.length() {
+    let k = keys[i]
+    if !bytes_starts_with(k, prefix) {
+      break
     }
-  })
-  out.sort_by(fn(a, b) { bytes_cmp(a.key, b.key) })
+    match index.latest(k) {
+      Some(off) =>
+        match self.get(off) {
+          Some(rec) => out.push(rec)
+          None => ()
+        }
+      None => ()
+    }
+    i = i + 1
+  }
   out
 }
 
@@ -241,21 +278,25 @@ pub fn[W, R : @io.LogReader] Log::scan_key_range(
   hi : Bytes,
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
+  let keys = index.sorted_keys()
   let has_hi = hi.length() > 0
   let out : Array[@core.Record] = []
-  self.for_each((0 : UInt64), self.next_offset, rec => {
-    if !rec.is_delete() {
-      let ge_lo = bytes_cmp(rec.key, lo) >= 0
-      let lt_hi = if has_hi { bytes_cmp(rec.key, hi) < 0 } else { true }
-      if ge_lo && lt_hi {
-        match index.latest(rec.key) {
-          Some(off) => if off == rec.offset { out.push(rec) }
+  let mut i = lower_bound(keys, lo)
+  while i < keys.length() {
+    let k = keys[i]
+    if has_hi && bytes_cmp(k, hi) >= 0 {
+      break
+    }
+    match index.latest(k) {
+      Some(off) =>
+        match self.get(off) {
+          Some(rec) => out.push(rec)
           None => ()
         }
-      }
+      None => ()
     }
-  })
-  out.sort_by(fn(a, b) { bytes_cmp(a.key, b.key) })
+    i = i + 1
+  }
   out
 }
 

@@ -28,10 +28,12 @@ pub fn ConsumerCursor::seek(Self, UInt64) -> Unit
 
 pub(all) struct KeyIndex {
   entries : @hashmap.HashMap[Bytes, UInt64]
+  mut sorted_keys : Array[Bytes]
 }
 pub fn KeyIndex::latest(Self, Bytes) -> UInt64?
 pub fn KeyIndex::new() -> Self
 pub fn KeyIndex::size(Self) -> Int32
+pub fn KeyIndex::sorted_keys(Self) -> Array[Bytes]
 
 pub(all) struct Log[W, R] {
   mut segments : Array[@segment.Segment[W, R]]

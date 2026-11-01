@@ -28,6 +28,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   over its whole data range in `.index` (metadata v4; older versions read back as
   "unverified"). `Log::verify` reports the first segment whose stored checksum
   does not match via `VerifyReport::first_bad_checksum`.
+- **Sorted key index (M39)**：`build_key_index` now keeps its live keys in byte
+  order, so `scan_prefix` / `scan_key_range` binary-search the range and
+  point-look-up the matching records instead of re-scanning the log and sorting.
 
 ## 0.2.0 - 2026-10-31
 
