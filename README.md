@@ -232,6 +232,7 @@ u32 crc32          (仅覆盖 body)
 - M41 逆序扫描与 tail：`Log::scan_reverse` 按 offset 降序返回区间记录，`Log::tail` 返回最近 n 条（按 append 顺序）；CLI `tail`
 - M42 缓冲写合并：`NativeFileLog` 把小追加合并成更少的 `pwrite`；读取 / flush / truncate / close 与写元数据前先 drain，写命令返回时文件大小与逻辑大小一致
 - M43 段压缩：纯 MoonBit RLE（`core.rle_compress` / `core.rle_decompress`）；CLI `compress` 原地压缩所有已 roll 段（meta v5 记录压缩标志与原始大小），打开时透明解压为只读视图，旧版本 meta 读为未压缩
+- M44 原子批量写入：`Log::append_batch_atomic` 失败时整体回滚（删除批中新建段、截断并重建原活跃段、恢复 offset 空间）
 
 ## 许可
 

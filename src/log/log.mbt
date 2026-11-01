@@ -139,6 +139,61 @@ pub fn[W : @io.LogWriter, R] Log::append_batch(
 }
 
 ///|
+/// Append several records atomically: if any append fails, every record from
+/// this batch is discarded. Segments created by the batch are handed to
+/// `on_drop` (so the caller can reclaim their files), the previously active
+/// segment is truncated back to its pre-batch size and its index, Bloom filter
+/// and counters are rebuilt, and the offset space is restored. On success it
+/// behaves like `append_batch`.
+pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch_atomic(
+  self : Log[W, R],
+  records : Array[(Bytes, Bytes, Int64)],
+  on_drop : (@segment.Segment[W, R]) -> Unit,
+) -> Array[UInt64] raise @io.IoError {
+  let start = self.next_offset
+  let n0 = self.segments.length()
+  let prev_size = if n0 > 0 { self.segments[n0 - 1].size } else { (0 : Int64) }
+  let offsets : Array[UInt64] = []
+  let ok = try {
+    for rec in records {
+      let (key, value, timestamp) = rec
+      offsets.push(self.append(key, value, timestamp))
+    }
+    true
+  } catch {
+    _ => false
+  }
+  if ok {
+    if self.sync is SyncPolicy::Batch {
+      self.flush()
+    }
+    offsets
+  } else {
+    let mut i = n0
+    while i < self.segments.length() {
+      on_drop(self.segments[i])
+      i = i + 1
+    }
+    let kept : Array[@segment.Segment[W, R]] = []
+    let mut j = 0
+    while j < n0 {
+      kept.push(self.segments[j])
+      j = j + 1
+    }
+    self.segments = kept
+    if n0 > 0 {
+      let seg = self.segments[n0 - 1]
+      @io.LogTruncate::truncate(seg.writer, prev_size) catch {
+        _ => ()
+      }
+      ignore(seg.rebuild_index() catch { _ => 0 })
+    }
+    self.next_offset = start
+    ([] : Array[UInt64])
+  }
+}
+
+///|
 /// Locate the segment that owns `offset`, if any. Segments are kept in
 /// increasing `base_offset` order, so this binary-searches them.
 fn[W, R] Log::find_segment(

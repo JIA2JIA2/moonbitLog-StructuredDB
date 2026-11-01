@@ -46,6 +46,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rolled-over segment in place; metadata v5 records the compression flag and the
   uncompressed size, and compressed segments are transparently decompressed into
   a read-only view on open. Older metadata versions read back as uncompressed.
+- **Atomic batch append (M44)**：`Log::append_batch_atomic` discards the whole
+  batch on failure — dropping segments created by the batch, truncating and
+  rebuilding the previously active segment, and restoring the offset space.
 
 ## 0.2.0 - 2026-10-31
 

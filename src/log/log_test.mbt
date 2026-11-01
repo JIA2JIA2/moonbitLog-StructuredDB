@@ -901,6 +901,8 @@ test "get_many returns latest live records in input order" {
 }
 
 ///|
+
+///|
 test "scan_reverse returns records newest first and tail takes the last n" {
   let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
     (1_000_000 : Int64),
@@ -921,4 +923,67 @@ test "scan_reverse returns records newest first and tail takes the last n" {
   assert_eq(all.length(), 5)
   let none = log.tail(0) catch { _ => panic() }
   assert_eq(none.length(), 0)
+}
+
+///|
+/// A writer that raises after `limit` successful appends, for rollback tests.
+struct FailAfter {
+  mem : @backend_mem.MemLog
+  limit : Int32
+  mut n : Int32
+}
+
+///|
+impl @io.LogWriter for FailAfter with fn append(self, chunk) {
+  if self.n >= self.limit {
+    raise @io.IoError::Syscall(-1)
+  }
+  self.n = self.n + 1
+  self.mem.append(chunk)
+}
+
+///|
+impl @io.LogWriter for FailAfter with fn flush(self) {
+  self.mem.flush()
+}
+
+///|
+impl @io.LogReader for FailAfter with fn read_at(self, offset, len) {
+  self.mem.read_at(offset, len)
+}
+
+///|
+impl @io.LogReader for FailAfter with fn length(self) {
+  self.mem.length()
+}
+
+///|
+impl @io.LogTruncate for FailAfter with fn truncate(self, size) {
+  self.mem.truncate(size)
+}
+
+///|
+test "append_batch_atomic rolls back every record on failure" {
+  let store = @backend_mem.MemLog::new()
+  let w : FailAfter = { mem: store, limit: 2, n: 0, }
+  let log : @log.Log[FailAfter, FailAfter] = @log.Log::new(
+    (1_000_000 : Int64),
+    _base => @segment.Segment::new(w, w, (0 : UInt64)),
+  )
+  let batch : Array[(Bytes, Bytes, Int64)] = [
+    (b"a", b"1", (0 : Int64)),
+    (b"b", b"2", (1 : Int64)),
+    (b"c", b"3", (2 : Int64)),
+  ]
+  let dropped : Array[UInt64] = []
+  let offsets = log.append_batch_atomic(batch, seg => {
+    dropped.push(seg.base_offset)
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(offsets.length(), 0)
+  assert_eq(log.count(), 0)
+  assert_eq(log.next_offset(), (0 : UInt64))
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 0)
 }
