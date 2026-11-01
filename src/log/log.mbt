@@ -234,6 +234,8 @@ pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch
         _ => ()
       }
       ignore(seg.rebuild_index() catch { _ => 0 })
+      // Truncation is a durable change and must be fsynced like an append.
+      seg.fsync_dirty = true
     }
     self.next_offset = start
     ([] : Array[UInt64])
@@ -605,6 +607,9 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(
     self.index_cache = None
     merged = merged + 1
   }
+  // The rewritten segment bypasses SyncPolicy (it replays via Segment::append),
+  // and the old files are already gone — fsync it before returning.
+  self.flush()
   merged
 }
 

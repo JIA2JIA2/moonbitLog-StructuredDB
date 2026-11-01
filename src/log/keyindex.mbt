@@ -201,6 +201,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(
   for rec in live {
     ignore(self.append(rec.key, rec.value, rec.timestamp))
   }
+  self.flush()
   live.length()
 }
 
@@ -236,6 +237,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact_expired(
   for rec in live {
     ignore(self.append(rec.key, rec.value, rec.timestamp))
   }
+  self.flush()
   live.length()
 }
 

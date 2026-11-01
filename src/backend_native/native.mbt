@@ -463,6 +463,7 @@ fn load_compressed_segment(
             )
             seg.apply_meta(m)
             load_segment_keys(dir, base, seg)
+            seg.mark_fsync_clean()
             Some(seg)
           } else {
             None
@@ -636,6 +637,9 @@ fn load_segment(
     Some(m) => {
       seg.apply_meta(m)
       load_segment_keys(dir, base, seg)
+      // The data already lives on disk; only writes made in this process need
+      // an fsync, so a freshly loaded segment starts clean.
+      seg.mark_fsync_clean()
     }
     None => ignore(seg.recover())
   }
@@ -793,11 +797,13 @@ pub fn compress_log_dir(
         } else {
           @core.lz_compress(raw)
         }
-        write_file(
-          dir + "/" + @segment.segment_file_name(seg.base_offset),
+        write_file_atomic(
+          dir,
+          @segment.segment_file_name(seg.base_offset),
           packed_bytes,
         )
         seg.mark_compressed(raw_size, algo)
+        seg.mark_fsync_clean()
         packed = packed + 1
       }
     }
