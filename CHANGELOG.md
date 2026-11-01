@@ -32,6 +32,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   accept `dry-run` (reporting counts via `count_compressible_segments` /
   `Log::count_superseded` without changing anything); `get-many` also accepts
   `--keys <file>` to read newline-separated keys.
+- **Complexity guard for key index (M54)**：a `CountReader` test asserts
+  `build_key_index` reads no record bodies, pinning the O(keys) cost added in
+  M47 against regressions.
 
 ## 0.3.0 - 2026-11-01
 

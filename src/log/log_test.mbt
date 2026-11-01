@@ -1071,3 +1071,40 @@ test "prune_superseded drops only fully-superseded segments" {
     None => panic()
   }
 }
+
+///|
+/// A reader wrapper that counts `read_at` calls, so tests can assert that an
+/// operation does not re-read record bodies.
+struct CountReader {
+  mem : @backend_mem.MemLog
+  mut reads : Int32
+}
+
+///|
+impl @io.LogReader for CountReader with fn read_at(self, offset, len) {
+  self.reads = self.reads + 1
+  self.mem.read_at(offset, len)
+}
+
+///|
+impl @io.LogReader for CountReader with fn length(self) {
+  self.mem.length()
+}
+
+///|
+test "build_key_index reads no record bodies" {
+  let store = @backend_mem.MemLog::new()
+  let cr : CountReader = { mem: store, reads: 0, }
+  let log : @log.Log[@backend_mem.MemLog, CountReader] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => @segment.Segment::new(store, cr, base),
+  )
+  for i = 0; i < 50; i = i + 1 {
+    ignore(log.append(b"key", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  ignore(log.scan() catch { _ => panic() })
+  cr.reads = 0
+  let index = log.build_key_index()
+  assert_eq(index.size(), 1)
+  assert_eq(cr.reads, 0)
+}

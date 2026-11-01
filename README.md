@@ -245,6 +245,7 @@ u32 crc32          (仅覆盖 body)
 - M51 冗余段回收：`Log::prune_superseded` 删除所有记录均被后续覆盖（同 key 更新 / tombstone）的已 roll 段，回收空间且不重排 offset；CLI `prune-superseded`
 - M52 并发写锁超时：`DirLock::acquire_timeout` 在超时前重试忙锁（新增 `nanosleep` stub），多写者排队而非立即失败；CLI 等待上限由 `MOONLOG_LOCK_TIMEOUT` 控制（默认 5000ms）
 - M53 CLI dry-run 与批量 key：`compress` / `prune-superseded` 支持 `dry-run`（经 `count_compressible_segments` / `Log::count_superseded` 只读报告）；`get-many` 支持 `--keys <file>` 按行读取 key
+- M54 复杂度回归保护：`CountReader` 测试断言 `build_key_index` 不读记录体（锁定 M47 带来的 O(keys) 开销）
 
 ## 许可
 
