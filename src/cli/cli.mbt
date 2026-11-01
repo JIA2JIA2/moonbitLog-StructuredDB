@@ -35,6 +35,7 @@
 ///   export <dir> <file>              write all records to a portable file
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
+///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
 ///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
@@ -50,7 +51,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -717,6 +718,26 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Rewrite the directory with unexpired live keys: like `compact`, but keys
+/// whose latest record has expired (`now - ts > ttl`) are dropped too.
+/// Offsets are renumbered from 0.
+fn cmd_compact_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
+  let ttl_ms = @string.parse_int64(ttl) catch {
+    _ => raise @io.IoError::Invalid("invalid ttl: " + ttl)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let n = log.compact_expired(now_ms(), ttl_ms, on_drop=seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    @backend_native.flush_meta(dir, log)
+    println("compacted " + n.to_string() + " records")
+    close_log(log)
+  })
+}
+
+///|
 /// Compress every rolled-over (non-active) segment in place. The active segment
 /// keeps growing, so it is left uncompressed. `algo` is `rle` or `lzss`
 /// (default).
@@ -916,6 +937,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "compact" {
     cmd_compact(args[2])
+  } else if cmd == "compact-expired" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_compact_expired(args[2], args[3])
+    }
   } else if cmd == "compress" {
     let mut algo = "lzss"
     let mut dry = false

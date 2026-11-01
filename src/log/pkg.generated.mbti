@@ -49,6 +49,7 @@ pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, 
 pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch_atomic(Self[W, R], Array[(Bytes, Bytes, Int64)], (@segment.Segment[W, R]) -> Unit) -> Array[UInt64] raise @io.IoError
 pub fn[W, R] Log::build_key_index(Self[W, R]) -> KeyIndex
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(Self[W, R], on_drop~ : (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact_expired(Self[W, R], Int64, Int64, on_drop~ : (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Log::count_superseded(Self[W, R], KeyIndex) -> Int32 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::delete(Self[W, R], Bytes, Int64) -> UInt64 raise @io.IoError

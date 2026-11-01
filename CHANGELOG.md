@@ -11,6 +11,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sequence of puts/deletes/reads is checked against an in-memory model while
   segments roll, followed by a full `verify` — guarding the live view and
   integrity against regressions beyond fixed test cases.
+- **Expire-aware compaction (M63)**：`Log::compact_expired(now, ttl, on_drop)`
+  folds the log like `compact` but also drops keys whose latest record is a
+  tombstone or an expired put, closing the loop on TTL space reclamation;
+  exposed as the `compact-expired <dir> <ttl>` CLI command. Offsets are
+  renumbered (same as `compact`).
 
 ## 0.4.0 - 2026-11-01
 

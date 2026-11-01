@@ -1199,3 +1199,47 @@ test "scan_time_range skips segments that cannot overlap" {
   ignore(log.scan_time_range((60 : Int64), (80 : Int64)) catch { _ => panic() })
   assert_eq(readers[0].reads, 0)
 }
+
+///|
+test "compact_expired drops expired records and keeps fresh ones" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"a1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"b1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"a2", (900 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"c1", (600 : Int64)) catch { _ => panic() })
+  let kept = log.compact_expired((1000 : Int64), (500 : Int64), on_drop=_seg => {
+    ()
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(kept, 2)
+  let idx = log.build_key_index()
+  let a = log.get_latest(idx, b"a") catch { _ => panic() }
+  match a {
+    Some(rec) => {
+      assert_eq(rec.value, b"a2")
+      assert_eq(rec.timestamp, (900 : Int64))
+    }
+    None => panic()
+  }
+  let b = log.get_latest(idx, b"b") catch { _ => panic() }
+  match b {
+    Some(_) => panic()
+    None => ()
+  }
+  let c = log.get_latest(idx, b"c") catch { _ => panic() }
+  match c {
+    Some(rec) => assert_eq(rec.value, b"c1")
+    None => panic()
+  }
+  let live = log.scan_live((1000 : Int64), (500 : Int64)) catch { _ => panic() }
+  assert_eq(live.length(), 2)
+  let report = log.verify()
+  match report.first_bad_offset {
+    Some(_) => panic()
+    None => ()
+  }
+}

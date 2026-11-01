@@ -164,6 +164,41 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(
 }
 
 ///|
+/// Fold the log down to its unexpired live view in place: like `compact`, but a
+/// key whose latest record is a tombstone — or whose latest put has expired
+/// (`now - timestamp > ttl`) — is dropped entirely, reclaiming the space that
+/// TTL-only reads cannot. Like `compact`, offsets are renumbered from 0 and the
+/// original timestamps are preserved. Returns the number of records written.
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact_expired(
+  self : Log[W, R],
+  now : Int64,
+  ttl : Int64,
+  on_drop~ : (@segment.Segment[W, R]) -> Unit,
+) -> Int32 raise @io.IoError {
+  let index = self.build_key_index()
+  let live : Array[@core.Record] = []
+  self.for_each((0 : UInt64), self.next_offset, rec => {
+    match index.latest(rec.key) {
+      Some(off) =>
+        if off == rec.offset && !rec.is_delete() && now - rec.timestamp <= ttl {
+          live.push(rec)
+        }
+      None => ()
+    }
+  })
+  for seg in self.segments {
+    on_drop(seg)
+  }
+  self.segments = []
+  self.index_cache = None
+  self.next_offset = (0 : UInt64)
+  for rec in live {
+    ignore(self.append(rec.key, rec.value, rec.timestamp))
+  }
+  live.length()
+}
+
+///|
 /// Latest live record for `key` that has not outlived `ttl` at `now`: a record
 /// with `now - timestamp > ttl` is treated as expired and reported as absent.
 pub fn[W, R : @io.LogReader] Log::get_latest_at(

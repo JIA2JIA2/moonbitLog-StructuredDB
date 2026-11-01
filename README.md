@@ -263,6 +263,7 @@ u32 crc32          (仅覆盖 body)
 - M59 key 索引缓存：`Log::build_key_index` 记忆化结果并在任意变更（append/delete/保留/回收/合并/compact）后失效，同进程重复 KV 查询每次变更后最多重建一次；`Log::index_build_count` 暴露实际构建次数
 - M60 复杂度基线扩展：断言 `scan_range` 只读请求窗口、`scan_time_range` 跳过无重叠段（补充 M54 的 key 索引基线）
 - M62 property 测试：固定 seed 的随机 append/delete/读校验序列对照内存模型（强制跨段滚动），结尾全量 `verify`
+- M63 TTL 空间回收闭环：`Log::compact_expired(now, ttl)` 在折叠 live 时同时丢弃已过期记录与对应 tombstone（offset 重排，同 compact）；CLI `compact-expired <dir> <ttl>`
 
 ## 许可
 
