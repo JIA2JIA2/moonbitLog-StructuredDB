@@ -253,6 +253,7 @@ u32 crc32          (仅覆盖 body)
 - M53 CLI dry-run 与批量 key：`compress` / `prune-superseded` 支持 `dry-run`（经 `count_compressible_segments` / `Log::count_superseded` 只读报告）；`get-many` 支持 `--keys <file>` 按行读取 key
 - M54 复杂度回归保护：`CountReader` 测试断言 `build_key_index` 不读记录体（锁定 M47 带来的 O(keys) 开销）
 - M55 文档与 native 示例：新增 `examples/native_demo`（文件后端端到端演示）；README 补齐本轮（M47–M54）能力说明
+- M56 旧格式兼容性测试：构造 v1–v7 各历史版本的段元数据字节，断言当前解码器均可正确读取（锁定向后兼容）
 
 ## 许可
 

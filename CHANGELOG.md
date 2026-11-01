@@ -37,6 +37,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   M47 against regressions.
 - **Native example (M55)**：`examples/native_demo` demonstrates the file backend
   end to end (open, append/delete, live view, key-range scan, per-segment stats).
+- **Metadata compatibility tests (M56)**：tests build segment-meta buffers for
+  every historical layout (v1–v7) and assert the current reader decodes each,
+  guarding backward compatibility.
 
 ## 0.3.0 - 2026-11-01
 

@@ -449,3 +449,90 @@ test "segment key index round-trips through encode/load" {
   assert_eq(a_off, (2 : UInt64))
   assert_true(b_del)
 }
+
+///|
+/// Build a minimal segment-meta buffer encoding the layout used at `version`,
+/// so the current reader can be checked against every historical format.
+fn meta_bytes_v1_to_v7(
+  version : UInt32,
+  base : UInt64,
+  count : UInt32,
+  size : Int64,
+) -> Bytes {
+  let b = @buffer.Buffer::Buffer()
+  b.write_uint_le((0x4D4C5347 : UInt32))
+  b.write_uint_le(version)
+  b.write_uint64_le(base)
+  b.write_uint64_le(base + count.to_uint64())
+  b.write_uint_le(count)
+  b.write_int64_le(size)
+  b.write_uint_le((32 : Int32).reinterpret_as_uint())
+  b.write_uint_le((0 : Int32).reinterpret_as_uint())
+  if version >= 2 {
+    b.write_uint_le((1 : Int32).reinterpret_as_uint())
+    b.write_bytes(b"\x00")
+  }
+  if version >= 3 {
+    b.write_int64_le((10 : Int64))
+    b.write_int64_le((20 : Int64))
+    b.write_uint_le((1 : Int32).reinterpret_as_uint())
+  }
+  if version >= 4 {
+    b.write_uint_le((0xCAFE : UInt32))
+    b.write_uint_le((1 : Int32).reinterpret_as_uint())
+  }
+  if version >= 5 {
+    b.write_uint_le((0 : Int32).reinterpret_as_uint())
+    b.write_int64_le((0 : Int64))
+  }
+  if version >= 6 {
+    b.write_uint_le((1 : Int32).reinterpret_as_uint())
+  }
+  if version >= 7 {
+    b.write_uint_le((2 : Int32).reinterpret_as_uint())
+  }
+  let body = b.to_bytes()
+  let out = @buffer.Buffer::Buffer()
+  out.write_bytes(body)
+  out.write_uint_le(@core.crc32(body))
+  out.to_bytes()
+}
+
+///|
+test "segment meta decodes every historical version" {
+  let mut v : UInt32 = 1
+  while v <= 7 {
+    let bytes = meta_bytes_v1_to_v7(
+      v,
+      (5 : UInt64),
+      (3 : UInt32),
+      (100 : Int64),
+    )
+    let m = @segment.decode_segment_meta(bytes) catch { _ => panic() }
+    assert_eq(m.base_offset, (5 : UInt64))
+    assert_eq(m.record_count, (3 : UInt32))
+    assert_eq(m.size, (100 : Int64))
+    if v >= 3 {
+      assert_true(m.time_known)
+      assert_eq(m.min_ts, (10 : Int64))
+      assert_eq(m.max_ts, (20 : Int64))
+    } else {
+      assert_true(!m.time_known)
+    }
+    if v >= 4 {
+      assert_eq(m.data_crc, (0xCAFE : UInt32))
+      assert_true(m.crc_known)
+    } else {
+      assert_true(!m.crc_known)
+    }
+    if v >= 6 {
+      assert_true(m.ts_sorted)
+    }
+    if v >= 7 {
+      assert_eq(m.comp_algo, 2)
+    } else {
+      assert_eq(m.comp_algo, 0)
+    }
+    v = v + 1
+  }
+}
