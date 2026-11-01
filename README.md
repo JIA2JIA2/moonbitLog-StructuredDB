@@ -296,6 +296,7 @@ u32 crc32          (仅覆盖 body)
 - M77 维护/游标 property 测试 + 修复：随机维护（merge/prune-superseded/compact）与游标推进的 property 测试；**修复** `prune_superseded` 不再删除含 tombstone 的段（防旧 put 复活）
 - M78 ts 采样持久化（meta v8）：稀疏索引条目附 timestamp（兼容读 v1–v7），打开的段加载即恢复内存 ts 采样，`scan_time_range` 立即使用采样二分
 - M79 `get_many` 段分组点查：批量点查按 offset 排序后单次顺序遍历段，替代逐 key 重复定位
+- M80 发布 0.8.0：维护/游标 property 测试、tombstone 安全修剪修复、ts 采样持久化、get_many 段分组随包发布
 
 ## 许可
 
