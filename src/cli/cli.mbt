@@ -12,6 +12,7 @@
 ///   get <dir> <offset>               fetch one record by offset
 ///   scan <dir> [from] [to]           list records in [from, to)
 ///   scan-prefix <dir> <prefix>       list live keys beginning with a prefix
+///   scan-time <dir> <lo> <hi>        list records with timestamp in [lo, hi)
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
@@ -43,7 +44,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -225,6 +226,30 @@ fn cmd_scan_prefix(dir : String, prefix : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let recs = log.scan_prefix(@utf8.encode(prefix))
+    for rec in recs {
+      print_record(rec)
+    }
+    println("(" + recs.length().to_string() + " records)")
+    close_log(log)
+  })
+}
+
+///|
+/// List records whose timestamp lies in `[lo, hi)`.
+fn cmd_scan_time(
+  dir : String,
+  lo : String,
+  hi : String,
+) -> Unit raise @io.IoError {
+  let lo_ts = @string.parse_int64(lo) catch {
+    _ => raise @io.IoError::Invalid("invalid timestamp: " + lo)
+  }
+  let hi_ts = @string.parse_int64(hi) catch {
+    _ => raise @io.IoError::Invalid("invalid timestamp: " + hi)
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let recs = log.scan_time_range(lo_ts, hi_ts)
     for rec in recs {
       print_record(rec)
     }
@@ -545,6 +570,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_scan_prefix(args[2], args[3])
+    }
+  } else if cmd == "scan-time" {
+    if args.length() < 5 {
+      println(USAGE)
+    } else {
+      cmd_scan_time(args[2], args[3], args[4])
     }
   } else if cmd == "recover" || cmd == "stats" {
     cmd_recover(args[2])

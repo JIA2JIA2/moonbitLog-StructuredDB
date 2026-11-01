@@ -55,6 +55,7 @@ moonlog <command> <dir> [args...]
   get <dir> <offset>            按 offset 读取记录
   scan <dir> [from] [to]        列出 [from, to) 区间记录
   scan-prefix <dir> <prefix>    按 key 前缀列出（结果按 key 排序）
+  scan-time <dir> <lo> <hi>     列出 timestamp 落在 [lo, hi) 的记录
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
@@ -86,7 +87,7 @@ stats <dir>                   打印记录/段计数
 | --- | --- | --- |
 | `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
 | `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
-| `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
+| `Log::get` / `scan` / `scan_range` / `scan_time_range` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 时间区间 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `scan_live` / `scan_prefix` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 前缀扫描 / 折叠 live 记录 / 原地重写 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
@@ -175,7 +176,7 @@ u32 crc32          (仅覆盖 body)
 
 ### 持久化元数据（M8）
 
-- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照与该段 key 的 Bloom 过滤器（含 CRC32），重开时可直接恢复，无需扫描数据。
+- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照、该段 key 的 Bloom 过滤器与时间跨度（min/max timestamp）（含 CRC32），重开时可直接恢复，无需扫描数据。
 - 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（每段的 `base_offset` 与 `byte_size`，整体附 CRC32）。打开时据此校验每个段文件的真实大小，不符则回退全量恢复。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
 - 元数据（`MANIFEST` 与每段 `.index`）以**原子替换**落盘：写入 `<name>.tmp` → fsync → `rename` 覆盖 → fsync 目录。进程在任意时刻崩溃只会留下旧版或新版，不会出现半写文件。
@@ -221,6 +222,7 @@ u32 crc32          (仅覆盖 body)
 - M32 审阅修复：CLI 默认 `MOONLOG_SYNC=always`（命令返回即落盘），并明确 `import` 的 offset 语义
 - M33 key 前缀扫描：`Log::scan_prefix` 与 CLI `scan-prefix`（结果按 key 排序）
 - M34 段级 Bloom 过滤：`BloomFilter` 持久化进 `.index`（meta v2），`Log::get_latest_bloom` 跳过不可能含 key 的段；CLI `has-key`
+- M35 时间范围查询：段级 min/max timestamp 持久化进 `.index`（meta v3），`Log::scan_time_range` 跳过无重叠段；CLI `scan-time`
 
 ## 许可
 

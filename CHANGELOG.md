@@ -14,6 +14,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   keys, persisted in `.index` (metadata v2, v1 still readable as a disabled
   filter). `Log::get_latest_bloom` skips segments that cannot contain a key;
   the `has-key` CLI command uses it.
+- **Time-range queries (M35)**：each segment records its min/max timestamp in
+  `.index` (metadata v3; v1/v2 read back as "span unknown"). `Log::scan_time_range`
+  skips segments that cannot overlap a `[lo, hi)` window; exposed as the
+  `scan-time` CLI command.
 
 ## 0.2.0 - 2026-10-31
 

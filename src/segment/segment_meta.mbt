@@ -22,13 +22,16 @@ pub(all) struct SegmentMeta {
   interval : Int32
   entries : Array[IndexEntry]
   bloom : BloomFilter
+  min_ts : Int64
+  max_ts : Int64
+  time_known : Bool
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 2
+const SEGMENT_META_VERSION : UInt32 = 3
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -79,6 +82,9 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   let bloom = self.bloom.to_bytes()
   body.write_uint_le(meta_i32_count(bloom.length()))
   body.write_bytes(bloom)
+  body.write_int64_le(self.min_ts)
+  body.write_int64_le(self.max_ts)
+  body.write_uint_le(if self.time_known { 1 } else { 0 })
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -96,7 +102,7 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     raise @core.MetaError::BadMagic
   }
   let version = meta_u32(data, 4)
-  if version != 1 && version != SEGMENT_META_VERSION {
+  if version < 1 || version > SEGMENT_META_VERSION {
     raise @core.MetaError::BadVersion(version)
   }
   let body_end = total - 4
@@ -125,7 +131,8 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     pos = pos + 16
     i = i + 1
   }
-  let bloom = if version >= 2 {
+  let mut bloom = BloomFilter::disabled()
+  if version >= 2 {
     if pos + 4 > body_end {
       raise @core.MetaError::Truncated(pos)
     }
@@ -134,11 +141,35 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     if bstart + blen > body_end {
       raise @core.MetaError::Truncated(pos)
     }
-    BloomFilter::of_bytes(@core.slice(data, bstart, bstart + blen), true)
-  } else {
-    BloomFilter::disabled()
+    bloom = BloomFilter::of_bytes(
+      @core.slice(data, bstart, bstart + blen),
+      true,
+    )
+    pos = bstart + blen
   }
-  { base_offset, next_offset, record_count, size, interval, entries, bloom, }
+  let mut min_ts : Int64 = 0
+  let mut max_ts : Int64 = 0
+  let mut time_known = false
+  if version >= 3 {
+    if pos + 20 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    min_ts = meta_i64(data, pos)
+    max_ts = meta_i64(data, pos + 8)
+    time_known = meta_u32(data, pos + 16) == 1
+  }
+  {
+    base_offset,
+    next_offset,
+    record_count,
+    size,
+    interval,
+    entries,
+    bloom,
+    min_ts,
+    max_ts,
+    time_known,
+  }
 }
 
 ///|
@@ -152,6 +183,9 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     interval: self.index.interval,
     entries: self.index.entries,
     bloom: self.bloom,
+    min_ts: self.min_ts,
+    max_ts: self.max_ts,
+    time_known: self.time_known,
   }
 }
 
@@ -171,5 +205,8 @@ pub fn[W, R] Segment::apply_meta(
     self.index.push(e.record_index, e.position)
   }
   self.bloom = meta.bloom
+  self.min_ts = meta.min_ts
+  self.max_ts = meta.max_ts
+  self.time_known = meta.time_known
   self.meta_loaded = true
 }

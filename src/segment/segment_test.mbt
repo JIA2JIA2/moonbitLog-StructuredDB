@@ -379,3 +379,20 @@ test "segment meta round-trips the bloom filter" {
   assert_true(decoded.bloom.may_contain(b"hello"))
   assert_true(!decoded.bloom.may_contain(b"key-that-was-never-inserted-abcdef"))
 }
+
+///|
+test "segment meta round-trips the timestamp span" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  ignore(seg.append(b"k", b"v", (50 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"k", b"v", (10 : Int64)) catch { _ => panic() })
+  ignore(seg.append(b"k", b"v", (90 : Int64)) catch { _ => panic() })
+  assert_true(seg.has_time_range())
+  assert_eq(seg.min_timestamp(), (10 : Int64))
+  assert_eq(seg.max_timestamp(), (90 : Int64))
+  let decoded = @segment.decode_segment_meta(seg.to_meta().encode()) catch {
+    _ => panic()
+  }
+  assert_true(decoded.time_known)
+  assert_eq(decoded.min_ts, (10 : Int64))
+  assert_eq(decoded.max_ts, (90 : Int64))
+}

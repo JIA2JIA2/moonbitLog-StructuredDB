@@ -40,6 +40,9 @@ pub(all) struct Segment[W, R] {
   mut size : Int64
   mut index : SparseIndex
   mut bloom : BloomFilter
+  mut min_ts : Int64
+  mut max_ts : Int64
+  mut time_known : Bool
   mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
@@ -48,10 +51,14 @@ pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
+pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
+pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
 pub fn[W, R] Segment::may_contain(Self[W, R], Bytes) -> Bool
+pub fn[W, R] Segment::min_timestamp(Self[W, R]) -> Int64
 pub fn[W, R] Segment::new(W, R, UInt64) -> Self[W, R]
 pub fn[W, R] Segment::new_with_index_interval(W, R, UInt64, Int32) -> Self[W, R]
+pub fn[W, R] Segment::note_timestamp(Self[W, R], Int64) -> Unit
 pub fn[W, R : @io.LogReader] Segment::read_raw(Self[W, R], Int64, Int32) -> Bytes raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::rebuild_index(Self[W, R]) -> Int32 raise @io.IoError
 pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(Self[W, R]) -> Int32 raise @io.IoError
@@ -67,6 +74,9 @@ pub(all) struct SegmentMeta {
   interval : Int32
   entries : Array[IndexEntry]
   bloom : BloomFilter
+  min_ts : Int64
+  max_ts : Int64
+  time_known : Bool
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 

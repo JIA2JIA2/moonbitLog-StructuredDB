@@ -742,3 +742,27 @@ test "get_latest_bloom matches the key index view" {
     None => ()
   }
 }
+
+///|
+test "scan_time_range filters by timestamp and reports overlaps" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (100 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (200 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"3", (300 : Int64)) catch { _ => panic() })
+  let mid = log.scan_time_range((150 : Int64), (300 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(mid.length(), 1)
+  assert_eq(mid[0].key, b"b")
+  let none = log.scan_time_range((400 : Int64), (500 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(none.length(), 0)
+  let all = log.scan_time_range((0 : Int64), (1000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(all.length(), 3)
+}

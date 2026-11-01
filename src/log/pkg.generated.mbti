@@ -65,6 +65,7 @@ pub fn[W, R : @io.LogReader] Log::scan(Self[W, R]) -> Array[@core.Record] raise 
 pub fn[W, R : @io.LogReader] Log::scan_live(Self[W, R], Int64, Int64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::scan_prefix(Self[W, R], Bytes) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R : @io.LogReader] Log::scan_time_range(Self[W, R], Int64, Int64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::verify(Self[W, R]) -> VerifyReport

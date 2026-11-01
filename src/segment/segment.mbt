@@ -15,6 +15,9 @@ pub(all) struct Segment[W, R] {
   mut size : Int64
   mut index : SparseIndex
   mut bloom : BloomFilter
+  mut min_ts : Int64
+  mut max_ts : Int64
+  mut time_known : Bool
   mut meta_loaded : Bool
 }
 
@@ -53,6 +56,9 @@ pub fn[W, R] Segment::new_with_index_interval(
     size: 0,
     index: SparseIndex::new(index_interval),
     bloom: BloomFilter::new(),
+    min_ts: 0,
+    max_ts: 0,
+    time_known: false,
     meta_loaded: false,
   }
 }
@@ -68,6 +74,44 @@ pub fn[W, R] Segment::index_interval(self : Segment[W, R]) -> Int32 {
 /// result is conclusive; `true` only means a real lookup is still required.
 pub fn[W, R] Segment::may_contain(self : Segment[W, R], key : Bytes) -> Bool {
   self.bloom.may_contain(key)
+}
+
+///|
+/// Fold `ts` into the segment's timestamp span.
+pub fn[W, R] Segment::note_timestamp(self : Segment[W, R], ts : Int64) -> Unit {
+  if !self.time_known {
+    self.min_ts = ts
+    self.max_ts = ts
+    self.time_known = true
+  } else {
+    if ts < self.min_ts {
+      self.min_ts = ts
+    }
+    if ts > self.max_ts {
+      self.max_ts = ts
+    }
+  }
+}
+
+///|
+/// Smallest record timestamp in this segment (valid only when
+/// `has_time_range`).
+pub fn[W, R] Segment::min_timestamp(self : Segment[W, R]) -> Int64 {
+  self.min_ts
+}
+
+///|
+/// Largest record timestamp in this segment (valid only when
+/// `has_time_range`).
+pub fn[W, R] Segment::max_timestamp(self : Segment[W, R]) -> Int64 {
+  self.max_ts
+}
+
+///|
+/// Whether the segment's timestamp span is known (false while empty and for
+/// metadata written before time ranges were persisted).
+pub fn[W, R] Segment::has_time_range(self : Segment[W, R]) -> Bool {
+  self.time_known
 }
 
 ///|
@@ -88,6 +132,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   let bytes = rec.encode()
   ignore(self.writer.append(bytes))
   self.bloom.add(key)
+  self.note_timestamp(timestamp)
   self.next_offset = offset + (1 : UInt64)
   self.record_count = self.record_count + 1
   self.size = self.size + bytes.length().to_int64()
@@ -269,6 +314,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
 ) -> Int32 raise @io.IoError {
   self.index.reset()
   self.bloom = BloomFilter::new()
+  self.time_known = false
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -279,6 +325,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
       None => go = false
       Some((rec, next)) => {
         self.bloom.add(rec.key)
+        self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
         }
@@ -305,6 +352,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
 ) -> Int32 raise @io.IoError {
   self.index.reset()
   self.bloom = BloomFilter::new()
+  self.time_known = false
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -323,6 +371,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
         }
         last = rec.offset
         self.bloom.add(rec.key)
+        self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
         }

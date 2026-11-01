@@ -225,6 +225,37 @@ pub fn[W, R : @io.LogReader] Log::scan_range(
 }
 
 ///|
+/// Records whose timestamp lies in `[lo, hi)`, in log (offset) order and
+/// including tombstones. Segments whose persisted time span cannot overlap the
+/// range are skipped; a segment without a known span is always scanned.
+pub fn[W, R : @io.LogReader] Log::scan_time_range(
+  self : Log[W, R],
+  lo : Int64,
+  hi : Int64,
+) -> Array[@core.Record] raise @io.IoError {
+  let out : Array[@core.Record] = []
+  if hi <= lo {
+    return out
+  }
+  for seg in self.segments {
+    let overlaps = if seg.has_time_range() {
+      seg.max_timestamp() >= lo && seg.min_timestamp() < hi
+    } else {
+      true
+    }
+    if overlaps {
+      let end = seg.base_offset + seg.record_count.to_uint64()
+      seg.for_each(seg.base_offset, end, rec => {
+        if rec.timestamp >= lo && rec.timestamp < hi {
+          out.push(rec)
+        }
+      })
+    }
+  }
+  out
+}
+
+///|
 /// Append a tombstone that marks `key` as deleted, without rewriting history.
 pub fn[W : @io.LogWriter, R] Log::delete(
   self : Log[W, R],
