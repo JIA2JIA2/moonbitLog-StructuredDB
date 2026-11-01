@@ -55,6 +55,7 @@ moonlog <command> <dir> [args...]
   get <dir> <offset>            按 offset 读取记录
   scan <dir> [from] [to]        列出 [from, to) 区间记录
   scan-prefix <dir> <prefix>    按 key 前缀列出（结果按 key 排序）
+  scan-range <dir> <lo> [hi]    按 key 半开区间 [lo, hi) 列出（hi 省略表示无上界）
   scan-time <dir> <lo> <hi>     列出 timestamp 落在 [lo, hi) 的记录
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
@@ -89,7 +90,7 @@ stats <dir>                   打印记录/段计数
 | `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `scan_time_range` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 时间区间 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `scan_live` / `scan_prefix` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 前缀扫描 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 前缀扫描 / key 区间扫描 / 折叠 live 记录 / 原地重写 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
@@ -223,6 +224,7 @@ u32 crc32          (仅覆盖 body)
 - M33 key 前缀扫描：`Log::scan_prefix` 与 CLI `scan-prefix`（结果按 key 排序）
 - M34 段级 Bloom 过滤：`BloomFilter` 持久化进 `.index`（meta v2），`Log::get_latest_bloom` 跳过不可能含 key 的段；CLI `has-key`
 - M35 时间范围查询：段级 min/max timestamp 持久化进 `.index`（meta v3），`Log::scan_time_range` 跳过无重叠段；CLI `scan-time`
+- M36 key 区间扫描：`Log::scan_key_range` 按 `[lo, hi)` 返回每个 live key 的最新记录（按 key 排序，空 `hi` 表示无上界）；CLI `scan-range`
 
 ## 许可
 

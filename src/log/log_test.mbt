@@ -766,3 +766,50 @@ test "scan_time_range filters by timestamp and reports overlaps" {
   }
   assert_eq(all.length(), 3)
 }
+
+///|
+test "scan_key_range returns sorted live keys in [lo, hi)" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"c", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"b2", (3 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"c", (4 : Int64)) catch { _ => panic() })
+  let recs = log.scan_key_range(b"a", b"c") catch { _ => panic() }
+  assert_eq(recs.length(), 2)
+  assert_eq(recs[0].key, b"a")
+  assert_eq(recs[0].value, b"1")
+  assert_eq(recs[1].key, b"b")
+  assert_eq(recs[1].value, b"b2")
+  let open = log.scan_key_range(b"a", b"") catch { _ => panic() }
+  assert_eq(open.length(), 2)
+  let all = log.scan_key_range(b"", b"") catch { _ => panic() }
+  assert_eq(all.length(), 2)
+  let none = log.scan_key_range(b"x", b"z") catch { _ => panic() }
+  assert_eq(none.length(), 0)
+  let reversed = log.scan_key_range(b"c", b"a") catch { _ => panic() }
+  assert_eq(reversed.length(), 0)
+}
+
+///|
+test "scan_key_range upper bound is exclusive at an exact key" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"user:1", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"user:2", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"user:3", b"3", (2 : Int64)) catch { _ => panic() })
+  let lt = log.scan_key_range(b"user:1", b"user:3") catch { _ => panic() }
+  assert_eq(lt.length(), 2)
+  assert_eq(lt[0].key, b"user:1")
+  assert_eq(lt[1].key, b"user:2")
+  let le = log.scan_key_range(b"user:1", b"user:4") catch { _ => panic() }
+  assert_eq(le.length(), 3)
+  let only2 = log.scan_key_range(b"user:2", b"user:3") catch { _ => panic() }
+  assert_eq(only2.length(), 1)
+  assert_eq(only2[0].key, b"user:2")
+}

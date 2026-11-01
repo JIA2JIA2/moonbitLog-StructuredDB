@@ -12,6 +12,7 @@
 ///   get <dir> <offset>               fetch one record by offset
 ///   scan <dir> [from] [to]           list records in [from, to)
 ///   scan-prefix <dir> <prefix>       list live keys beginning with a prefix
+///   scan-range <dir> <lo> [hi]       list live keys in [lo, hi), hi optional
 ///   scan-time <dir> <lo> <hi>        list records with timestamp in [lo, hi)
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
@@ -44,7 +45,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -226,6 +227,29 @@ fn cmd_scan_prefix(dir : String, prefix : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let recs = log.scan_prefix(@utf8.encode(prefix))
+    for rec in recs {
+      print_record(rec)
+    }
+    println("(" + recs.length().to_string() + " records)")
+    close_log(log)
+  })
+}
+
+///|
+/// List the latest live record for every key in the half-open range `[lo, hi)`,
+/// sorted by key. When `hi` is omitted the range is unbounded above.
+fn cmd_scan_range(
+  dir : String,
+  lo : String,
+  hi : String?,
+) -> Unit raise @io.IoError {
+  let hi_bytes = match hi {
+    Some(s) => @utf8.encode(s)
+    None => (b"" : Bytes)
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let recs = log.scan_key_range(@utf8.encode(lo), hi_bytes)
     for rec in recs {
       print_record(rec)
     }
@@ -570,6 +594,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_scan_prefix(args[2], args[3])
+    }
+  } else if cmd == "scan-range" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let hi = if args.length() > 4 { Some(args[4]) } else { None }
+      cmd_scan_range(args[2], args[3], hi)
     }
   } else if cmd == "scan-time" {
     if args.length() < 5 {

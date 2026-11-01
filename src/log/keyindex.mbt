@@ -214,6 +214,35 @@ pub fn[W, R : @io.LogReader] Log::scan_prefix(
 }
 
 ///|
+/// The latest live record for every key in the half-open key range `[lo, hi)`,
+/// sorted ascending by key bytes. An empty `hi` leaves the range unbounded
+/// above; an empty `lo` starts from the smallest key. Tombstoned keys are
+/// excluded; superseded puts lose to the newest one.
+pub fn[W, R : @io.LogReader] Log::scan_key_range(
+  self : Log[W, R],
+  lo : Bytes,
+  hi : Bytes,
+) -> Array[@core.Record] raise @io.IoError {
+  let index = self.build_key_index()
+  let has_hi = hi.length() > 0
+  let out : Array[@core.Record] = []
+  self.for_each((0 : UInt64), self.next_offset, rec => {
+    if !rec.is_delete() {
+      let ge_lo = bytes_cmp(rec.key, lo) >= 0
+      let lt_hi = if has_hi { bytes_cmp(rec.key, hi) < 0 } else { true }
+      if ge_lo && lt_hi {
+        match index.latest(rec.key) {
+          Some(off) => if off == rec.offset { out.push(rec) }
+          None => ()
+        }
+      }
+    }
+  })
+  out.sort_by(fn(a, b) { bytes_cmp(a.key, b.key) })
+  out
+}
+
+///|
 /// The last record for `key` within a single segment (latest offset wins),
 /// whether a put or a tombstone.
 fn[W, R : @io.LogReader] latest_key_in_segment(

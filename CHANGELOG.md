@@ -18,6 +18,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `.index` (metadata v3; v1/v2 read back as "span unknown"). `Log::scan_time_range`
   skips segments that cannot overlap a `[lo, hi)` window; exposed as the
   `scan-time` CLI command.
+- **Key range scan (M36)**：`Log::scan_key_range` returns the latest live record
+  for every key in the half-open range `[lo, hi)`, sorted by key bytes (an empty
+  `hi` is unbounded above); exposed as the `scan-range` CLI command.
 
 ## 0.2.0 - 2026-10-31
 
