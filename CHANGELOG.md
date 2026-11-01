@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 0.4.0 - 2026-11-01
+## Unreleased
 
 ### Added
 
@@ -11,6 +11,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   sequence of puts/deletes/reads is checked against an in-memory model while
   segments roll, followed by a full `verify` — guarding the live view and
   integrity against regressions beyond fixed test cases.
+
+## 0.4.0 - 2026-11-01
 
 ### Added
 
