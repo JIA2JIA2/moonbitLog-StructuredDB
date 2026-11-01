@@ -106,6 +106,40 @@ pub fn[W, R : @io.LogReader] Log::get_many(
 }
 
 ///|
+/// Append `value` for `key` only when the current live value matches
+/// `expected` (`Some(e)` requires the key to exist with value `e`; `None`
+/// requires the key to have no live record). Returns the new offset on
+/// success, `None` when the condition is not met. Under the single-writer
+/// directory lock the check-and-append is atomic.
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compare_and_swap(
+  self : Log[W, R],
+  key : Bytes,
+  expected : Bytes?,
+  value : Bytes,
+  timestamp : Int64,
+) -> UInt64? raise @io.IoError {
+  let index = self.build_key_index()
+  let current = self.get_latest(index, key)
+  let matches = match expected {
+    Some(e) =>
+      match current {
+        Some(rec) => rec.value == e
+        None => false
+      }
+    None =>
+      match current {
+        Some(_) => false
+        None => true
+      }
+  }
+  if matches {
+    Some(self.append(key, value, timestamp))
+  } else {
+    None
+  }
+}
+
+///|
 /// Compacted logical view: for each live key, its latest put, with offsets
 /// renumbered from 0. Writing these records to a fresh log yields an
 /// equivalent but smaller log.

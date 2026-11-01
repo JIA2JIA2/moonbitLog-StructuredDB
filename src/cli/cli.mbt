@@ -7,6 +7,8 @@
 ///
 /// Commands:
 ///   put <dir> <key> <value>          append a key/value record
+///   put-if <dir> <key> <expected|-> <value>
+///                                    append only if live value == expected
 ///   put-batch <dir> <k> <v> ...      append several key/value records at once
 ///   delete <dir> <key>               append a tombstone for a key
 ///   get <dir> <offset>               fetch one record by offset
@@ -51,7 +53,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -163,6 +165,37 @@ fn cmd_put(
     let log = open_log(dir)
     let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
     println("offset " + off.to_string())
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+}
+
+///|
+/// Append `value` for `key` only when the current live value equals
+/// `expected`; pass `-` to require that the key does not exist yet.
+fn cmd_put_if(
+  dir : String,
+  key : String,
+  expected : String,
+  value : String,
+) -> Unit raise @io.IoError {
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let expected_bytes : Bytes? = if expected == "-" {
+      (None : Bytes?)
+    } else {
+      Some(@utf8.encode(expected))
+    }
+    let result = log.compare_and_swap(
+      @utf8.encode(key),
+      expected_bytes,
+      @utf8.encode(value),
+      now_ms(),
+    )
+    match result {
+      Some(off) => println("offset " + off.to_string())
+      None => println("condition not met")
+    }
     @backend_native.flush_meta(dir, log)
     close_log(log)
   })
@@ -802,6 +835,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_put(args[2], args[3], args[4])
+    }
+  } else if cmd == "put-if" {
+    if args.length() < 6 {
+      println(USAGE)
+    } else {
+      cmd_put_if(args[2], args[3], args[4], args[5])
     }
   } else if cmd == "put-batch" {
     if args.length() < 5 {

@@ -1243,3 +1243,53 @@ test "compact_expired drops expired records and keeps fresh ones" {
     None => ()
   }
 }
+
+///|
+test "compare_and_swap enforces the expected value" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  let r1 = log.compare_and_swap(b"a", Some(b"9"), b"2", (1 : Int64)) catch {
+    _ => panic()
+  }
+  match r1 {
+    Some(_) => panic()
+    None => ()
+  }
+  assert_eq(log.count(), 1)
+  let r2 = log.compare_and_swap(b"a", Some(b"1"), b"2", (1 : Int64)) catch {
+    _ => panic()
+  }
+  match r2 {
+    Some(_) => ()
+    None => panic()
+  }
+  let r3 = log.compare_and_swap(b"b", (None : Bytes?), b"3", (2 : Int64)) catch {
+    _ => panic()
+  }
+  match r3 {
+    Some(_) => ()
+    None => panic()
+  }
+  let r4 = log.compare_and_swap(b"b", (None : Bytes?), b"4", (3 : Int64)) catch {
+    _ => panic()
+  }
+  match r4 {
+    Some(_) => panic()
+    None => ()
+  }
+  let idx = log.build_key_index()
+  let a = log.get_latest(idx, b"a") catch { _ => panic() }
+  match a {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+  let b = log.get_latest(idx, b"b") catch { _ => panic() }
+  match b {
+    Some(rec) => assert_eq(rec.value, b"3")
+    None => panic()
+  }
+  assert_eq(log.count(), 3)
+}

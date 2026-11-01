@@ -50,6 +50,8 @@ moon coverage report -f summary               # 覆盖率摘要
 moonlog <command> <dir> [args...]
 
   put <dir> <key> <value>       追加一条 key/value 记录
+  put-if <dir> <key> <expected|-> <value>
+                                仅当 live 值等于 expected（`-` 要求不存在）才追加
   put-batch <dir> <k> <v> ...   一次追加多组 key/value 记录
   delete <dir> <key>            追加 key 的 tombstone
   get <dir> <offset>            按 offset 读取记录
@@ -265,6 +267,7 @@ u32 crc32          (仅覆盖 body)
 - M60 复杂度基线扩展：断言 `scan_range` 只读请求窗口、`scan_time_range` 跳过无重叠段（补充 M54 的 key 索引基线）
 - M62 property 测试：固定 seed 的随机 append/delete/读校验序列对照内存模型（强制跨段滚动），结尾全量 `verify`
 - M63 TTL 空间回收闭环：`Log::compact_expired(now, ttl)` 在折叠 live 时同时丢弃已过期记录与对应 tombstone（offset 重排，同 compact）；CLI `compact-expired <dir> <ttl>`
+- M64 条件写入 CAS：`Log::compare_and_swap(key, expected, value, ts)` 仅当 live 值匹配期望（或要求 key 不存在）才追加；CLI `put-if`
 
 ## 许可
 

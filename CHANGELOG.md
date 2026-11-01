@@ -16,6 +16,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tombstone or an expired put, closing the loop on TTL space reclamation;
   exposed as the `compact-expired <dir> <ttl>` CLI command. Offsets are
   renumbered (same as `compact`).
+- **Compare-and-swap (M64)**：`Log::compare_and_swap(key, expected, value, ts)`
+  appends only when the current live value matches `expected` (or, with
+  `expected = None`, only when the key has no live record); exposed as the
+  `put-if <dir> <key> <expected|-> <value>` CLI command.
 
 ## 0.4.0 - 2026-11-01
 
