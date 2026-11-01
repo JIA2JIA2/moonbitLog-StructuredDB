@@ -509,9 +509,15 @@ fn[W, R : @io.LogReader] segment_all_superseded(
   let end = seg.base_offset + seg.record_count.to_uint64()
   let mut all = true
   seg.for_each(seg.base_offset, end, rec => {
-    match index.latest(rec.key) {
-      Some(off) => if off <= rec.offset { all = false }
-      None => ()
+    if rec.is_delete() {
+      // Dropping a tombstone could resurrect an older put that lives in a
+      // surviving segment, so segments carrying tombstones are kept.
+      all = false
+    } else {
+      match index.latest(rec.key) {
+        Some(off) => if off <= rec.offset { all = false }
+        None => ()
+      }
     }
   })
   all
@@ -672,7 +678,7 @@ pub fn[W, R : @io.LogReader] Log::verify_fast(self : Log[W, R]) -> VerifyReport 
   let mut bad_ck_found = false
   let mut bad_ck_at : UInt64 = 0
   for seg in self.segments {
-    if !bad_found && seg.base_offset != expected {
+    if !bad_found && seg.base_offset < expected {
       bad_found = true
       bad_at = expected
     }
@@ -717,10 +723,11 @@ pub fn[W, R : @io.LogReader] Log::verify_fast(self : Log[W, R]) -> VerifyReport 
 }
 
 ///|
-/// Sweep the whole log in order, checking that segments are laid out
-/// contiguously and that every record decodes with the expected offset. The
-/// first inconsistency (a segment gap, an offset jump, or a decode error) is
-/// reported via `first_bad_offset`; a healthy log leaves it empty.
+/// Sweep the whole log in order, checking that segments are ordered and
+/// non-overlapping (holes left by retention/pruning are legal), that every
+/// record decodes, and that offsets run contiguously inside each segment. The
+/// first inconsistency is reported via `first_bad_offset`; a healthy log
+/// leaves it empty.
 pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
   let mut expected : UInt64 = 0
   let mut records : Int32 = 0
@@ -729,7 +736,7 @@ pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
   let mut bad_ck_found = false
   let mut bad_ck_at : UInt64 = 0
   for seg in self.segments {
-    if !bad_found && seg.base_offset != expected {
+    if !bad_found && seg.base_offset < expected {
       bad_found = true
       bad_at = expected
     }
@@ -758,14 +765,16 @@ pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
         []
       }
     }
+    let mut rel : UInt64 = seg.base_offset
     for rec in recs {
-      if !bad_found && rec.offset != expected {
+      if !bad_found && rec.offset != rel {
         bad_found = true
-        bad_at = expected
+        bad_at = rel
       }
-      expected = expected + (1 : UInt64)
+      rel = rel + (1 : UInt64)
       records = records + 1
     }
+    expected = seg.base_offset + seg.record_count.to_uint64()
   }
   {
     segments: self.segments.length(),

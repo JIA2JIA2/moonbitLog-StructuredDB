@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Fixed
+
+- **Tombstone-safe pruning**：`Log::prune_superseded` no longer drops segments
+  carrying tombstones — deleting a tombstone could resurrect an older put that
+  lives in a surviving segment. Found by the new maintenance property test.
+
+### Added
+
+- **Maintenance property test (M77)**：randomized maintenance (merge /
+  prune-superseded with cursor guard / compact) interleaved with regular ops,
+  asserting the offset stream before the cursor, the live view, and `verify`
+  stay intact.
+
 ## 0.7.0 - 2026-11-01
 
 ### Added
