@@ -258,6 +258,7 @@ u32 crc32          (仅覆盖 body)
 - M57 崩溃一致性测试：损坏 `.index`、删除 `MANIFEST` / `.index` / `.keys` 后，断言 `open_log_dir` 仍能从段数据恢复记录并重建 key 索引
 - M58 段合并：`Log::merge_segments` 将 offset 连续的已 roll 段合并为更少的段（保留逻辑 offset）；CLI `merge <dir> <max-segments>`
 - M59 key 索引缓存：`Log::build_key_index` 记忆化结果并在任意变更（append/delete/保留/回收/合并/compact）后失效，同进程重复 KV 查询每次变更后最多重建一次；`Log::index_build_count` 暴露实际构建次数
+- M60 复杂度基线扩展：断言 `scan_range` 只读请求窗口、`scan_time_range` 跳过无重叠段（补充 M54 的 key 索引基线）
 
 ## 许可
 

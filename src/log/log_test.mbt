@@ -1156,3 +1156,46 @@ test "key index is cached until the log changes" {
   assert_eq(log.index_build_count(), start + 2)
   assert_eq(i3.size(), 2)
 }
+
+///|
+test "scan_range reads only the requested window" {
+  let store = @backend_mem.MemLog::new()
+  let cr : CountReader = { mem: store, reads: 0, }
+  let log : @log.Log[@backend_mem.MemLog, CountReader] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => @segment.Segment::new(store, cr, base),
+  )
+  for i = 0; i < 50; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  cr.reads = 0
+  ignore(log.scan() catch { _ => panic() })
+  let full = cr.reads
+  cr.reads = 0
+  ignore(log.scan_range((0 : UInt64), (2 : UInt64)) catch { _ => panic() })
+  let partial = cr.reads
+  assert_true(partial < full)
+}
+
+///|
+test "scan_time_range skips segments that cannot overlap" {
+  let readers : Array[CountReader] = []
+  let log : @log.Log[@backend_mem.MemLog, CountReader] = @log.Log::new(
+    (60 : Int64),
+    base => {
+      let store = @backend_mem.MemLog::new()
+      let cr : CountReader = { mem: store, reads: 0, }
+      readers.push(cr)
+      @segment.Segment::new(store, cr, base)
+    },
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  for r in readers {
+    r.reads = 0
+  }
+  ignore(log.scan_time_range((60 : Int64), (80 : Int64)) catch { _ => panic() })
+  assert_eq(readers[0].reads, 0)
+}

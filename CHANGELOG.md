@@ -50,6 +50,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   invalidates it on any mutation (append/delete/retention/prune/merge/compact),
   so repeated KV queries in one process rebuild the index at most once per
   change. `Log::index_build_count` exposes the actual build count.
+- **More complexity guards (M60)**：tests assert `scan_range` reads only its
+  requested window and `scan_time_range` skips segments that cannot overlap,
+  complementing the M54 key-index guard.
 
 ## 0.3.0 - 2026-11-01
 
