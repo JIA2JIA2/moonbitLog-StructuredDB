@@ -76,6 +76,7 @@ moonlog <command> <dir> [args...]
   export <dir> <file>           导出全部记录（含 tombstone）到可移植文件
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
+  compact-expired <dir> <ttl>   折叠 live 记录并剔除已过期记录（offset 重排）
   fsck <dir>                    校验记录/offset 完整性
 stats <dir> [json]            打印逐段统计（可选 JSON）
 ```
@@ -92,7 +93,7 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `Log::append` / `append_batch` / `append_batch_atomic` / `Log::delete` | `log` | 追加单条 / 批量 / 原子批量（失败回滚）/ tombstone |
 | `Log::get` / `scan` / `scan_range` / `scan_reverse` / `scan_time_range` / `tail` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 逆序区间 / 时间区间 / 最近 N 条 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `index_build_count` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` / `merge_segments` / `prune_superseded` | `log` | KV 逻辑视图（带缓存）/ TTL 读取 / Bloom 快查 / 批量点查 / 前缀与区间扫描 / 折叠 live / 原地重写 / 段合并 / 冗余段回收 |
+| `Log::build_key_index` / `index_build_count` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` / `compact_expired` / `merge_segments` / `prune_superseded` | `log` | KV 逻辑视图（带缓存）/ TTL 读取 / Bloom 快查 / 批量点查 / 前缀与区间扫描 / 折叠 live / 过期折叠 / 原地重写 / 段合并 / 冗余段回收 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
