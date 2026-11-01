@@ -636,3 +636,48 @@ test "append buffers writes and reads drain them before flushing" {
   }
   clean_dir(dir)
 }
+
+///|
+test "compress_log_dir compresses rolled segments and they reopen read-only" {
+  let dir = "/tmp/moonlog_compress"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let packed = @backend_native.compress_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(packed >= 1)
+  let reopened = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 8)
+  let recs = reopened.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 8)
+  assert_eq(recs[7].value, b"value")
+  let report = reopened.verify()
+  match report.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

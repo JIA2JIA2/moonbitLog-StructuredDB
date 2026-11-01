@@ -14,6 +14,10 @@ pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
 
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
 
+pub fn rle_compress(Bytes) -> Bytes
+
+pub fn rle_decompress(Bytes, Int64) -> Bytes raise MetaError
+
 pub fn slice(Bytes, Int32, Int32) -> Bytes
 
 // Errors

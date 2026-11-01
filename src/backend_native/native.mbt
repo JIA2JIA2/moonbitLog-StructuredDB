@@ -64,6 +64,7 @@ pub(all) struct NativeFileLog {
   mut flushed : Int64
   mut pending : Bytes
   mut closed : Bool
+  mut raw : Bytes?
 }
 
 ///|
@@ -75,7 +76,15 @@ pub fn NativeFileLog::open(path : String) -> NativeFileLog raise @io.IoError {
     raise @io.IoError::Syscall(fd)
   }
   let size = moonlog_size(fd)
-  { fd, path: bytes, size, flushed: size, pending: b"", closed: false, }
+  {
+    fd,
+    path: bytes,
+    size,
+    flushed: size,
+    pending: b"",
+    closed: false,
+    raw: None,
+  }
 }
 
 ///|
@@ -89,7 +98,40 @@ pub fn NativeFileLog::open_readonly(
     raise @io.IoError::Syscall(fd)
   }
   let size = moonlog_size(fd)
-  { fd, path: bytes, size, flushed: size, pending: b"", closed: false, }
+  {
+    fd,
+    path: bytes,
+    size,
+    flushed: size,
+    pending: b"",
+    closed: false,
+    raw: None,
+  }
+}
+
+///|
+/// Open a compressed segment file into an in-memory read-only view: the whole
+/// file is decompressed eagerly and served from memory. `raw_size` is the
+/// uncompressed length recorded in the segment's index.
+pub fn NativeFileLog::open_compressed(
+  path : String,
+  raw_size : Int64,
+) -> NativeFileLog raise @io.IoError {
+  let bytes = @utf8.encode(path)
+  let compressed = read_file(path)
+  let raw = @core.rle_decompress(compressed, raw_size) catch {
+    _ => raise @io.IoError::Corrupt((0 : Int64))
+  }
+  let len = raw.length().to_int64()
+  {
+    fd: (-1 : Int32),
+    path: bytes,
+    size: len,
+    flushed: len,
+    pending: b"",
+    closed: false,
+    raw: Some(raw),
+  }
 }
 
 ///|
@@ -97,7 +139,9 @@ pub fn NativeFileLog::open_readonly(
 pub fn NativeFileLog::close(self : NativeFileLog) -> Unit {
   if !self.closed {
     ignore(self.write_pending() catch { _ => () })
-    ignore(moonlog_close(self.fd))
+    if self.fd >= 0 {
+      ignore(moonlog_close(self.fd))
+    }
     self.closed = true
   }
 }
@@ -105,6 +149,10 @@ pub fn NativeFileLog::close(self : NativeFileLog) -> Unit {
 ///|
 /// Write any buffered bytes to the descriptor (no fsync). Idempotent.
 fn NativeFileLog::write_pending(self : NativeFileLog) -> Unit raise @io.IoError {
+  match self.raw {
+    Some(_) => return
+    None => ()
+  }
   let data = self.pending
   if data.length() == 0 {
     return
@@ -183,6 +231,10 @@ pub impl @io.LogWriter for NativeFileLog with fn append(self, chunk) {
   if self.closed {
     raise @io.IoError::Closed
   }
+  match self.raw {
+    Some(_) => raise @io.IoError::Closed
+    None => ()
+  }
   if self.pending.length() == 0 && chunk.length() >= WRITE_BUFFER_LIMIT {
     let n = moonlog_pwrite(self.fd, self.flushed, chunk)
     if n < 0 {
@@ -204,6 +256,10 @@ pub impl @io.LogWriter for NativeFileLog with fn flush(self) {
   if self.closed {
     raise @io.IoError::Closed
   }
+  match self.raw {
+    Some(_) => return
+    None => ()
+  }
   self.write_pending()
   let r = moonlog_fsync(self.fd)
   if r < 0 {
@@ -216,11 +272,17 @@ pub impl @io.LogReader for NativeFileLog with fn read_at(self, offset, len) {
   if self.closed {
     raise @io.IoError::Closed
   }
-  self.write_pending()
   if offset < (0 : Int64) || offset + len.to_int64() > self.size {
     raise @io.IoError::OutOfBounds(offset)
   }
-  moonlog_pread(self.fd, offset, len)
+  match self.raw {
+    Some(r) =>
+      @core.slice(r, offset.to_int(), (offset + len.to_int64()).to_int())
+    None => {
+      self.write_pending()
+      moonlog_pread(self.fd, offset, len)
+    }
+  }
 }
 
 ///|
@@ -232,6 +294,10 @@ pub impl @io.LogReader for NativeFileLog with fn length(self) {
 pub impl @io.LogTruncate for NativeFileLog with fn truncate(self, size) {
   if self.closed {
     raise @io.IoError::Closed
+  }
+  match self.raw {
+    Some(_) => return
+    None => ()
   }
   self.pending = b""
   let r = moonlog_truncate(self.fd, size)
@@ -330,17 +396,22 @@ pub fn recover_log_dir(
   for name in names {
     if name.has_suffix(".log") {
       let path = dir + "/" + name
-      let f = NativeFileLog::open(path)
-      let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
-        f,
-        f,
-        (0 : UInt64),
-      )
-      let n = seg.recover()
-      if n > 0 {
-        segs = insert_segment_sorted(segs, seg)
-      } else {
-        f.close()
+      match load_compressed_segment(dir, name, path) {
+        Some(seg) => segs = insert_segment_sorted(segs, seg)
+        None => {
+          let f = NativeFileLog::open(path)
+          let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
+            f,
+            f,
+            (0 : UInt64),
+          )
+          let n = seg.recover()
+          if n > 0 {
+            segs = insert_segment_sorted(segs, seg)
+          } else {
+            f.close()
+          }
+        }
       }
     }
   }
@@ -352,6 +423,53 @@ pub fn recover_log_dir(
     segs,
     sync~,
   )
+}
+
+///|
+/// If the segment named by `<digits>.log` is stored compressed (its index says
+/// so), load it into a read-only decompressing view; otherwise return `None`.
+fn load_compressed_segment(
+  dir : String,
+  name : String,
+  path : String,
+) -> @segment.Segment[NativeFileLog, NativeFileLog]? raise @io.IoError {
+  match parse_base_from_log_name(name) {
+    None => None
+    Some(base) => {
+      let ip = segment_index_path(dir, base)
+      if !file_exists(ip) {
+        return None
+      }
+      let decoded = Some(@segment.decode_segment_meta(read_file(ip))) catch {
+        _ => None
+      }
+      match decoded {
+        Some(m) =>
+          if m.base_offset == base && m.compressed {
+            let f = NativeFileLog::open_compressed(path, m.raw_size)
+            let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
+              f, f, base,
+            )
+            seg.apply_meta(m)
+            Some(seg)
+          } else {
+            None
+          }
+        None => None
+      }
+    }
+  }
+}
+
+///|
+/// Parse the base offset out of a `<digits>.log` segment file name.
+fn parse_base_from_log_name(name : String) -> UInt64? {
+  if !name.has_suffix(".log") {
+    return None
+  }
+  let digits = name[0:name.length() - 4].to_owned()
+  let v = @string.parse_uint64(digits) catch { _ => return None }
+  Some(v)
 }
 
 ///|
@@ -442,30 +560,34 @@ fn load_segment(
   dir : String,
   base : UInt64,
 ) -> @segment.Segment[NativeFileLog, NativeFileLog] raise @io.IoError {
-  let f = NativeFileLog::open(dir + "/" + @segment.segment_file_name(base))
+  let ip = segment_index_path(dir, base)
+  let decoded : @segment.SegmentMeta? = if file_exists(ip) {
+    Some(@segment.decode_segment_meta(read_file(ip))) catch {
+      _ => None
+    }
+  } else {
+    None
+  }
+  let valid : @segment.SegmentMeta? = match decoded {
+    Some(m) => if m.base_offset == base { Some(m) } else { None }
+    None => None
+  }
+  let path = dir + "/" + @segment.segment_file_name(base)
+  let f = match valid {
+    Some(m) =>
+      if m.compressed {
+        NativeFileLog::open_compressed(path, m.raw_size)
+      } else {
+        NativeFileLog::open(path)
+      }
+    None => NativeFileLog::open(path)
+  }
   let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
     f, f, base,
   )
-  let ip = segment_index_path(dir, base)
-  let restored = if file_exists(ip) {
-    let meta = Some(@segment.decode_segment_meta(read_file(ip))) catch {
-      _ => None
-    }
-    match meta {
-      Some(m) =>
-        if m.base_offset == base {
-          seg.apply_meta(m)
-          true
-        } else {
-          false
-        }
-      None => false
-    }
-  } else {
-    false
-  }
-  if !restored {
-    ignore(seg.recover())
+  match valid {
+    Some(m) => seg.apply_meta(m)
+    None => ignore(seg.recover())
   }
   seg
 }
@@ -570,7 +692,12 @@ pub fn flush_meta(
       seg.to_meta().encode(),
     )
     bases.push(seg.base_offset)
-    sizes.push(seg.byte_size())
+    let stored = if seg.is_compressed() {
+      segment_file_size(dir, seg.base_offset)
+    } else {
+      seg.byte_size()
+    }
+    sizes.push(stored)
     i = i + 1
   }
   let manifest : @log.Manifest = {
@@ -580,6 +707,43 @@ pub fn flush_meta(
     segment_sizes: sizes,
   }
   write_file_atomic(dir, MANIFEST_NAME, manifest.encode())
+}
+
+///|
+/// RLE-compress every rolled-over (non-active) segment of `dir` in place. Each
+/// compressed segment records its uncompressed size and a checksum of the raw
+/// data in its index, and the manifest is refreshed. Returns the number of
+/// segments compressed.
+pub fn compress_log_dir(
+  dir : String,
+  roll_size : Int64,
+) -> Int32 raise @io.IoError {
+  let log = open_log_dir(dir, roll_size)
+  let n = log.segment_count()
+  let mut packed = 0
+  let mut i = 0
+  while i < n {
+    if i < n - 1 {
+      let seg = log.segments[i]
+      if !seg.is_compressed() {
+        let raw_size = seg.byte_size()
+        let raw = seg.reader.read_at((0 : Int64), raw_size.to_int())
+        seg.set_checksum(@core.crc32(raw))
+        write_file(
+          dir + "/" + @segment.segment_file_name(seg.base_offset),
+          @core.rle_compress(raw),
+        )
+        seg.mark_compressed(raw_size)
+        packed = packed + 1
+      }
+    }
+    i = i + 1
+  }
+  flush_meta(dir, log)
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  packed
 }
 
 ///|

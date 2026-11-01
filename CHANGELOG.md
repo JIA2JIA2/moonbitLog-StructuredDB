@@ -41,6 +41,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `pwrite` calls. The buffer is drained before reads, `flush`, `truncate`,
   `close`, and before metadata is written, so the on-disk size matches the
   logical size once a write command returns.
+- **Segment compression (M43)**：pure MoonBit RLE (`core.rle_compress` /
+  `core.rle_decompress`). The `compress` CLI command RLE-compresses every
+  rolled-over segment in place; metadata v5 records the compression flag and the
+  uncompressed size, and compressed segments are transparently decompressed into
+  a read-only view on open. Older metadata versions read back as uncompressed.
 
 ## 0.2.0 - 2026-10-31
 

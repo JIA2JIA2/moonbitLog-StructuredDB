@@ -45,6 +45,8 @@ pub(all) struct Segment[W, R] {
   mut time_known : Bool
   mut data_crc : UInt32
   mut crc_known : Bool
+  mut compressed : Bool
+  mut raw_size : Int64
   mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
@@ -57,6 +59,8 @@ pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? r
 pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
+pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
+pub fn[W, R] Segment::mark_compressed(Self[W, R], Int64) -> Unit
 pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
 pub fn[W, R] Segment::may_contain(Self[W, R], Bytes) -> Bool
 pub fn[W, R] Segment::min_timestamp(Self[W, R]) -> Int64
@@ -85,6 +89,8 @@ pub(all) struct SegmentMeta {
   time_known : Bool
   data_crc : UInt32
   crc_known : Bool
+  compressed : Bool
+  raw_size : Int64
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 

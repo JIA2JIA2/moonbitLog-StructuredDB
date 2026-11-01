@@ -14,7 +14,7 @@
 ///   u32 entry_count
 ///   entries[entry_count]: { u64 record_index, i64 position }
 ///   (v2+) bloom ; (v3+) min_ts/max_ts/time_known ; (v4+) data_crc/crc_known
-///   u32 crc32
+///   (v5+) compressed/raw_size ; u32 crc32
 pub(all) struct SegmentMeta {
   base_offset : UInt64
   next_offset : UInt64
@@ -28,13 +28,15 @@ pub(all) struct SegmentMeta {
   time_known : Bool
   data_crc : UInt32
   crc_known : Bool
+  compressed : Bool
+  raw_size : Int64
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 4
+const SEGMENT_META_VERSION : UInt32 = 5
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -90,6 +92,8 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   body.write_uint_le(if self.time_known { 1 } else { 0 })
   body.write_uint_le(self.data_crc)
   body.write_uint_le(if self.crc_known { 1 } else { 0 })
+  body.write_uint_le(if self.compressed { 1 } else { 0 })
+  body.write_int64_le(self.raw_size)
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -172,6 +176,16 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     }
     data_crc = meta_u32(data, pos)
     crc_known = meta_u32(data, pos + 4) == 1
+    pos = pos + 8
+  }
+  let mut compressed = false
+  let mut raw_size : Int64 = 0
+  if version >= 5 {
+    if pos + 12 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    compressed = meta_u32(data, pos) == 1
+    raw_size = meta_i64(data, pos + 4)
   }
   {
     base_offset,
@@ -186,6 +200,8 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     time_known,
     data_crc,
     crc_known,
+    compressed,
+    raw_size,
   }
 }
 
@@ -205,6 +221,8 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     time_known: self.time_known,
     data_crc: self.data_crc,
     crc_known: self.crc_known,
+    compressed: self.compressed,
+    raw_size: self.raw_size,
   }
 }
 
@@ -229,5 +247,7 @@ pub fn[W, R] Segment::apply_meta(
   self.time_known = meta.time_known
   self.data_crc = meta.data_crc
   self.crc_known = meta.crc_known
+  self.compressed = meta.compressed
+  self.raw_size = meta.raw_size
   self.meta_loaded = true
 }

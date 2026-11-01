@@ -20,6 +20,8 @@ pub(all) struct Segment[W, R] {
   mut time_known : Bool
   mut data_crc : UInt32
   mut crc_known : Bool
+  mut compressed : Bool
+  mut raw_size : Int64
   mut meta_loaded : Bool
 }
 
@@ -63,6 +65,8 @@ pub fn[W, R] Segment::new_with_index_interval(
     time_known: false,
     data_crc: 0,
     crc_known: false,
+    compressed: false,
+    raw_size: 0,
     meta_loaded: false,
   }
 }
@@ -149,6 +153,23 @@ pub fn[W, R : @io.LogReader] Segment::compute_checksum(
   }
   let data = self.reader.read_at((0 : Int64), total.to_int())
   @core.crc32(data)
+}
+
+///|
+/// Whether this segment's data is stored compressed on disk.
+pub fn[W, R] Segment::is_compressed(self : Segment[W, R]) -> Bool {
+  self.compressed
+}
+
+///|
+/// Record that this segment is now stored compressed, holding `raw_size` bytes
+/// of uncompressed data.
+pub fn[W, R] Segment::mark_compressed(
+  self : Segment[W, R],
+  raw_size : Int64,
+) -> Unit {
+  self.compressed = true
+  self.raw_size = raw_size
 }
 
 ///|

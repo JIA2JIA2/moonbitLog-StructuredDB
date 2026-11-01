@@ -33,6 +33,7 @@
 ///   export <dir> <file>              write all records to a portable file
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
+///   compress <dir>                   RLE-compress every rolled-over segment
 ///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir>                      print record/segment counts
 ///
@@ -47,7 +48,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -582,6 +583,16 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// RLE-compress every rolled-over (non-active) segment in place. The active
+/// segment keeps growing, so it is left uncompressed.
+fn cmd_compress(dir : String) -> Unit raise @io.IoError {
+  run_locked(dir, true, () => {
+    let n = @backend_native.compress_log_dir(dir, ROLL_SIZE)
+    println("compressed " + n.to_string() + " segments")
+  })
+}
+
+///|
 /// Export the whole directory (including tombstones) to a portable record
 /// stream file.
 fn cmd_export(dir : String, file : String) -> Unit raise @io.IoError {
@@ -733,6 +744,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "compact" {
     cmd_compact(args[2])
+  } else if cmd == "compress" {
+    cmd_compress(args[2])
   } else if cmd == "cursor-commit" {
     if args.length() < 4 {
       println(USAGE)
