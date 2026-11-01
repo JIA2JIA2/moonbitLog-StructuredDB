@@ -3,7 +3,7 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## Unreleased
+## 0.2.0 - 2026-10-31
 
 ### Added
 
@@ -49,6 +49,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   benchmark was added to guard the decision.
 - **CI coverage and benchmarks (M29)**：CI now collects native code coverage
   into the run summary and archives benchmark results as an artifact.
+- **Architecture docs and release workflow (M30)**：an architecture overview was
+  added to the README and a release-triggered workflow verifies and publishes
+  the package to mooncakes.io.
 
 ## 0.1.0 - 2026-10-31
 

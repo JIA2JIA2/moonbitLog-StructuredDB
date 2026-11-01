@@ -130,6 +130,34 @@ moon run examples/mem_demo --target native
 moon run examples/mem_demo --target wasm
 ```
 
+## 架构
+
+```
+          ┌──────────────┐
+          │  cli（CLI）  │  put / scan / compact / export / fsck …
+          └──────┬───────┘
+                 │
+          ┌──────▼───────┐
+          │     log      │  Log[W,R]：多段、offset、保留、游标、KV 视图
+          └───┬──────┬───┘
+              │      │
+    ┌─────────▼─┐  ┌─▼──────────┐
+    │  segment  │  │    core    │  记录编解码 / CRC32
+    └─────┬─────┘  └────────────┘
+          │
+   ┌──────▼───────────────────┐
+   │ io：LogWriter/Reader/    │
+   │     LogTruncate/IoError  │
+   └───┬──────────────────┬───┘
+       │                  │
+┌──────▼──────┐    ┌──────▼────────┐
+│ backend_mem │    │ backend_native│  flock / C stub FFI
+└─────────────┘    └───────────────┘
+```
+
+- 存储抽象（`io`）让同一份 `log`/`segment` 逻辑同时运行在内存（wasm/js）与文件（native）后端之上。
+- `segment` 负责单段的 append、稀疏索引、范围扫描与崩溃恢复；`log` 在其上实现多段管理、全局 offset、保留策略、消费游标、KV 视图与 compaction。
+
 ## 磁盘格式
 
 每条记录（小端）：
@@ -192,6 +220,7 @@ u32 crc32          (仅覆盖 body)
 - M24 自适应稀疏索引间隔：`index_interval_for` 按 `roll_size` 估算
 - M25 读取路径：实测读缓存比直接 pread 慢约 3.7×，故保留直接 `pread`；新增 native 顺序扫描基准
 - M29 CI 增强：native 覆盖率摘要 + bench 结果归档
+- M30 架构文档与发布工作流（release 触发 `moon publish`）
 
 ## 许可
 
