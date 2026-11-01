@@ -46,6 +46,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Segment merging (M58)**：`Log::merge_segments` merges offset-contiguous
   rolled-over segments into fewer segments while preserving logical offsets;
   exposed as the `merge <dir> <max-segments>` CLI command.
+- **Cached key index (M59)**：`Log::build_key_index` memoizes its result and
+  invalidates it on any mutation (append/delete/retention/prune/merge/compact),
+  so repeated KV queries in one process rebuild the index at most once per
+  change. `Log::index_build_count` exposes the actual build count.
 
 ## 0.3.0 - 2026-11-01
 

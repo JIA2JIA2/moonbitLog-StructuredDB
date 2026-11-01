@@ -1136,3 +1136,23 @@ test "merge_segments combines contiguous rolled segments preserving offsets" {
     None => panic()
   }
 }
+
+///|
+test "key index is cached until the log changes" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  let start = log.index_build_count()
+  let i1 = log.build_key_index()
+  assert_eq(log.index_build_count(), start + 1)
+  assert_eq(i1.size(), 1)
+  let i2 = log.build_key_index()
+  assert_eq(log.index_build_count(), start + 1)
+  assert_eq(i2.size(), 1)
+  ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  let i3 = log.build_key_index()
+  assert_eq(log.index_build_count(), start + 2)
+  assert_eq(i3.size(), 2)
+}

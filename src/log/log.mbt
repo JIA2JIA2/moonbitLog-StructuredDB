@@ -26,6 +26,8 @@ pub(all) struct Log[W, R] {
   mut next_offset : UInt64
   make : MakeSegment[W, R]
   sync : SyncPolicy
+  mut index_cache : KeyIndex?
+  mut index_builds : Int32
 }
 
 ///|
@@ -34,7 +36,15 @@ pub fn[W, R] Log::new(
   make : MakeSegment[W, R],
   sync~ : SyncPolicy = SyncPolicy::Never,
 ) -> Log[W, R] {
-  { segments: [], roll_size, next_offset: 0, make, sync, }
+  {
+    segments: [],
+    roll_size,
+    next_offset: 0,
+    make,
+    sync,
+    index_cache: None,
+    index_builds: 0,
+  }
 }
 
 ///|
@@ -51,7 +61,15 @@ pub fn[W, R] Log::recover(
   if segments.length() > 0 {
     next = segments[segments.length() - 1].next_offset
   }
-  { segments, roll_size, next_offset: next, make, sync, }
+  {
+    segments,
+    roll_size,
+    next_offset: next,
+    make,
+    sync,
+    index_cache: None,
+    index_builds: 0,
+  }
 }
 
 ///|
@@ -102,6 +120,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
     active.writer.flush()
   }
   self.next_offset = offset + (1 : UInt64)
+  self.index_cache = None
   offset
 }
 
@@ -181,6 +200,7 @@ pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch
       j = j + 1
     }
     self.segments = kept
+    self.index_cache = None
     if n0 > 0 {
       let seg = self.segments[n0 - 1]
       @io.LogTruncate::truncate(seg.writer, prev_size) catch {
@@ -388,6 +408,7 @@ pub fn[W, R] Log::drop_before(
     }
   }
   self.segments = keep
+  self.index_cache = None
   dropped
 }
 
@@ -413,6 +434,7 @@ pub fn[W, R] Log::retain_last(
     }
   }
   self.segments = kept
+  self.index_cache = None
   dropped
 }
 
@@ -443,6 +465,7 @@ pub fn[W, R] Log::retain_max_bytes(
     }
   }
   self.segments = kept
+  self.index_cache = None
   dropped
 }
 
@@ -489,6 +512,7 @@ pub fn[W, R : @io.LogReader] Log::prune_superseded(
     i = i + 1
   }
   self.segments = kept
+  self.index_cache = None
   dropped
 }
 
@@ -546,6 +570,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(
       i = i + 1
     }
     self.segments = rebuilt
+    self.index_cache = None
     merged = merged + 1
   }
   merged
@@ -583,6 +608,7 @@ pub fn[W, R : @io.LogReader] Log::retain_before(
     }
   }
   self.segments = kept
+  self.index_cache = None
   dropped
 }
 

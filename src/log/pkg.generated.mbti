@@ -41,6 +41,8 @@ pub(all) struct Log[W, R] {
   mut next_offset : UInt64
   make : (UInt64) -> @segment.Segment[W, R] raise @io.IoError
   sync : SyncPolicy
+  mut index_cache : KeyIndex?
+  mut index_builds : Int32
 }
 pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, Int64)]) -> Array[UInt64] raise @io.IoError
@@ -60,6 +62,7 @@ pub fn[W, R : @io.LogReader] Log::get_latest_at(Self[W, R], KeyIndex, Bytes, Int
 pub fn[W, R : @io.LogReader] Log::get_latest_bloom(Self[W, R], Bytes) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_many(Self[W, R], Array[Bytes]) -> Array[@core.Record?] raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::import_bytes(Self[W, R], Bytes) -> Int32 raise @io.IoError
+pub fn[W, R] Log::index_build_count(Self[W, R]) -> Int32
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(Self[W, R], Int32, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy) -> Self[W, R]
 pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64

@@ -44,23 +44,37 @@ fn KeyIndex::drop(self : KeyIndex, key : Bytes) -> Unit {
 /// its keys' latest offsets), so no record bodies are re-decoded. A tombstone
 /// in a newer segment hides an older put.
 pub fn[W, R] Log::build_key_index(self : Log[W, R]) -> KeyIndex {
-  let index = KeyIndex::new()
-  for seg in self.segments {
-    seg.each_key((k, off, del) => {
-      if del {
-        index.drop(k)
-      } else {
-        index.put(k, off)
+  match self.index_cache {
+    Some(cached) => cached
+    None => {
+      let index = KeyIndex::new()
+      for seg in self.segments {
+        seg.each_key((k, off, del) => {
+          if del {
+            index.drop(k)
+          } else {
+            index.put(k, off)
+          }
+        })
       }
-    })
+      let keys : Array[Bytes] = []
+      for k in index.entries.keys() {
+        keys.push(k)
+      }
+      keys.sort_by(fn(a, b) { bytes_cmp(a, b) })
+      index.sorted_keys = keys
+      self.index_cache = Some(index)
+      self.index_builds = self.index_builds + 1
+      index
+    }
   }
-  let keys : Array[Bytes] = []
-  for k in index.entries.keys() {
-    keys.push(k)
-  }
-  keys.sort_by(fn(a, b) { bytes_cmp(a, b) })
-  index.sorted_keys = keys
-  index
+}
+
+///|
+/// Number of times the key index has actually been (re)built; with the built-in
+/// cache this stays flat while the log is unchanged.
+pub fn[W, R] Log::index_build_count(self : Log[W, R]) -> Int32 {
+  self.index_builds
 }
 
 ///|
@@ -141,6 +155,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(
     on_drop(seg)
   }
   self.segments = []
+  self.index_cache = None
   self.next_offset = (0 : UInt64)
   for rec in live {
     ignore(self.append(rec.key, rec.value, rec.timestamp))
