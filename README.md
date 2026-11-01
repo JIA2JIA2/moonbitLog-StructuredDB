@@ -12,7 +12,7 @@
 - **崩溃恢复**：`Segment::recover` 顺序解码、遇 torn/CRC 失败的尾部即截断到最后一个完好边界并重建索引与计数；native 侧 `recover_log_dir` 打开目录恢复全部 `*.log` 段。
 - **Tombstone**：`Log::delete` 追加删除标记记录，历史不被改写。
 - **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes` / `Log::retain_before`（按 offset / 段数 / 总字节 / 时间戳）以整段删除方式回收旧数据。
-- **可配置持久化**：`SyncPolicy::Always` 让每次 append 后 `fsync`；CLI 用 `MOONLOG_SYNC=1` 开启。
+- **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
@@ -71,18 +71,12 @@ moonlog <command> <dir> [args...]
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   fsck <dir>                    校验记录/offset 完整性
-  stats <dir>                   打印记录/段计数
+stats <dir>                   打印记录/段计数
 ```
 
-示例：
+持久性与 `MOONLOG_SYNC`：CLI 写入默认 `Always`，即命令返回时数据已 fsync 落盘；设 `MOONLOG_SYNC=batch` 改为批量 / 导入时一次 fsync，设 `MOONLOG_SYNC=never`（或 `0`）关闭显式 fsync（仅依赖 OS 回写）。
 
-```bash
-EXE=_build/native/debug/build/src/cli/cli.exe
-$EXE put /tmp/log user:1 alice
-$EXE put /tmp/log user:2 bob
-$EXE delete /tmp/log user:2
-$EXE scan /tmp/log
-```
+`import` 会用目标日志的 `append` **重新分配 offset**（offset 是每个日志本地的连续编号）；导出文件保留 key/value/timestamp/kind，不含目标 offset 语义。
 
 ## API 概览
 
@@ -222,6 +216,7 @@ u32 crc32          (仅覆盖 body)
 - M29 CI 增强：native 覆盖率摘要 + bench 结果归档
 - M30 架构文档与发布工作流（release 触发 `moon publish`）
 - M31 审阅修复：`Log::flush` 刷所有段、`import_bytes` 批量落盘、CLI 支持 `MOONLOG_SYNC=batch`
+- M32 审阅修复：CLI 默认 `MOONLOG_SYNC=always`（命令返回即落盘），并明确 `import` 的 offset 语义
 
 ## 许可
 

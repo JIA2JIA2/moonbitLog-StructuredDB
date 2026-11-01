@@ -60,6 +60,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   segments durable; previously only the active segment was fsynced, leaving a
   cross-segment batch only partially durable. The CLI `MOONLOG_SYNC` variable
   now also accepts `batch`.
+- **CLI durability default（post-M31 review）**：the CLI now defaults to
+  `SyncPolicy::Always`, so a write command that returns has fsynced its data;
+  `MOONLOG_SYNC` accepts `always` (default), `batch`, and `never` / `0`. The
+  README now also documents that `import` reassigns offsets in the target log.
 
 ## 0.1.0 - 2026-10-31
 
