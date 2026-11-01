@@ -92,7 +92,7 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `Log::append` / `append_batch` / `append_batch_atomic` / `Log::delete` | `log` | 追加单条 / 批量 / 原子批量（失败回滚）/ tombstone |
 | `Log::get` / `scan` / `scan_range` / `scan_reverse` / `scan_time_range` / `tail` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 逆序区间 / 时间区间 / 最近 N 条 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 批量点查 / 前缀扫描 / key 区间扫描 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `index_build_count` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` / `merge_segments` / `prune_superseded` | `log` | KV 逻辑视图（带缓存）/ TTL 读取 / Bloom 快查 / 批量点查 / 前缀与区间扫描 / 折叠 live / 原地重写 / 段合并 / 冗余段回收 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
@@ -102,7 +102,7 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `rle_compress` / `rle_decompress` | `core` | 纯 MoonBit RLE 段数据压缩 / 解压（wasm 可用） |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
-| `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `compress_log_dir` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、段压缩、目录锁 |
+| `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `compress_log_dir` / `count_compressible_segments` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、段压缩与计数、目录锁（含超时重试） |
 | `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
@@ -187,7 +187,10 @@ u32 crc32          (仅覆盖 body)
 
 ### 持久化元数据（M8）
 
-- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照、该段 key 的 Bloom 过滤器、时间跨度（min/max timestamp），以及已 roll 段的整段数据 CRC32 与压缩标志 + 原始大小（整体含 CRC32），重开时可直接恢复，无需扫描数据。
+- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照、该段 key 的 Bloom 过滤器、时间跨度（min/max timestamp），以及已 roll 段的整段数据 CRC32 与压缩标志 + 原始大小（整体含 CRC32），重开时可直接恢复，无需扫描数据。采用版本化布局，打开时按版本解析（向后兼容读取 v1–v7）：
+  - v1：header + 稀疏索引条目；v2：+ Bloom 过滤器；v3：+ 时间跨度（`min_ts`/`max_ts`/`time_known`）
+  - v4：+ 整段数据 CRC32（`data_crc`/`crc_known`，仅已 roll 段）；v5：+ 压缩标志与原始大小（`compressed`/`raw_size`）
+  - v6：+ 时间有序标志（`ts_sorted`）；v7：+ 压缩算法（`comp_algo`：0 无 / 1 RLE / 2 LZSS）
 - 每个段旁挂 `<name>.log.keys`：保存该段 key → 最新 offset（含 tombstone 标志）索引（含 CRC32），重开时直接加载；缺失或损坏则回退重建扫描。
 - 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（每段的 `base_offset` 与 `byte_size`，整体附 CRC32）。打开时据此校验每个段文件的真实大小，不符则回退全量恢复。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
@@ -195,7 +198,7 @@ u32 crc32          (仅覆盖 body)
 
 ### 目录锁与游标文件（M12）
 
-- `LOCK`：`flock` 建议锁的载体。写者取独占锁，读者取共享锁，均以非阻塞方式获取，冲突即快速失败而非死等；`compact` 会保留该文件。
+- `LOCK`：`flock` 建议锁的载体。写者取独占锁，读者取共享锁；`DirLock::acquire_timeout` 在有限时间内重试忙锁（CLI 默认 5s，可用 `MOONLOG_LOCK_TIMEOUT` 调整），使多写者排队而非立即失败；`compact` 会保留该文件。
 - `CURSOR` / `CURSOR.<name>`：CLI 持久化的（命名）消费游标位置。编码为 `u32 magic("MLCU") + u64 position + u32 crc32`，损坏或缺失时回退为 `0`；写入采用原子替换。
 
 ## 里程碑
