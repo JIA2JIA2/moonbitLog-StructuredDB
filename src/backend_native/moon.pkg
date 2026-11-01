@@ -7,6 +7,10 @@ import {
 
 supported_targets = "-all+native"
 
+import {
+  "moonbitlang/core/bench",
+} for "test"
+
 options(
   "native-stub": [ "stub.c" ],
 )

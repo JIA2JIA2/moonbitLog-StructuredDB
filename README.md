@@ -188,6 +188,7 @@ u32 crc32          (仅覆盖 body)
 - M27 命名游标管理：`list_named_cursors` / `remove_named_cursor` 与 CLI `cursor-list` / `cursor-drop`
 - M28 导出/导入：`Log::export_bytes` / `Log::import_bytes` 与 CLI `export` / `import`
 - M24 自适应稀疏索引间隔：`index_interval_for` 按 `roll_size` 估算
+- M25 读取路径：实测读缓存比直接 pread 慢约 3.7×，故保留直接 `pread`；新增 native 顺序扫描基准
 
 ## 许可
 

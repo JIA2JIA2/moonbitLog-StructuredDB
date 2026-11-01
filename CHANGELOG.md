@@ -43,6 +43,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Adaptive index interval (M24)**：new segments pick a sparse-index interval
   scaled from `roll_size` via `index_interval_for`, keeping the per-segment
   index size roughly constant.
+- **Read path evaluation (M25)**：a read-ahead cache was implemented and
+  measured ~3.7× slower than direct `pread` (MoonBit `Bytes` slicing copies
+  byte-by-byte), so reads keep using `pread`; a native sequential-scan
+  benchmark was added to guard the decision.
 
 ## 0.1.0 - 2026-10-31
 
