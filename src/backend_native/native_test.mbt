@@ -1137,6 +1137,49 @@ test "verify_fast detects data corruption via segment checksums" {
 }
 
 ///|
+
+///|
+test "ts samples are persisted in segment metadata (v8)" {
+  let dir = "/tmp/moonlog_ts_persist"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 100; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_eq(log.segment_count(), 1)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // Reopen: the loaded segment must restore its in-memory ts samples from the
+  // v8 metadata, so scan_time_range uses the sample binary search.
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(reopened.segments[0].ts_samples.length() >= 3)
+  let mid = reopened.scan_time_range((150 : Int64), (350 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(mid.length(), 20)
+  assert_eq(mid[0].timestamp, (150 : Int64))
+  assert_eq(mid[19].timestamp, (340 : Int64))
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
 test "a freshly loaded segment does not need fsync" {
   let dir = "/tmp/moonlog_fsync_clean"
   ignore(@backend_native.ensure_dir(dir))

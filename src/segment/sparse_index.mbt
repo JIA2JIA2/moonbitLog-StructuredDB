@@ -4,6 +4,7 @@
 pub(all) struct IndexEntry {
   record_index : UInt64
   position : Int64
+  timestamp : Int64
 }
 
 ///|
@@ -36,8 +37,9 @@ pub fn SparseIndex::push(
   self : SparseIndex,
   record_index : UInt64,
   position : Int64,
+  timestamp : Int64,
 ) -> Unit {
-  self.entries.push({ record_index, position, })
+  self.entries.push({ record_index, position, timestamp, })
 }
 
 ///|

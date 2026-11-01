@@ -14,7 +14,9 @@
 ///   u32 entry_count
 ///   entries[entry_count]: { u64 record_index, i64 position }
 ///   (v2+) bloom ; (v3+) min_ts/max_ts/time_known ; (v4+) data_crc/crc_known
-///   (v5+) compressed/raw_size ; (v6+) ts_sorted ; (v7+) comp_algo ; u32 crc32
+///   (v5+) compressed/raw_size ; (v6+) ts_sorted ; (v7+) comp_algo
+///   (v8+) entries carry { u64 record_index, i64 position, i64 timestamp }
+///   u32 crc32
 pub(all) struct SegmentMeta {
   base_offset : UInt64
   next_offset : UInt64
@@ -32,13 +34,14 @@ pub(all) struct SegmentMeta {
   raw_size : Int64
   ts_sorted : Bool
   comp_algo : Int32
+  entries_have_ts : Bool
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 7
+const SEGMENT_META_VERSION : UInt32 = 8
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -85,6 +88,7 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   for e in self.entries {
     body.write_uint64_le(e.record_index)
     body.write_int64_le(e.position)
+    body.write_int64_le(e.timestamp)
   }
   let bloom = self.bloom.to_bytes()
   body.write_uint_le(meta_i32_count(bloom.length()))
@@ -131,17 +135,23 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
   let interval = meta_i32(data, 36)
   let entry_count = meta_u32(data, 40)
   let entries : Array[IndexEntry] = []
+  let entry_size = if version >= 8 { 24 } else { 16 }
   let mut pos = SEGMENT_META_HEADER
   let mut i = 0
   let n = entry_count.reinterpret_as_int()
   while i < n {
-    if pos + 16 > body_end {
+    if pos + entry_size > body_end {
       raise @core.MetaError::Truncated(pos)
     }
     let record_index = meta_u64(data, pos)
     let position = meta_i64(data, pos + 8)
-    entries.push({ record_index, position, })
-    pos = pos + 16
+    let timestamp = if version >= 8 {
+      meta_i64(data, pos + 16)
+    } else {
+      (0 : Int64)
+    }
+    entries.push({ record_index, position, timestamp, })
+    pos = pos + entry_size
     i = i + 1
   }
   let mut bloom = BloomFilter::disabled()
@@ -224,6 +234,7 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     raw_size,
     ts_sorted,
     comp_algo,
+    entries_have_ts: version >= 8,
   }
 }
 
@@ -247,6 +258,7 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     raw_size: self.raw_size,
     ts_sorted: self.ts_sorted,
     comp_algo: self.comp_algo,
+    entries_have_ts: true,
   }
 }
 
@@ -263,7 +275,16 @@ pub fn[W, R] Segment::apply_meta(
   self.size = meta.size
   self.index = SparseIndex::new(meta.interval)
   for e in meta.entries {
-    self.index.push(e.record_index, e.position)
+    self.index.push(e.record_index, e.position, e.timestamp)
+  }
+  self.ts_samples = if meta.entries_have_ts {
+    let arr : Array[(UInt64, Int64)] = []
+    for e in meta.entries {
+      arr.push((e.record_index, e.timestamp))
+    }
+    arr
+  } else {
+    []
   }
   self.bloom = meta.bloom
   self.min_ts = meta.min_ts

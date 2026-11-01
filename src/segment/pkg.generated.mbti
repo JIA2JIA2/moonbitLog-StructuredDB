@@ -30,6 +30,7 @@ pub fn BloomFilter::to_bytes(Self) -> Bytes
 pub(all) struct IndexEntry {
   record_index : UInt64
   position : Int64
+  timestamp : Int64
 }
 
 pub(all) struct Segment[W, R] {
@@ -110,6 +111,7 @@ pub(all) struct SegmentMeta {
   raw_size : Int64
   ts_sorted : Bool
   comp_algo : Int32
+  entries_have_ts : Bool
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 
@@ -121,7 +123,7 @@ pub fn SparseIndex::entry(Self, Int32) -> IndexEntry
 pub fn SparseIndex::floor(Self, UInt64) -> IndexEntry?
 pub fn SparseIndex::length(Self) -> Int32
 pub fn SparseIndex::new(Int32) -> Self
-pub fn SparseIndex::push(Self, UInt64, Int64) -> Unit
+pub fn SparseIndex::push(Self, UInt64, Int64, Int64) -> Unit
 pub fn SparseIndex::reset(Self) -> Unit
 pub fn SparseIndex::should_index(Self, Int32) -> Bool
 

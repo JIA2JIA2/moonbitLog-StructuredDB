@@ -303,7 +303,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
 ) -> UInt64 raise @io.IoError {
   let offset = self.next_offset
   if self.index.should_index(self.record_count) {
-    self.index.push(self.record_count.to_uint64(), self.size)
+    self.index.push(self.record_count.to_uint64(), self.size, timestamp)
     self.ts_samples.push((self.record_count.to_uint64(), timestamp))
   }
   let rec : @core.Record = { offset, timestamp, kind, key, value, }
@@ -534,7 +534,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
         self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
-          self.index.push(n.to_uint64(), pos)
+          self.index.push(n.to_uint64(), pos, rec.timestamp)
           self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1
@@ -587,7 +587,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
         self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
-          self.index.push(n.to_uint64(), pos)
+          self.index.push(n.to_uint64(), pos, rec.timestamp)
           self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1

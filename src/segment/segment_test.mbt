@@ -110,9 +110,9 @@ test "sparse index samples one entry per interval and still finds any offset" {
 ///|
 test "sparse index floor returns the greatest lower bound" {
   let idx = @segment.SparseIndex::new(4)
-  idx.push((0 : UInt64), (0 : Int64))
-  idx.push((4 : UInt64), (40 : Int64))
-  idx.push((8 : UInt64), (80 : Int64))
+  idx.push((0 : UInt64), (0 : Int64), (0 : Int64))
+  idx.push((4 : UInt64), (40 : Int64), (10 : Int64))
+  idx.push((8 : UInt64), (80 : Int64), (20 : Int64))
   let f0 = idx.floor((0 : UInt64))
   match f0 {
     Some(e) => assert_eq(e.position, (0 : Int64))
@@ -501,7 +501,7 @@ fn meta_bytes_v1_to_v7(
 ///|
 test "segment meta decodes every historical version" {
   let mut v : UInt32 = 1
-  while v <= 7 {
+  while v <= 8 {
     let bytes = meta_bytes_v1_to_v7(
       v,
       (5 : UInt64),
@@ -532,6 +532,11 @@ test "segment meta decodes every historical version" {
       assert_eq(m.comp_algo, 2)
     } else {
       assert_eq(m.comp_algo, 0)
+    }
+    if v >= 8 {
+      assert_true(m.entries_have_ts)
+    } else {
+      assert_true(!m.entries_have_ts)
     }
     v = v + 1
   }

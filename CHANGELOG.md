@@ -18,6 +18,15 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   asserting the offset stream before the cursor, the live view, and `verify`
   stay intact.
 
+## Unreleased
+
+### Added
+
+- **Persisted ts samples (M78)**：sparse-index entries carry their timestamp
+  (metadata v8; v1–v7 remain readable), so a freshly loaded segment restores its
+  in-memory ts samples and `scan_time_range` uses the sample binary search
+  immediately instead of falling back to point probes.
+
 ## 0.7.0 - 2026-11-01
 
 ### Added
