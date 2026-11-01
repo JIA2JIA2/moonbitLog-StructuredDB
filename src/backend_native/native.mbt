@@ -49,12 +49,20 @@ extern "C" fn moonlog_readdir(handle : Int64) -> Bytes = "moonlog_readdir"
 extern "C" fn moonlog_closedir(handle : Int64) -> Int32 = "moonlog_closedir"
 
 ///|
+/// Number of buffered bytes at which an append is flushed to the descriptor.
+const WRITE_BUFFER_LIMIT : Int32 = 65536
+
+///|
 /// Native file-backed append-only log. A single open file descriptor serves
-/// both writing (append) and random-access reading.
+/// both writing (append) and random-access reading. Appends accumulate in a
+/// small in-memory buffer coalesced into fewer `pwrite` calls; the buffer is
+/// drained before any read, `flush`, `truncate` or `close`.
 pub(all) struct NativeFileLog {
   fd : Int32
   path : Bytes
   mut size : Int64
+  mut flushed : Int64
+  mut pending : Bytes
   mut closed : Bool
 }
 
@@ -67,7 +75,7 @@ pub fn NativeFileLog::open(path : String) -> NativeFileLog raise @io.IoError {
     raise @io.IoError::Syscall(fd)
   }
   let size = moonlog_size(fd)
-  { fd, path: bytes, size, closed: false, }
+  { fd, path: bytes, size, flushed: size, pending: b"", closed: false, }
 }
 
 ///|
@@ -81,16 +89,39 @@ pub fn NativeFileLog::open_readonly(
     raise @io.IoError::Syscall(fd)
   }
   let size = moonlog_size(fd)
-  { fd, path: bytes, size, closed: false, }
+  { fd, path: bytes, size, flushed: size, pending: b"", closed: false, }
 }
 
 ///|
 /// Close the underlying file descriptor. Idempotent.
 pub fn NativeFileLog::close(self : NativeFileLog) -> Unit {
   if !self.closed {
+    ignore(self.write_pending() catch { _ => () })
     ignore(moonlog_close(self.fd))
     self.closed = true
   }
+}
+
+///|
+/// Write any buffered bytes to the descriptor (no fsync). Idempotent.
+fn NativeFileLog::write_pending(self : NativeFileLog) -> Unit raise @io.IoError {
+  let data = self.pending
+  if data.length() == 0 {
+    return
+  }
+  let n = moonlog_pwrite(self.fd, self.flushed, data)
+  if n < 0 {
+    raise @io.IoError::Syscall(n)
+  }
+  self.flushed = self.flushed + n.to_int64()
+  self.pending = b""
+}
+
+///|
+/// Flush buffered bytes to the file (without fsync) so the on-disk size matches
+/// the logical size; used before writing metadata sidecars.
+pub fn NativeFileLog::drain(self : NativeFileLog) -> Unit raise @io.IoError {
+  self.write_pending()
 }
 
 ///|
@@ -152,11 +183,19 @@ pub impl @io.LogWriter for NativeFileLog with fn append(self, chunk) {
   if self.closed {
     raise @io.IoError::Closed
   }
-  let n = moonlog_pwrite(self.fd, self.size, chunk)
-  if n < 0 {
-    raise @io.IoError::Syscall(n)
+  if self.pending.length() == 0 && chunk.length() >= WRITE_BUFFER_LIMIT {
+    let n = moonlog_pwrite(self.fd, self.flushed, chunk)
+    if n < 0 {
+      raise @io.IoError::Syscall(n)
+    }
+    self.flushed = self.flushed + n.to_int64()
+  } else {
+    self.pending = self.pending + chunk
+    if self.pending.length() >= WRITE_BUFFER_LIMIT {
+      self.write_pending()
+    }
   }
-  self.size = self.size + n.to_int64()
+  self.size = self.size + chunk.length().to_int64()
   self.size
 }
 
@@ -165,6 +204,7 @@ pub impl @io.LogWriter for NativeFileLog with fn flush(self) {
   if self.closed {
     raise @io.IoError::Closed
   }
+  self.write_pending()
   let r = moonlog_fsync(self.fd)
   if r < 0 {
     raise @io.IoError::Syscall(r)
@@ -176,6 +216,7 @@ pub impl @io.LogReader for NativeFileLog with fn read_at(self, offset, len) {
   if self.closed {
     raise @io.IoError::Closed
   }
+  self.write_pending()
   if offset < (0 : Int64) || offset + len.to_int64() > self.size {
     raise @io.IoError::OutOfBounds(offset)
   }
@@ -192,11 +233,13 @@ pub impl @io.LogTruncate for NativeFileLog with fn truncate(self, size) {
   if self.closed {
     raise @io.IoError::Closed
   }
+  self.pending = b""
   let r = moonlog_truncate(self.fd, size)
   if r < 0 {
     raise @io.IoError::Syscall(r)
   }
   self.size = size
+  self.flushed = size
 }
 
 ///|
@@ -516,6 +559,7 @@ pub fn flush_meta(
   let n = log.segments.length()
   let mut i = 0
   for seg in log.segments {
+    seg.writer.drain()
     let is_active = i == n - 1
     if !is_active && !seg.has_checksum() {
       seg.set_checksum(seg.compute_checksum())

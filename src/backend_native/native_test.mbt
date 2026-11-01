@@ -603,3 +603,36 @@ test "flush_meta records segment checksums and verify detects tampering" {
   }
   clean_dir(dir)
 }
+
+///|
+test "append buffers writes and reads drain them before flushing" {
+  let dir = "/tmp/moonlog_write_buffer"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 10; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  // The records are still buffered; reads must still see them.
+  let recs = log.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 10)
+  assert_eq(recs[9].value, b"value")
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 10)
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

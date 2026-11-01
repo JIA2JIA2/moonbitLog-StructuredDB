@@ -230,6 +230,7 @@ u32 crc32          (仅覆盖 body)
 - M39 有序 key 索引：`KeyIndex` 维护按字节排序的 live key 列表，`scan_prefix` / `scan_key_range` 改为二分定位 + 点查（不再全量扫段 + 排序）
 - M40 多键批量点查：`Log::get_many` 一次返回多个 key 的最新 live 记录（共享一次索引扫描）；CLI `get-many`
 - M41 逆序扫描与 tail：`Log::scan_reverse` 按 offset 降序返回区间记录，`Log::tail` 返回最近 n 条（按 append 顺序）；CLI `tail`
+- M42 缓冲写合并：`NativeFileLog` 把小追加合并成更少的 `pwrite`；读取 / flush / truncate / close 与写元数据前先 drain，写命令返回时文件大小与逻辑大小一致
 
 ## 许可
 

@@ -37,6 +37,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Reverse scans and tail (M41)**：`Log::scan_reverse` returns a range newest
   first, and `Log::tail` returns the most recent `n` records in append order;
   exposed as the `tail` CLI command.
+- **Buffered appends (M42)**：`NativeFileLog` coalesces small appends into fewer
+  `pwrite` calls. The buffer is drained before reads, `flush`, `truncate`,
+  `close`, and before metadata is written, so the on-disk size matches the
+  logical size once a write command returns.
 
 ## 0.2.0 - 2026-10-31
 
