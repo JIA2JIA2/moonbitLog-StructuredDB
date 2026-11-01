@@ -25,6 +25,7 @@
 ///   cursor-drop <dir> <name>         delete a named consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
+///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
@@ -42,7 +43,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|scan|scan-prefix|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -415,6 +416,20 @@ fn cmd_cursor_drop(dir : String, name : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Report whether a key is currently live, using segment Bloom filters to skip
+/// segments that cannot contain it.
+fn cmd_has_key(dir : String, key : String) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    match log.get_latest_bloom(@utf8.encode(key)) {
+      Some(_) => println("present")
+      None => println("absent")
+    }
+    close_log(log)
+  })
+}
+
+///|
 fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -576,6 +591,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_getkey_live(args[2], args[3], args[4])
+    }
+  } else if cmd == "has-key" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_has_key(args[2], args[3])
     }
   } else if cmd == "compact" {
     cmd_compact(args[2])

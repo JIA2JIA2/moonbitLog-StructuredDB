@@ -212,3 +212,51 @@ pub fn[W, R : @io.LogReader] Log::scan_prefix(
   out.sort_by(fn(a, b) { bytes_cmp(a.key, b.key) })
   out
 }
+
+///|
+/// The last record for `key` within a single segment (latest offset wins),
+/// whether a put or a tombstone.
+fn[W, R : @io.LogReader] latest_key_in_segment(
+  seg : @segment.Segment[W, R],
+  key : Bytes,
+) -> @core.Record? raise @io.IoError {
+  let recs = seg.scan()
+  let mut found : @core.Record? = None
+  for rec in recs {
+    if rec.key == key {
+      match found {
+        Some(prev) => if rec.offset > prev.offset { found = Some(rec) }
+        None => found = Some(rec)
+      }
+    }
+  }
+  found
+}
+
+///|
+/// Latest live record for `key`, using each segment's Bloom filter to skip
+/// segments that cannot contain it. Scans newest segment first; a tombstone in
+/// the admitting segment means the key is gone. Correct regardless of filter
+/// false positives (which merely cause an extra scan).
+pub fn[W, R : @io.LogReader] Log::get_latest_bloom(
+  self : Log[W, R],
+  key : Bytes,
+) -> @core.Record? raise @io.IoError {
+  let mut i = self.segments.length() - 1
+  while i >= 0 {
+    let seg = self.segments[i]
+    if seg.may_contain(key) {
+      match latest_key_in_segment(seg, key) {
+        Some(rec) =>
+          if rec.is_delete() {
+            return (None : @core.Record?)
+          } else {
+            return Some(rec)
+          }
+        None => ()
+      }
+    }
+    i = i - 1
+  }
+  (None : @core.Record?)
+}

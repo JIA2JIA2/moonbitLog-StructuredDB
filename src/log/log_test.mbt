@@ -715,3 +715,30 @@ test "scan_prefix returns sorted live keys under a prefix" {
   assert_eq(all[0].key, b"order:1")
   assert_eq(all[1].key, b"user:2")
 }
+
+///|
+test "get_latest_bloom matches the key index view" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"b", (3 : Int64)) catch { _ => panic() })
+  let a = log.get_latest_bloom(b"a") catch { _ => panic() }
+  match a {
+    Some(rec) => assert_eq(rec.value, b"3")
+    None => panic()
+  }
+  let b = log.get_latest_bloom(b"b") catch { _ => panic() }
+  match b {
+    Some(_) => panic()
+    None => ()
+  }
+  let missing = log.get_latest_bloom(b"never-inserted") catch { _ => panic() }
+  match missing {
+    Some(_) => panic()
+    None => ()
+  }
+}

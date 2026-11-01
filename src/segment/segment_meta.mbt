@@ -21,13 +21,14 @@ pub(all) struct SegmentMeta {
   size : Int64
   interval : Int32
   entries : Array[IndexEntry]
+  bloom : BloomFilter
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 1
+const SEGMENT_META_VERSION : UInt32 = 2
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -75,6 +76,9 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
     body.write_uint64_le(e.record_index)
     body.write_int64_le(e.position)
   }
+  let bloom = self.bloom.to_bytes()
+  body.write_uint_le(meta_i32_count(bloom.length()))
+  body.write_bytes(bloom)
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -92,7 +96,7 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     raise @core.MetaError::BadMagic
   }
   let version = meta_u32(data, 4)
-  if version != SEGMENT_META_VERSION {
+  if version != 1 && version != SEGMENT_META_VERSION {
     raise @core.MetaError::BadVersion(version)
   }
   let body_end = total - 4
@@ -121,7 +125,20 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     pos = pos + 16
     i = i + 1
   }
-  { base_offset, next_offset, record_count, size, interval, entries, }
+  let bloom = if version >= 2 {
+    if pos + 4 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    let blen = meta_u32(data, pos).reinterpret_as_int()
+    let bstart = pos + 4
+    if bstart + blen > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    BloomFilter::of_bytes(@core.slice(data, bstart, bstart + blen), true)
+  } else {
+    BloomFilter::disabled()
+  }
+  { base_offset, next_offset, record_count, size, interval, entries, bloom, }
 }
 
 ///|
@@ -134,6 +151,7 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     size: self.size,
     interval: self.index.interval,
     entries: self.index.entries,
+    bloom: self.bloom,
   }
 }
 
@@ -152,5 +170,6 @@ pub fn[W, R] Segment::apply_meta(
   for e in meta.entries {
     self.index.push(e.record_index, e.position)
   }
+  self.bloom = meta.bloom
   self.meta_loaded = true
 }

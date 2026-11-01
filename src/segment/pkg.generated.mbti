@@ -14,6 +14,18 @@ pub fn segment_file_name(UInt64) -> String
 // Errors
 
 // Types and methods
+pub(all) struct BloomFilter {
+  bits : Array[Byte]
+  hashes : Int32
+  enabled : Bool
+}
+pub fn BloomFilter::add(Self, Bytes) -> Unit
+pub fn BloomFilter::disabled() -> Self
+pub fn BloomFilter::may_contain(Self, Bytes) -> Bool
+pub fn BloomFilter::new() -> Self
+pub fn BloomFilter::of_bytes(Bytes, Bool) -> Self
+pub fn BloomFilter::to_bytes(Self) -> Bytes
+
 pub(all) struct IndexEntry {
   record_index : UInt64
   position : Int64
@@ -27,6 +39,7 @@ pub(all) struct Segment[W, R] {
   mut record_count : Int32
   mut size : Int64
   mut index : SparseIndex
+  mut bloom : BloomFilter
   mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
@@ -36,6 +49,7 @@ pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
+pub fn[W, R] Segment::may_contain(Self[W, R], Bytes) -> Bool
 pub fn[W, R] Segment::new(W, R, UInt64) -> Self[W, R]
 pub fn[W, R] Segment::new_with_index_interval(W, R, UInt64, Int32) -> Self[W, R]
 pub fn[W, R : @io.LogReader] Segment::read_raw(Self[W, R], Int64, Int32) -> Bytes raise @io.IoError
@@ -52,6 +66,7 @@ pub(all) struct SegmentMeta {
   size : Int64
   interval : Int32
   entries : Array[IndexEntry]
+  bloom : BloomFilter
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 

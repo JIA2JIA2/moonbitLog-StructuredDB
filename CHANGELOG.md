@@ -10,6 +10,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Key prefix scan (M33)**：`Log::scan_prefix` returns the latest live record
   for every key matching a byte prefix, sorted by key; exposed as the
   `scan-prefix` CLI command.
+- **Segment Bloom filters (M34)**：each segment carries a Bloom filter over its
+  keys, persisted in `.index` (metadata v2, v1 still readable as a disabled
+  filter). `Log::get_latest_bloom` skips segments that cannot contain a key;
+  the `has-key` CLI command uses it.
 
 ## 0.2.0 - 2026-10-31
 

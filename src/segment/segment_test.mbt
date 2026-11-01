@@ -367,3 +367,15 @@ test "scan reads values larger than the read chunk" {
     None => panic()
   }
 }
+
+///|
+test "segment meta round-trips the bloom filter" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  ignore(seg.append(b"hello", b"v", (0 : Int64)) catch { _ => panic() })
+  let meta = seg.to_meta()
+  let decoded = @segment.decode_segment_meta(meta.encode()) catch {
+    _ => panic()
+  }
+  assert_true(decoded.bloom.may_contain(b"hello"))
+  assert_true(!decoded.bloom.may_contain(b"key-that-was-never-inserted-abcdef"))
+}

@@ -14,6 +14,7 @@ pub(all) struct Segment[W, R] {
   mut record_count : Int32
   mut size : Int64
   mut index : SparseIndex
+  mut bloom : BloomFilter
   mut meta_loaded : Bool
 }
 
@@ -51,6 +52,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     record_count: 0,
     size: 0,
     index: SparseIndex::new(index_interval),
+    bloom: BloomFilter::new(),
     meta_loaded: false,
   }
 }
@@ -59,6 +61,13 @@ pub fn[W, R] Segment::new_with_index_interval(
 /// The sparse-index interval in effect for this segment.
 pub fn[W, R] Segment::index_interval(self : Segment[W, R]) -> Int32 {
   self.index.interval
+}
+
+///|
+/// Whether this segment *might* contain `key`, per its Bloom filter. A `false`
+/// result is conclusive; `true` only means a real lookup is still required.
+pub fn[W, R] Segment::may_contain(self : Segment[W, R], key : Bytes) -> Bool {
+  self.bloom.may_contain(key)
 }
 
 ///|
@@ -78,6 +87,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   let rec : @core.Record = { offset, timestamp, kind, key, value, }
   let bytes = rec.encode()
   ignore(self.writer.append(bytes))
+  self.bloom.add(key)
   self.next_offset = offset + (1 : UInt64)
   self.record_count = self.record_count + 1
   self.size = self.size + bytes.length().to_int64()
@@ -258,6 +268,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self : Segment[W, R],
 ) -> Int32 raise @io.IoError {
   self.index.reset()
+  self.bloom = BloomFilter::new()
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -266,7 +277,8 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
     let loaded = self.load_record_at(pos)
     match loaded {
       None => go = false
-      Some((_rec, next)) => {
+      Some((rec, next)) => {
+        self.bloom.add(rec.key)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
         }
@@ -292,6 +304,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self : Segment[W, R],
 ) -> Int32 raise @io.IoError {
   self.index.reset()
+  self.bloom = BloomFilter::new()
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -309,6 +322,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
           any = true
         }
         last = rec.offset
+        self.bloom.add(rec.key)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
         }

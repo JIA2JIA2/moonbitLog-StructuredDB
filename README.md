@@ -68,6 +68,7 @@ moonlog <command> <dir> [args...]
   cursor-drop <dir> <name>      删除命名消费游标位置
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
+  has-key <dir> <key>           用段级 Bloom 过滤判断 key 是否存在
   export <dir> <file>           导出全部记录（含 tombstone）到可移植文件
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
@@ -87,7 +88,7 @@ stats <dir>                   打印记录/段计数
 | `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `get_latest_at` / `scan_live` / `scan_prefix` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / 前缀扫描 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `scan_live` / `scan_prefix` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 前缀扫描 / 折叠 live 记录 / 原地重写 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
@@ -174,7 +175,7 @@ u32 crc32          (仅覆盖 body)
 
 ### 持久化元数据（M8）
 
-- 每个段旁挂 `<name>.log.index`：保存该段计数与稀疏索引快照（含 CRC32），重开时可直接恢复，无需扫描数据。
+- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照与该段 key 的 Bloom 过滤器（含 CRC32），重开时可直接恢复，无需扫描数据。
 - 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（每段的 `base_offset` 与 `byte_size`，整体附 CRC32）。打开时据此校验每个段文件的真实大小，不符则回退全量恢复。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
 - 元数据（`MANIFEST` 与每段 `.index`）以**原子替换**落盘：写入 `<name>.tmp` → fsync → `rename` 覆盖 → fsync 目录。进程在任意时刻崩溃只会留下旧版或新版，不会出现半写文件。
@@ -219,6 +220,7 @@ u32 crc32          (仅覆盖 body)
 - M31 审阅修复：`Log::flush` 刷所有段、`import_bytes` 批量落盘、CLI 支持 `MOONLOG_SYNC=batch`
 - M32 审阅修复：CLI 默认 `MOONLOG_SYNC=always`（命令返回即落盘），并明确 `import` 的 offset 语义
 - M33 key 前缀扫描：`Log::scan_prefix` 与 CLI `scan-prefix`（结果按 key 排序）
+- M34 段级 Bloom 过滤：`BloomFilter` 持久化进 `.index`（meta v2），`Log::get_latest_bloom` 跳过不可能含 key 的段；CLI `has-key`
 
 ## 许可
 
