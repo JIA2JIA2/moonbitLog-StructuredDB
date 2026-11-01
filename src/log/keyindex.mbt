@@ -1,8 +1,8 @@
 ///|
 /// A point-in-time key -> latest-offset index built from a log scan. Keys are
-/// interpreted as UTF-8; tombstones remove keys, so only live puts remain.
+/// raw bytes (binary-safe); tombstones remove keys, so only live puts remain.
 pub(all) struct KeyIndex {
-  entries : @hashmap.HashMap[String, UInt64]
+  entries : @hashmap.HashMap[Bytes, UInt64]
 }
 
 ///|
@@ -13,7 +13,7 @@ pub fn KeyIndex::new() -> KeyIndex {
 ///|
 /// Offset of the latest live record for `key`, if any.
 pub fn KeyIndex::latest(self : KeyIndex, key : Bytes) -> UInt64? {
-  self.entries.get(@utf8.decode_lossy(key))
+  self.entries.get(key)
 }
 
 ///|
@@ -24,12 +24,12 @@ pub fn KeyIndex::size(self : KeyIndex) -> Int32 {
 
 ///|
 fn KeyIndex::put(self : KeyIndex, key : Bytes, offset : UInt64) -> Unit {
-  self.entries.set(@utf8.decode_lossy(key), offset)
+  self.entries.set(key, offset)
 }
 
 ///|
 fn KeyIndex::drop(self : KeyIndex, key : Bytes) -> Unit {
-  self.entries.remove(@utf8.decode_lossy(key))
+  self.entries.remove(key)
 }
 
 ///|
@@ -191,6 +191,24 @@ fn bytes_cmp(a : Bytes, b : Bytes) -> Int32 {
 }
 
 ///|
+/// Whether `a` begins with the byte prefix `b` (binary-safe; an empty `b`
+/// matches everything).
+fn bytes_starts_with(a : Bytes, b : Bytes) -> Bool {
+  let bn = b.length()
+  if bn > a.length() {
+    return false
+  }
+  let mut i = 0
+  while i < bn {
+    if a.at(i).to_int() != b.at(i).to_int() {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 /// The latest live record for every key that begins with `prefix`, sorted
 /// ascending by key bytes. Tombstoned keys are excluded; superseded puts lose
 /// to the newest one.
@@ -199,10 +217,9 @@ pub fn[W, R : @io.LogReader] Log::scan_prefix(
   prefix : Bytes,
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
-  let p = @utf8.decode_lossy(prefix)
   let out : Array[@core.Record] = []
   self.for_each((0 : UInt64), self.next_offset, rec => {
-    if !rec.is_delete() && @utf8.decode_lossy(rec.key).has_prefix(p) {
+    if !rec.is_delete() && bytes_starts_with(rec.key, prefix) {
       match index.latest(rec.key) {
         Some(off) => if off == rec.offset { out.push(rec) }
         None => ()

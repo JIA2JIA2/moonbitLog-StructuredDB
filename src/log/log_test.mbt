@@ -813,3 +813,40 @@ test "scan_key_range upper bound is exclusive at an exact key" {
   assert_eq(only2.length(), 1)
   assert_eq(only2[0].key, b"user:2")
 }
+
+///|
+test "key index is binary-safe for keys with invalid utf8 bytes" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"\xff", b"ff", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"\xfe", b"fe", (1 : Int64)) catch { _ => panic() })
+  let idx = log.build_key_index() catch { _ => panic() }
+  assert_eq(idx.size(), 2)
+  let ff = log.get_latest(idx, b"\xff") catch { _ => panic() }
+  match ff {
+    Some(rec) => assert_eq(rec.value, b"ff")
+    None => panic()
+  }
+  let fe = log.get_latest(idx, b"\xfe") catch { _ => panic() }
+  match fe {
+    Some(rec) => assert_eq(rec.value, b"fe")
+    None => panic()
+  }
+}
+
+///|
+test "scan_prefix matches raw bytes rather than lossy text" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"\xff\x01", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"\xfe\x01", b"b", (1 : Int64)) catch { _ => panic() })
+  let recs = log.scan_prefix(b"\xff") catch { _ => panic() }
+  assert_eq(recs.length(), 1)
+  assert_eq(recs[0].key, b"\xff\x01")
+  let none = log.scan_prefix(b"\x00") catch { _ => panic() }
+  assert_eq(none.length(), 0)
+}

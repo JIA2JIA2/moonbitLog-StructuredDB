@@ -4,7 +4,6 @@ import {
   "moonlog/lsdb/src/segment",
   "moonbitlang/core/buffer",
   "moonbitlang/core/hashmap",
-  "moonbitlang/core/encoding/utf8",
 }
 
 import {

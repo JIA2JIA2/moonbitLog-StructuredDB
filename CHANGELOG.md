@@ -21,6 +21,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Key range scan (M36)**：`Log::scan_key_range` returns the latest live record
   for every key in the half-open range `[lo, hi)`, sorted by key bytes (an empty
   `hi` is unbounded above); exposed as the `scan-range` CLI command.
+- **Binary-safe key index (M37)**：the key index now keys on raw key bytes rather
+  than a lossy UTF-8 decoding, so distinct binary keys can no longer collapse
+  into one another; `scan_prefix` likewise matches raw bytes.
 
 ## 0.2.0 - 2026-10-31
 

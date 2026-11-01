@@ -225,6 +225,7 @@ u32 crc32          (仅覆盖 body)
 - M34 段级 Bloom 过滤：`BloomFilter` 持久化进 `.index`（meta v2），`Log::get_latest_bloom` 跳过不可能含 key 的段；CLI `has-key`
 - M35 时间范围查询：段级 min/max timestamp 持久化进 `.index`（meta v3），`Log::scan_time_range` 跳过无重叠段；CLI `scan-time`
 - M36 key 区间扫描：`Log::scan_key_range` 按 `[lo, hi)` 返回每个 live key 的最新记录（按 key 排序，空 `hi` 表示无上界）；CLI `scan-range`
+- M37 二进制安全 key 索引：`KeyIndex` 改以 key 原始字节为键（此前用有损 `utf8.decode_lossy`，非法 UTF-8 的不同 key 会塌缩冲突），`scan_prefix` 改按原始字节匹配；新增回归测试
 
 ## 许可
 

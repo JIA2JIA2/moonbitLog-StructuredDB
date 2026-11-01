@@ -27,7 +27,7 @@ pub fn ConsumerCursor::position(Self) -> UInt64
 pub fn ConsumerCursor::seek(Self, UInt64) -> Unit
 
 pub(all) struct KeyIndex {
-  entries : @hashmap.HashMap[String, UInt64]
+  entries : @hashmap.HashMap[Bytes, UInt64]
 }
 pub fn KeyIndex::latest(Self, Bytes) -> UInt64?
 pub fn KeyIndex::new() -> Self
