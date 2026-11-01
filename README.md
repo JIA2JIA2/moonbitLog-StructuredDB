@@ -228,6 +228,7 @@ u32 crc32          (仅覆盖 body)
 - M37 二进制安全 key 索引：`KeyIndex` 改以 key 原始字节为键（此前用有损 `utf8.decode_lossy`，非法 UTF-8 的不同 key 会塌缩冲突），`scan_prefix` 改按原始字节匹配；新增回归测试
 - M38 段数据校验和：已 roll 段在 `.index` 记录整段数据 CRC32（meta v4，旧版本读为未校验）；`Log::verify` 报告首个校验和不符的段（`VerifyReport::first_bad_checksum`）
 - M39 有序 key 索引：`KeyIndex` 维护按字节排序的 live key 列表，`scan_prefix` / `scan_key_range` 改为二分定位 + 点查（不再全量扫段 + 排序）
+- M40 多键批量点查：`Log::get_many` 一次返回多个 key 的最新 live 记录（共享一次索引扫描）；CLI `get-many`
 
 ## 许可
 

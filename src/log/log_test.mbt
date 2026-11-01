@@ -873,3 +873,29 @@ test "verify reports a segment checksum mismatch" {
     None => panic()
   }
 }
+
+///|
+test "get_many returns latest live records in input order" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"3", (2 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"b", (3 : Int64)) catch { _ => panic() })
+  let recs = log.get_many([b"a", b"b", b"missing"]) catch { _ => panic() }
+  assert_eq(recs.length(), 3)
+  match recs[0] {
+    Some(rec) => assert_eq(rec.value, b"3")
+    None => panic()
+  }
+  match recs[1] {
+    Some(_) => panic()
+    None => ()
+  }
+  match recs[2] {
+    Some(_) => panic()
+    None => ()
+  }
+}

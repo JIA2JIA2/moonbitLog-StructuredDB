@@ -75,6 +75,21 @@ pub fn[W, R : @io.LogReader] Log::get_latest(
 }
 
 ///|
+/// The latest live record for each of `keys`, in the same order. Builds the key
+/// index once so looking up many keys shares a single log scan.
+pub fn[W, R : @io.LogReader] Log::get_many(
+  self : Log[W, R],
+  keys : Array[Bytes],
+) -> Array[@core.Record?] raise @io.IoError {
+  let index = self.build_key_index()
+  let out : Array[@core.Record?] = []
+  for k in keys {
+    out.push(self.get_latest(index, k))
+  }
+  out
+}
+
+///|
 /// Compacted logical view: for each live key, its latest put, with offsets
 /// renumbered from 0. Writing these records to a fresh log yields an
 /// equivalent but smaller log.

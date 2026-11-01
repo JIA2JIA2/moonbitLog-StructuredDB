@@ -31,6 +31,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Sorted key index (M39)**：`build_key_index` now keeps its live keys in byte
   order, so `scan_prefix` / `scan_key_range` binary-search the range and
   point-look-up the matching records instead of re-scanning the log and sorting.
+- **Batch point lookups (M40)**：`Log::get_many` returns the latest live record
+  for each of several keys in one call (sharing a single index scan); exposed as
+  the `get-many` CLI command.
 
 ## 0.2.0 - 2026-10-31
 

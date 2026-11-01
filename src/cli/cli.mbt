@@ -26,6 +26,7 @@
 ///   cursor-list <dir>                list named consumer positions
 ///   cursor-drop <dir> <name>         delete a named consumer position
 ///   getkey <dir> <key>               fetch the latest value for a key
+///   get-many <dir> <key> ...         fetch the latest value for several keys
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
 ///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
@@ -45,7 +46,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -506,6 +507,28 @@ fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Latest live value for each of several keys, in the given order.
+fn cmd_get_many(dir : String, keys : Array[String]) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let encoded : Array[Bytes] = []
+    for k in keys {
+      encoded.push(@utf8.encode(k))
+    }
+    let recs = log.get_many(encoded)
+    let mut i = 0
+    for rec in recs {
+      match rec {
+        Some(r) => print_record(r)
+        None => println(bytes_to_string(encoded[i]) + ": not found")
+      }
+      i = i + 1
+    }
+    close_log(log)
+  })
+}
+
+///|
 /// Latest live value for `key`, treating records older than `ttl` ms as gone.
 fn cmd_getkey_live(
   dir : String,
@@ -667,6 +690,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_getkey_live(args[2], args[3], args[4])
+    }
+  } else if cmd == "get-many" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let keys : Array[String] = []
+      let mut i = 3
+      while i < args.length() {
+        keys.push(args[i])
+        i = i + 1
+      }
+      cmd_get_many(args[2], keys)
     }
   } else if cmd == "has-key" {
     if args.length() < 4 {
