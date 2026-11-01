@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -265,4 +266,12 @@ MOONBIT_FFI_EXPORT
 int32_t moonlog_flock(int32_t fd, int32_t exclusive) {
   int op = exclusive ? LOCK_EX : LOCK_SH;
   return (int32_t)flock(fd, op | LOCK_NB);
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_sleep_ms(int32_t ms) {
+  struct timespec ts;
+  ts.tv_sec = ms / 1000;
+  ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+  return (int32_t)nanosleep(&ts, NULL);
 }

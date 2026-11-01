@@ -905,6 +905,9 @@ pub fn remove_named_cursor(dir : String, name : String) -> Unit {
 extern "C" fn moonlog_flock(fd : Int32, exclusive : Int32) -> Int32 = "moonlog_flock"
 
 ///|
+extern "C" fn moonlog_sleep_ms(ms : Int32) -> Int32 = "moonlog_sleep_ms"
+
+///|
 /// A directory-level advisory lock (via `flock`) used to serialize writers.
 /// Acquisition is non-blocking, so a conflicting holder fails fast instead of
 /// dead-locking.
@@ -940,4 +943,36 @@ pub fn DirLock::release(self : DirLock) -> Unit {
     ignore(moonlog_close(self.fd))
     self.held = false
   }
+}
+
+///|
+/// Like `acquire`, but retries a busy lock in small steps for up to `timeout_ms`
+/// milliseconds before failing. This lets concurrent writers queue instead of
+/// failing fast.
+pub fn DirLock::acquire_timeout(
+  dir : String,
+  exclusive : Bool,
+  timeout_ms : Int32,
+) -> DirLock raise @io.IoError {
+  let path = dir + "/LOCK"
+  let fd = moonlog_open_rw(@utf8.encode(path))
+  if fd < 0 {
+    raise @io.IoError::Syscall(fd)
+  }
+  let flag = if exclusive { 1 } else { 0 }
+  let step = 5
+  let mut waited = 0
+  let mut ok = false
+  while !ok {
+    if moonlog_flock(fd, flag) >= 0 {
+      ok = true
+    } else if waited >= timeout_ms {
+      ignore(moonlog_close(fd))
+      raise @io.IoError::Syscall(-1)
+    } else {
+      ignore(moonlog_sleep_ms(step))
+      waited = waited + step
+    }
+  }
+  { fd, held: true, }
 }

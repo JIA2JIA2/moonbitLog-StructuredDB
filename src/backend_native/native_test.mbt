@@ -734,3 +734,24 @@ test "flush_meta persists the key index and reopen reads it back" {
   }
   clean_dir(dir)
 }
+
+///|
+test "acquire_timeout retries a busy lock and fails on timeout" {
+  let dir = "/tmp/moonlog_lock_timeout"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let held = @backend_native.DirLock::acquire(dir, true) catch { _ => panic() }
+  let mut raised = false
+  try {
+    let _ = @backend_native.DirLock::acquire_timeout(dir, true, (30 : Int32))
+  } catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+  held.release()
+  let again = @backend_native.DirLock::acquire_timeout(dir, true, (30 : Int32)) catch {
+    _ => panic()
+  }
+  again.release()
+  clean_dir(dir)
+}

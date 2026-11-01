@@ -110,14 +110,29 @@ fn close_log(log : CliLog) -> Unit {
 }
 
 ///|
-/// Run `action` while holding the directory lock (exclusive for writers).
+/// How long a CLI invocation waits for a busy directory lock before failing.
+/// Overridable with `MOONLOG_LOCK_TIMEOUT` (milliseconds); defaults to 5000.
+fn lock_timeout_ms() -> Int32 {
+  match @env.get_env_var("MOONLOG_LOCK_TIMEOUT") {
+    Some(v) => @string.parse_int(v) catch { _ => 5000 }
+    None => 5000
+  }
+}
+
+///|
+/// Run `action` while holding the directory lock (exclusive for writers). Waits
+/// up to `lock_timeout_ms()` for a busy lock so concurrent writers can queue.
 fn run_locked(
   dir : String,
   exclusive : Bool,
   action : () -> Unit raise @io.IoError,
 ) -> Unit raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  let lock = @backend_native.DirLock::acquire(dir, exclusive)
+  let lock = @backend_native.DirLock::acquire_timeout(
+    dir,
+    exclusive,
+    lock_timeout_ms(),
+  )
   action()
   lock.release()
 }

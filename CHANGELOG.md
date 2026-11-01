@@ -25,6 +25,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   segments every record of which a later record supersedes (same-key put or
   tombstone), reclaiming space without renumbering offsets; exposed as the
   `prune-superseded` CLI command.
+- **Lock timeouts (M52)**：`DirLock::acquire_timeout` retries a busy `flock` for a
+  bounded time (new `nanosleep` stub) so concurrent writers queue instead of
+  failing fast; the CLI waits up to `MOONLOG_LOCK_TIMEOUT` ms (default 5000).
 
 ## 0.3.0 - 2026-11-01
 
