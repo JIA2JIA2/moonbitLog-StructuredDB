@@ -18,8 +18,49 @@ test "property: randomized ops match an in-memory model" {
   ]
   let model : Array[Bytes?] = Array::make(16, (None : Bytes?))
   let mut x : UInt64 = 0x9E3779B97F4A7C15
+  let count_live = fn() -> Int32 {
+    let mut n = 0
+    for i = 0; i < 16; i = i + 1 {
+      match model[i] {
+        Some(_) => n = n + 1
+        None => ()
+      }
+    }
+    n
+  }
+  let check_views = fn() -> Unit raise {
+    let expect = count_live()
+    let snaps = log.snapshot() catch { _ => panic() }
+    assert_eq(snaps.length(), expect)
+    for rec in snaps {
+      let mut matched = false
+      for i = 0; i < 16; i = i + 1 {
+        if keys[i] == rec.key {
+          matched = true
+          match model[i] {
+            Some(v) => assert_eq(rec.value, v)
+            None => panic()
+          }
+        }
+      }
+      assert_true(matched)
+    }
+    let live = log.scan_live((1_000_000 : Int64), (1_000_000_000_000 : Int64)) catch {
+      _ => panic()
+    }
+    assert_eq(live.length(), expect)
+    let pref = log.scan_prefix(b"k") catch { _ => panic() }
+    assert_eq(pref.length(), expect)
+    let rng = log.scan_key_range(b"", b"") catch { _ => panic() }
+    assert_eq(rng.length(), expect)
+  }
   let mut step = 0
   while step < 400 {
+    if step % 40 == 39 {
+      check_views() catch {
+        _ => panic()
+      }
+    }
     x = x ^ (x << 13)
     x = x ^ (x >> 7)
     x = x ^ (x << 17)
@@ -50,6 +91,9 @@ test "property: randomized ops match an in-memory model" {
       }
     }
     step = step + 1
+  }
+  check_views() catch {
+    _ => panic()
   }
   let idx = log.build_key_index()
   for i = 0; i < 16; i = i + 1 {

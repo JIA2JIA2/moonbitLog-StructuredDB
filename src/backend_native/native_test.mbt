@@ -960,7 +960,7 @@ test "property: native randomized ops with crash injection match the model" {
           }
         None =>
           match got {
-            Some(rec) => {
+            Some(_) => {
               println("EXTRA ki=" + i.to_string())
               panic()
             }
@@ -968,6 +968,16 @@ test "property: native randomized ops with crash injection match the model" {
           }
       }
     }
+    // Cross-check the folded live view on the file backend too.
+    let mut expect = 0
+    for i = 0; i < 16; i = i + 1 {
+      match model[i] {
+        Some(_) => expect = expect + 1
+        None => ()
+      }
+    }
+    let snaps = l.snapshot() catch { _ => panic() }
+    assert_eq(snaps.length(), expect)
   }
   let mut x : UInt64 = 0xDEADBEEFCAFEBABE
   let mut step = 0
