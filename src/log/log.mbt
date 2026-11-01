@@ -493,6 +493,24 @@ pub fn[W, R : @io.LogReader] Log::prune_superseded(
 }
 
 ///|
+/// Number of rolled-over segments that `prune_superseded` would drop.
+pub fn[W, R : @io.LogReader] Log::count_superseded(
+  self : Log[W, R],
+  index : KeyIndex,
+) -> Int32 raise @io.IoError {
+  let n = self.segments.length()
+  let mut count = 0
+  let mut i = 0
+  while i < n {
+    if i < n - 1 && segment_all_superseded(self.segments[i], index) {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  count
+}
+
+///|
 /// Retention by timestamp: drop every rolled-over segment whose last record is
 /// older than `cutoff`, invoking `on_drop` for each. Assumes timestamps are
 /// non-decreasing across the log (the usual append-only event ordering); the

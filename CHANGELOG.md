@@ -28,6 +28,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Lock timeouts (M52)**：`DirLock::acquire_timeout` retries a busy `flock` for a
   bounded time (new `nanosleep` stub) so concurrent writers queue instead of
   failing fast; the CLI waits up to `MOONLOG_LOCK_TIMEOUT` ms (default 5000).
+- **CLI dry-run and batched keys (M53)**：`compress` and `prune-superseded`
+  accept `dry-run` (reporting counts via `count_compressible_segments` /
+  `Log::count_superseded` without changing anything); `get-many` also accepts
+  `--keys <file>` to read newline-separated keys.
 
 ## 0.3.0 - 2026-11-01
 

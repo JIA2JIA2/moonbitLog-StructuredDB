@@ -808,6 +808,29 @@ pub fn compress_log_dir(
 }
 
 ///|
+/// Number of rolled-over (non-active) segments that `compress_log_dir` would
+/// compress, without modifying anything.
+pub fn count_compressible_segments(
+  dir : String,
+  roll_size : Int64,
+) -> Int32 raise @io.IoError {
+  let log = open_log_dir(dir, roll_size)
+  let n = log.segment_count()
+  let mut count = 0
+  let mut i = 0
+  while i < n {
+    if i < n - 1 && !log.segments[i].is_compressed() {
+      count = count + 1
+    }
+    i = i + 1
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  count
+}
+
+///|
 /// Name of the default consumer-cursor position file.
 pub const CURSOR_NAME : String = "CURSOR"
 

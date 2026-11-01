@@ -494,16 +494,21 @@ fn cmd_prune_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
 ///|
 /// Drop rolled-over segments whose records have all been superseded by later
 /// records for the same key (no live data is lost).
-fn cmd_prune_superseded(dir : String) -> Unit raise @io.IoError {
+fn cmd_prune_superseded(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
     let index = log.build_key_index()
-    let dropped = log.prune_superseded(index, seg => {
-      @backend_native.remove_segment_files(dir, seg.base_offset)
-      seg.writer.close()
-    })
-    println("dropped " + dropped.to_string())
-    @backend_native.flush_meta(dir, log)
+    if dry_run {
+      let would = log.count_superseded(index)
+      println("would drop " + would.to_string() + " segments")
+    } else {
+      let dropped = log.prune_superseded(index, seg => {
+        @backend_native.remove_segment_files(dir, seg.base_offset)
+        seg.writer.close()
+      })
+      println("dropped " + dropped.to_string())
+      @backend_native.flush_meta(dir, log)
+    }
     close_log(log)
   })
 }
@@ -618,20 +623,36 @@ fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Read keys from a file, one per line (blank lines skipped).
+fn keys_from_file(file : String) -> Array[Bytes] {
+  let data = @backend_native.read_file(file)
+  let out : Array[Bytes] = []
+  let n = data.length()
+  let mut start = 0
+  let mut i = 0
+  while i <= n {
+    if i == n || data.at(i) == (10 : Byte) {
+      if i > start {
+        out.push(@core.slice(data, start, i))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
 /// Latest live value for each of several keys, in the given order.
-fn cmd_get_many(dir : String, keys : Array[String]) -> Unit raise @io.IoError {
+fn cmd_get_many(dir : String, keys : Array[Bytes]) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
-    let encoded : Array[Bytes] = []
-    for k in keys {
-      encoded.push(@utf8.encode(k))
-    }
-    let recs = log.get_many(encoded)
+    let recs = log.get_many(keys)
     let mut i = 0
     for rec in recs {
       match rec {
         Some(r) => print_record(r)
-        None => println(bytes_to_string(encoded[i]) + ": not found")
+        None => println(bytes_to_string(keys[i]) + ": not found")
       }
       i = i + 1
     }
@@ -680,7 +701,11 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
 /// Compress every rolled-over (non-active) segment in place. The active segment
 /// keeps growing, so it is left uncompressed. `algo` is `rle` or `lzss`
 /// (default).
-fn cmd_compress(dir : String, algo : String) -> Unit raise @io.IoError {
+fn cmd_compress(
+  dir : String,
+  algo : String,
+  dry_run : Bool,
+) -> Unit raise @io.IoError {
   let a = if algo == "rle" {
     1
   } else if algo == "lzss" || algo == "lz" {
@@ -689,8 +714,13 @@ fn cmd_compress(dir : String, algo : String) -> Unit raise @io.IoError {
     raise @io.IoError::Invalid("unknown compression algorithm: " + algo)
   }
   run_locked(dir, true, () => {
-    let n = @backend_native.compress_log_dir(dir, ROLL_SIZE, algo=a)
-    println("compressed " + n.to_string() + " segments")
+    if dry_run {
+      let would = @backend_native.count_compressible_segments(dir, ROLL_SIZE)
+      println("would compress " + would.to_string() + " segments")
+    } else {
+      let n = @backend_native.compress_log_dir(dir, ROLL_SIZE, algo=a)
+      println("compressed " + n.to_string() + " segments")
+    }
   })
 }
 
@@ -815,7 +845,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 3 {
       println(USAGE)
     } else {
-      cmd_prune_superseded(args[2])
+      cmd_prune_superseded(args[2], args.length() > 3 && args[3] == "dry-run")
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {
@@ -838,11 +868,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "get-many" {
     if args.length() < 4 {
       println(USAGE)
+    } else if args[3] == "--keys" {
+      if args.length() < 5 {
+        println(USAGE)
+      } else {
+        cmd_get_many(args[2], keys_from_file(args[4]))
+      }
     } else {
-      let keys : Array[String] = []
+      let keys : Array[Bytes] = []
       let mut i = 3
       while i < args.length() {
-        keys.push(args[i])
+        keys.push(@utf8.encode(args[i]))
         i = i + 1
       }
       cmd_get_many(args[2], keys)
@@ -856,8 +892,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "compact" {
     cmd_compact(args[2])
   } else if cmd == "compress" {
-    let algo = if args.length() > 3 { args[3] } else { "lzss" }
-    cmd_compress(args[2], algo)
+    let mut algo = "lzss"
+    let mut dry = false
+    let mut i = 3
+    while i < args.length() {
+      if args[i] == "dry-run" {
+        dry = true
+      } else {
+        algo = args[i]
+      }
+      i = i + 1
+    }
+    cmd_compress(args[2], algo, dry)
   } else if cmd == "cursor-commit" {
     if args.length() < 4 {
       println(USAGE)

@@ -244,6 +244,7 @@ u32 crc32          (仅覆盖 body)
 - M50 段压缩增强：新增纯 MoonBit LZSS（`core.lz_compress` / `lz_decompress`，4 KiB 窗口）与 RLE 并存；CLI `compress <dir> [rle|lzss]` 可选算法（默认 lzss），meta v7 记录算法以正确解压
 - M51 冗余段回收：`Log::prune_superseded` 删除所有记录均被后续覆盖（同 key 更新 / tombstone）的已 roll 段，回收空间且不重排 offset；CLI `prune-superseded`
 - M52 并发写锁超时：`DirLock::acquire_timeout` 在超时前重试忙锁（新增 `nanosleep` stub），多写者排队而非立即失败；CLI 等待上限由 `MOONLOG_LOCK_TIMEOUT` 控制（默认 5000ms）
+- M53 CLI dry-run 与批量 key：`compress` / `prune-superseded` 支持 `dry-run`（经 `count_compressible_segments` / `Log::count_superseded` 只读报告）；`get-many` 支持 `--keys <file>` 按行读取 key
 
 ## 许可
 
