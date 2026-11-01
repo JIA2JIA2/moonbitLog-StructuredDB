@@ -225,6 +225,43 @@ pub fn[W, R : @io.LogReader] Log::scan_range(
 }
 
 ///|
+/// Decode records whose global offset lies in the half-open range `[from, to)`,
+/// newest first (descending offset).
+pub fn[W, R : @io.LogReader] Log::scan_reverse(
+  self : Log[W, R],
+  from : UInt64,
+  to : UInt64,
+) -> Array[@core.Record] raise @io.IoError {
+  let recs = self.scan_range(from, to)
+  let out : Array[@core.Record] = []
+  let mut i = recs.length() - 1
+  while i >= 0 {
+    out.push(recs[i])
+    i = i - 1
+  }
+  out
+}
+
+///|
+/// The most recent `n` records in append order (oldest of the window first).
+/// Returns fewer when the log holds less than `n`; a non-positive `n` yields
+/// nothing.
+pub fn[W, R : @io.LogReader] Log::tail(
+  self : Log[W, R],
+  n : Int32,
+) -> Array[@core.Record] raise @io.IoError {
+  let out : Array[@core.Record] = []
+  if n <= 0 {
+    return out
+  }
+  let total = self.next_offset
+  let un = n.to_uint64()
+  let from = if total > un { total - un } else { (0 : UInt64) }
+  self.for_each(from, total, rec => out.push(rec))
+  out
+}
+
+///|
 /// Records whose timestamp lies in `[lo, hi)`, in log (offset) order and
 /// including tombstones. Segments whose persisted time span cannot overlap the
 /// range are skipped; a segment without a known span is always scanned.

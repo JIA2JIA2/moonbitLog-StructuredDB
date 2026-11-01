@@ -34,6 +34,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Batch point lookups (M40)**：`Log::get_many` returns the latest live record
   for each of several keys in one call (sharing a single index scan); exposed as
   the `get-many` CLI command.
+- **Reverse scans and tail (M41)**：`Log::scan_reverse` returns a range newest
+  first, and `Log::tail` returns the most recent `n` records in append order;
+  exposed as the `tail` CLI command.
 
 ## 0.2.0 - 2026-10-31
 

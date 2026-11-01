@@ -14,6 +14,7 @@
 ///   scan-prefix <dir> <prefix>       list live keys beginning with a prefix
 ///   scan-range <dir> <lo> [hi]       list live keys in [lo, hi), hi optional
 ///   scan-time <dir> <lo> <hi>        list records with timestamp in [lo, hi)
+///   tail <dir> <n>                   list the most recent n records
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
@@ -46,7 +47,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -275,6 +276,21 @@ fn cmd_scan_time(
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let recs = log.scan_time_range(lo_ts, hi_ts)
+    for rec in recs {
+      print_record(rec)
+    }
+    println("(" + recs.length().to_string() + " records)")
+    close_log(log)
+  })
+}
+
+///|
+/// List the most recent `n` records in append order.
+fn cmd_tail(dir : String, n : String) -> Unit raise @io.IoError {
+  let count = parse_count(n)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let recs = log.tail(count)
     for rec in recs {
       print_record(rec)
     }
@@ -644,6 +660,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_scan_time(args[2], args[3], args[4])
+    }
+  } else if cmd == "tail" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_tail(args[2], args[3])
     }
   } else if cmd == "recover" || cmd == "stats" {
     cmd_recover(args[2])

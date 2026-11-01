@@ -899,3 +899,26 @@ test "get_many returns latest live records in input order" {
     None => ()
   }
 }
+
+///|
+test "scan_reverse returns records newest first and tail takes the last n" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 5; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let rev = log.scan_reverse((1 : UInt64), (4 : UInt64)) catch { _ => panic() }
+  assert_eq(rev.length(), 3)
+  assert_eq(rev[0].offset.to_int(), 3)
+  assert_eq(rev[2].offset.to_int(), 1)
+  let tail2 = log.tail(2) catch { _ => panic() }
+  assert_eq(tail2.length(), 2)
+  assert_eq(tail2[0].offset.to_int(), 3)
+  assert_eq(tail2[1].offset.to_int(), 4)
+  let all = log.tail(99) catch { _ => panic() }
+  assert_eq(all.length(), 5)
+  let none = log.tail(0) catch { _ => panic() }
+  assert_eq(none.length(), 0)
+}

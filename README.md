@@ -229,6 +229,7 @@ u32 crc32          (仅覆盖 body)
 - M38 段数据校验和：已 roll 段在 `.index` 记录整段数据 CRC32（meta v4，旧版本读为未校验）；`Log::verify` 报告首个校验和不符的段（`VerifyReport::first_bad_checksum`）
 - M39 有序 key 索引：`KeyIndex` 维护按字节排序的 live key 列表，`scan_prefix` / `scan_key_range` 改为二分定位 + 点查（不再全量扫段 + 排序）
 - M40 多键批量点查：`Log::get_many` 一次返回多个 key 的最新 live 记录（共享一次索引扫描）；CLI `get-many`
+- M41 逆序扫描与 tail：`Log::scan_reverse` 按 offset 降序返回区间记录，`Log::tail` 返回最近 n 条（按 append 顺序）；CLI `tail`
 
 ## 许可
 
