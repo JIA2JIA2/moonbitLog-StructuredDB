@@ -11,6 +11,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   test now also runs against the file backend, periodically simulating a torn
   tail (truncating the last segment's data file after fsync) and rebuilding the
   model from the surviving record count.
+- **Selective fsync (M73)**：`Segment.fsync_dirty` tracks segments with data not
+  yet fsynced; `Log::flush` / `SyncPolicy::Always` only fsync those, so a
+  many-segment directory no longer pays an fsync per segment per write.
+  **Behaviour change**: `flush()` is now idempotent — calling it again without
+  new appends is a no-op.
 - **Point-lookup folding (M68)**：`snapshot` / `scan_live` collect the live view
   through the key index (one point lookup per live key, then sorted by offset)
   instead of a second full scan, which pays off once many records have been

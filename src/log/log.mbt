@@ -141,6 +141,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
   let offset = active.append(key, value, timestamp, kind~)
   if self.sync is SyncPolicy::Always {
     active.writer.flush()
+    active.mark_fsync_clean()
   }
   self.next_offset = offset + (1 : UInt64)
   self.index_cache = None
@@ -155,7 +156,10 @@ pub fn[W : @io.LogWriter, R] Log::flush(
   self : Log[W, R],
 ) -> Unit raise @io.IoError {
   for seg in self.segments {
-    seg.writer.flush()
+    if seg.fsync_dirty {
+      seg.writer.flush()
+      seg.mark_fsync_clean()
+    }
   }
 }
 

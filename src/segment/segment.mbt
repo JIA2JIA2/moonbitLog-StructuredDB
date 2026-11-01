@@ -28,6 +28,7 @@ pub(all) struct Segment[W, R] {
   mut meta_loaded : Bool
   mut meta_dirty : Bool
   mut ts_samples : Array[(UInt64, Int64)]
+  mut fsync_dirty : Bool
 }
 
 ///|
@@ -78,6 +79,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     meta_loaded: false,
     meta_dirty: true,
     ts_samples: [],
+    fsync_dirty: true,
   }
 }
 
@@ -244,6 +246,12 @@ pub fn[W, R] Segment::needs_meta_write(self : Segment[W, R]) -> Bool {
 }
 
 ///|
+/// Clear the segment's "needs fsync" flag once its data has been fsynced.
+pub fn[W, R] Segment::mark_fsync_clean(self : Segment[W, R]) -> Unit {
+  self.fsync_dirty = false
+}
+
+///|
 /// Recompute the CRC32 over the segment's whole byte range.
 pub fn[W, R : @io.LogReader] Segment::compute_checksum(
   self : Segment[W, R],
@@ -309,6 +317,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   self.size = self.size + bytes.length().to_int64()
   self.crc_known = false
   self.meta_dirty = true
+  self.fsync_dirty = true
   offset
 }
 
@@ -556,6 +565,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self.ts_sorted = true
   self.meta_dirty = true
   self.ts_samples = []
+  self.fsync_dirty = true
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0

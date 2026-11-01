@@ -584,6 +584,13 @@ test "sync policy Batch defers fsync to batch end or explicit flush" {
   batch_log.flush() catch {
     _ => panic()
   }
+  // Idempotent: nothing was appended since the previous fsync.
+  assert_eq(batch_counter.n, 1)
+  ignore(batch_log.append(b"d", b"4", (3 : Int64)) catch { _ => panic() })
+  batch_log.flush() catch {
+    _ => panic()
+  }
+  // Dirty again after the new append: fsynced exactly once more.
   assert_eq(batch_counter.n, 2)
 
   // Never: nothing flushes unless the caller asks.
@@ -603,7 +610,7 @@ test "sync policy Batch defers fsync to batch end or explicit flush" {
 
   // Reading the batch log exercises the LogReader side of FlushSpy.
   let recs = batch_log.scan() catch { _ => panic() }
-  assert_eq(recs.length(), 3)
+  assert_eq(recs.length(), 4)
 }
 
 ///|
