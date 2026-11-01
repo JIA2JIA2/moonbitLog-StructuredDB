@@ -7,7 +7,7 @@
 - **只追加日志**：记录一旦写入不再修改，逻辑 offset 全局单调递增。
 - **双后端**：内存后端（`backend_mem`，可在 wasm/js 运行）+ native 文件后端（`backend_native`，基于 C stub FFI 的真实文件持久化），通过 `io` 抽象隔离核心引擎。
 - **多段管理**：`Log` 按 `roll_size` 滚动切段，段一旦 roll 不再修改。
-- **稀疏索引**：每段内嵌按固定间隔采样的稀疏索引，`get(offset)` 与范围扫描先定位再顺序前进，避免全段扫描。
+- **稀疏索引**：每段内嵌按间隔采样的稀疏索引（间隔随 `roll_size` 自适应，使每段索引条目数接近固定），`get(offset)` 与范围扫描先定位再顺序前进，避免全段扫描。
 - **范围扫描**：`Segment::scan_range` / `Log::scan_range` 支持半开区间 `[from, to)`。
 - **崩溃恢复**：`Segment::recover` 顺序解码、遇 torn/CRC 失败的尾部即截断到最后一个完好边界并重建索引与计数；native 侧 `recover_log_dir` 打开目录恢复全部 `*.log` 段。
 - **Tombstone**：`Log::delete` 追加删除标记记录，历史不被改写。
@@ -98,7 +98,7 @@ $EXE scan /tmp/log
 | `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
-| `NativeFileLog` / `open_log_dir` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、目录锁 |
+| `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、目录锁 |
 | `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
@@ -187,6 +187,7 @@ u32 crc32          (仅覆盖 body)
 - M26 记录级 TTL：`Log::get_latest_at` / `Log::scan_live` 与 CLI `getkey-live` / `prune-expired`
 - M27 命名游标管理：`list_named_cursors` / `remove_named_cursor` 与 CLI `cursor-list` / `cursor-drop`
 - M28 导出/导入：`Log::export_bytes` / `Log::import_bytes` 与 CLI `export` / `import`
+- M24 自适应稀疏索引间隔：`index_interval_for` 按 `roll_size` 估算
 
 ## 许可
 

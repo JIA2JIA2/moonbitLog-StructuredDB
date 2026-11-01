@@ -231,11 +231,37 @@ fn insert_segment_sorted(
 }
 
 ///|
+/// Assumed average encoded record size, used to scale the sparse-index
+/// interval from `roll_size`.
+const ASSUMED_RECORD_BYTES : Int64 = 96
+
+///|
+/// Target number of sparse-index entries per segment.
+const INDEX_ENTRY_TARGET : Int64 = 1024
+
+///|
+/// Pick a sparse-index interval for a segment of `roll_size` bytes so that the
+/// per-segment index holds roughly `INDEX_ENTRY_TARGET` entries no matter how
+/// large the segment grows.
+pub fn index_interval_for(roll_size : Int64) -> Int32 {
+  let records = roll_size / ASSUMED_RECORD_BYTES
+  let iv = records / INDEX_ENTRY_TARGET
+  if iv < 1 {
+    1
+  } else if iv > 4096 {
+    4096
+  } else {
+    iv.to_int()
+  }
+}
+
+///|
 /// Open (creating if needed) the segment file for a freshly rolled segment in
-/// `dir`.
+/// `dir`, using the given sparse-index interval.
 pub fn open_segment_in_dir(
   dir : String,
   base : UInt64,
+  interval~ : Int32 = 32,
 ) -> @segment.Segment[NativeFileLog, NativeFileLog] raise @io.IoError {
   let path = dir + "/" + @segment.segment_file_name(base)
   let existed = file_exists(path)
@@ -243,7 +269,7 @@ pub fn open_segment_in_dir(
   if !existed {
     fsync_dir(dir)
   }
-  @segment.Segment::new(f, f, base)
+  @segment.Segment::new_with_index_interval(f, f, base, interval)
 }
 
 ///|
@@ -277,7 +303,9 @@ pub fn recover_log_dir(
   }
   @log.Log::recover(
     roll_size,
-    base => open_segment_in_dir(dir, base),
+    base => {
+      open_segment_in_dir(dir, base, interval=index_interval_for(roll_size))
+    },
     segs,
     sync~,
   )
@@ -455,7 +483,13 @@ pub fn open_log_dir(
         if consistent {
           @log.Log::recover(
             roll_size,
-            base => open_segment_in_dir(dir, base),
+            base => {
+              open_segment_in_dir(
+                dir,
+                base,
+                interval=index_interval_for(roll_size),
+              )
+            },
             segs,
             sync~,
           )

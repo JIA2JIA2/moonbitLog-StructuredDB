@@ -40,6 +40,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Export / import (M28)**：`Log::export_bytes` / `Log::import_bytes` and the
   `export` / `import` CLI commands move records (including tombstones) between
   directories as a self-checking frame stream.
+- **Adaptive index interval (M24)**：new segments pick a sparse-index interval
+  scaled from `roll_size` via `index_interval_for`, keeping the per-segment
+  index size roughly constant.
 
 ## 0.1.0 - 2026-10-31
 

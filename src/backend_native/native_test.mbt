@@ -526,3 +526,24 @@ test "named cursors can be listed and removed" {
   assert_eq(remaining.length(), 1)
   clean_dir(dir)
 }
+
+///|
+test "open_log_dir picks a roll-size scaled index interval" {
+  let dir = "/tmp/moonlog_index_interval"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  ignore(log.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  let expected = @backend_native.index_interval_for((1_000_000 : Int64))
+  assert_true(expected >= 1)
+  assert_eq(log.segments[0].index_interval(), expected)
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
