@@ -35,6 +35,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Complexity guard for key index (M54)**：a `CountReader` test asserts
   `build_key_index` reads no record bodies, pinning the O(keys) cost added in
   M47 against regressions.
+- **Native example (M55)**：`examples/native_demo` demonstrates the file backend
+  end to end (open, append/delete, live view, key-range scan, per-segment stats).
 
 ## 0.3.0 - 2026-11-01
 
