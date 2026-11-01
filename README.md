@@ -268,6 +268,7 @@ u32 crc32          (仅覆盖 body)
 - M62 property 测试：固定 seed 的随机 append/delete/读校验序列对照内存模型（强制跨段滚动），结尾全量 `verify`
 - M63 TTL 空间回收闭环：`Log::compact_expired(now, ttl)` 在折叠 live 时同时丢弃已过期记录与对应 tombstone（offset 重排，同 compact）；CLI `compact-expired <dir> <ttl>`
 - M64 条件写入 CAS：`Log::compare_and_swap(key, expected, value, ts)` 仅当 live 值匹配期望（或要求 key 不存在）才追加；CLI `put-if`
+- M65 sidecar 写放大优化：段级 `meta_dirty` 标志，`flush_meta` 只重写有变更段（新 roll / checksum / 压缩）的 `.index`/`.keys`，干净已 roll 段跳过
 
 ## 许可
 

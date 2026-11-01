@@ -556,7 +556,7 @@ fn load_segment_keys(
     None
   }
   match loaded {
-    Some(_) => ()
+    Some(_) => seg.mark_meta_clean()
     None => ignore(seg.rebuild_index() catch { _ => 0 })
   }
 }
@@ -736,16 +736,19 @@ pub fn flush_meta(
     if !is_active && !seg.has_checksum() {
       seg.set_checksum(seg.compute_checksum())
     }
-    write_file_atomic(
-      dir,
-      segment_index_name(seg.base_offset),
-      seg.to_meta().encode(),
-    )
-    write_file_atomic(
-      dir,
-      segment_keys_name(seg.base_offset),
-      seg.encode_keys(),
-    )
+    if seg.needs_meta_write() {
+      write_file_atomic(
+        dir,
+        segment_index_name(seg.base_offset),
+        seg.to_meta().encode(),
+      )
+      write_file_atomic(
+        dir,
+        segment_keys_name(seg.base_offset),
+        seg.encode_keys(),
+      )
+      seg.mark_meta_clean()
+    }
     bases.push(seg.base_offset)
     let stored = if seg.is_compressed() {
       segment_file_size(dir, seg.base_offset)

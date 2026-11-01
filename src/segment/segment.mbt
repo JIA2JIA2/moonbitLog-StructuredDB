@@ -26,6 +26,7 @@ pub(all) struct Segment[W, R] {
   mut comp_algo : Int32
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
+  mut meta_dirty : Bool
 }
 
 ///|
@@ -74,6 +75,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     comp_algo: 0,
     keys: @hashmap.HashMap::HashMap([]),
     meta_loaded: false,
+    meta_dirty: true,
   }
 }
 
@@ -181,6 +183,21 @@ pub fn[W, R] Segment::stored_checksum(self : Segment[W, R]) -> UInt32 {
 pub fn[W, R] Segment::set_checksum(self : Segment[W, R], crc : UInt32) -> Unit {
   self.data_crc = crc
   self.crc_known = true
+  self.meta_dirty = true
+}
+
+///|
+/// Clear the segment's "metadata changed" flag once its sidecars have been
+/// persisted, so unchanged segments are not rewritten on every flush.
+pub fn[W, R] Segment::mark_meta_clean(self : Segment[W, R]) -> Unit {
+  self.meta_dirty = false
+}
+
+///|
+/// Whether the segment's in-memory metadata differs from its persisted
+/// sidecars and they should be rewritten on the next flush.
+pub fn[W, R] Segment::needs_meta_write(self : Segment[W, R]) -> Bool {
+  self.meta_dirty
 }
 
 ///|
@@ -220,6 +237,7 @@ pub fn[W, R] Segment::mark_compressed(
   self.compressed = true
   self.raw_size = raw_size
   self.comp_algo = algo
+  self.meta_dirty = true
 }
 
 ///|
@@ -246,6 +264,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   self.record_count = self.record_count + 1
   self.size = self.size + bytes.length().to_int64()
   self.crc_known = false
+  self.meta_dirty = true
   offset
 }
 
@@ -447,6 +466,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
   self.ts_sorted = true
+  self.meta_dirty = true
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -488,6 +508,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
   self.ts_sorted = true
+  self.meta_dirty = true
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0

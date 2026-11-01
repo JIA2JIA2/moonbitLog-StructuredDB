@@ -536,3 +536,20 @@ test "segment meta decodes every historical version" {
     v = v + 1
   }
 }
+
+///|
+test "segment meta dirty flag tracks changes" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  assert_true(seg.needs_meta_write())
+  seg.mark_meta_clean()
+  assert_true(!seg.needs_meta_write())
+  ignore(seg.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  assert_true(seg.needs_meta_write())
+  seg.mark_meta_clean()
+  assert_true(!seg.needs_meta_write())
+  seg.set_checksum((1 : UInt32))
+  assert_true(seg.needs_meta_write())
+  seg.mark_meta_clean()
+  ignore(seg.rebuild_index() catch { _ => panic() })
+  assert_true(seg.needs_meta_write())
+}

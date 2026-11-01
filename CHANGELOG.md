@@ -20,6 +20,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   appends only when the current live value matches `expected` (or, with
   `expected = None`, only when the key has no live record); exposed as the
   `put-if <dir> <key> <expected|-> <value>` CLI command.
+- **Sidecar write amplification (M65)**：segments track a `meta_dirty` flag;
+  `flush_meta` now rewrites `.index`/`.keys` only for changed segments (new or
+  rolled segments, checksum/compression updates) instead of every segment on
+  every write command.
 
 ## 0.4.0 - 2026-11-01
 

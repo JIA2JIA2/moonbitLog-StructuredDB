@@ -757,6 +757,67 @@ test "acquire_timeout retries a busy lock and fails on timeout" {
 }
 
 ///|
+test "flush_meta skips clean segments and rebuilds on demand" {
+  let dir = "/tmp/moonlog_dirty_flush"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  ignore(log.append(b"a", b"1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let find_keys = fn() -> String {
+    let names = @backend_native.list_dir(dir) catch { _ => panic() }
+    let mut found = ""
+    for name in names {
+      if name.has_suffix(".keys") {
+        found = dir + "/" + name
+      }
+    }
+    found
+  }
+  let kp = find_keys()
+  assert_true(kp.length() > 0)
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  // External loss of the sidecar: a clean segment is NOT rewritten on flush.
+  ignore(@backend_native.remove_file(kp))
+  ignore(@backend_native.flush_meta(dir, reopened) catch { _ => panic() })
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  let kp2 = find_keys()
+  assert_true(kp2.length() == 0)
+  // A fresh open still recovers from the data file and rebuilds the keys.
+  let again = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(again.count(), 2)
+  let index = again.build_key_index()
+  let got = again.get_latest(index, b"b") catch { _ => panic() }
+  match got {
+    Some(rec) => assert_eq(rec.value, b"2")
+    None => panic()
+  }
+  for seg in again.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
 test "open_log_dir recovers when the index sidecar is corrupt" {
   let dir = "/tmp/moonlog_corrupt_index"
   ignore(@backend_native.ensure_dir(dir))
