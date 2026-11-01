@@ -694,3 +694,24 @@ test "sync policy Batch fsyncs every segment at the batch tail" {
   assert_true(segs >= 2)
   assert_eq(counter.n, segs)
 }
+
+///|
+test "scan_prefix returns sorted live keys under a prefix" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"user:2", b"b", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"user:1", b"a", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"order:1", b"d", (2 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"user:2", b"b2", (3 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"user:1", (4 : Int64)) catch { _ => panic() })
+  let recs = log.scan_prefix(b"user") catch { _ => panic() }
+  assert_eq(recs.length(), 1)
+  assert_eq(recs[0].key, b"user:2")
+  assert_eq(recs[0].value, b"b2")
+  let all = log.scan_prefix(b"") catch { _ => panic() }
+  assert_eq(all.length(), 2)
+  assert_eq(all[0].key, b"order:1")
+  assert_eq(all[1].key, b"user:2")
+}

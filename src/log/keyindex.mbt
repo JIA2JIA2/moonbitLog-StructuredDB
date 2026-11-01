@@ -162,3 +162,53 @@ pub fn[W, R : @io.LogReader] Log::scan_live(
   })
   out
 }
+
+///|
+/// Lexicographic byte comparison, used to order keys by their raw bytes.
+fn bytes_cmp(a : Bytes, b : Bytes) -> Int32 {
+  let an = a.length()
+  let bn = b.length()
+  let n = if an < bn { an } else { bn }
+  let mut i = 0
+  while i < n {
+    let x = a.at(i).to_int()
+    let y = b.at(i).to_int()
+    if x < y {
+      return -1
+    }
+    if x > y {
+      return 1
+    }
+    i = i + 1
+  }
+  if an < bn {
+    -1
+  } else if an > bn {
+    1
+  } else {
+    0
+  }
+}
+
+///|
+/// The latest live record for every key that begins with `prefix`, sorted
+/// ascending by key bytes. Tombstoned keys are excluded; superseded puts lose
+/// to the newest one.
+pub fn[W, R : @io.LogReader] Log::scan_prefix(
+  self : Log[W, R],
+  prefix : Bytes,
+) -> Array[@core.Record] raise @io.IoError {
+  let index = self.build_key_index()
+  let p = @utf8.decode_lossy(prefix)
+  let out : Array[@core.Record] = []
+  self.for_each((0 : UInt64), self.next_offset, rec => {
+    if !rec.is_delete() && @utf8.decode_lossy(rec.key).has_prefix(p) {
+      match index.latest(rec.key) {
+        Some(off) => if off == rec.offset { out.push(rec) }
+        None => ()
+      }
+    }
+  })
+  out.sort_by(fn(a, b) { bytes_cmp(a.key, b.key) })
+  out
+}

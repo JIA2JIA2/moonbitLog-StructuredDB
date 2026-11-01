@@ -54,6 +54,7 @@ moonlog <command> <dir> [args...]
   delete <dir> <key>            追加 key 的 tombstone
   get <dir> <offset>            按 offset 读取记录
   scan <dir> [from] [to]        列出 [from, to) 区间记录
+  scan-prefix <dir> <prefix>    按 key 前缀列出（结果按 key 排序）
   recover <dir>                 打开并恢复，报告计数
   prune <dir> <keep-segments>   只保留最新 N 个段
   prune-bytes <dir> <bytes>     回收最旧段直到总字节 <= bytes
@@ -86,7 +87,7 @@ stats <dir>                   打印记录/段计数
 | `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
 | `Log::get` / `scan` / `scan_range` / `for_each` | `log` | 点查 / 全扫 / 区间扫描 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `get_latest_at` / `scan_live` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `get_latest` / `get_latest_at` / `scan_live` / `scan_prefix` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / 前缀扫描 / 折叠 live 记录 / 原地重写 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
@@ -217,6 +218,7 @@ u32 crc32          (仅覆盖 body)
 - M30 架构文档与发布工作流（release 触发 `moon publish`）
 - M31 审阅修复：`Log::flush` 刷所有段、`import_bytes` 批量落盘、CLI 支持 `MOONLOG_SYNC=batch`
 - M32 审阅修复：CLI 默认 `MOONLOG_SYNC=always`（命令返回即落盘），并明确 `import` 的 offset 语义
+- M33 key 前缀扫描：`Log::scan_prefix` 与 CLI `scan-prefix`（结果按 key 排序）
 
 ## 许可
 
