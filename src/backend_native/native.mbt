@@ -116,10 +116,17 @@ pub fn NativeFileLog::open_readonly(
 pub fn NativeFileLog::open_compressed(
   path : String,
   raw_size : Int64,
+  algo : Int32,
 ) -> NativeFileLog raise @io.IoError {
   let bytes = @utf8.encode(path)
   let compressed = read_file(path)
-  let raw = @core.rle_decompress(compressed, raw_size) catch {
+  let raw = try {
+    if algo == 2 {
+      @core.lz_decompress(compressed, raw_size)
+    } else {
+      @core.rle_decompress(compressed, raw_size)
+    }
+  } catch {
     _ => raise @io.IoError::Corrupt((0 : Int64))
   }
   let len = raw.length().to_int64()
@@ -446,7 +453,11 @@ fn load_compressed_segment(
       match decoded {
         Some(m) =>
           if m.base_offset == base && m.compressed {
-            let f = NativeFileLog::open_compressed(path, m.raw_size)
+            let f = NativeFileLog::open_compressed(
+              path,
+              m.raw_size,
+              m.comp_algo,
+            )
             let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
               f, f, base,
             )
@@ -612,7 +623,7 @@ fn load_segment(
   let f = match valid {
     Some(m) =>
       if m.compressed {
-        NativeFileLog::open_compressed(path, m.raw_size)
+        NativeFileLog::open_compressed(path, m.raw_size, m.comp_algo)
       } else {
         NativeFileLog::open(path)
       }
@@ -754,13 +765,14 @@ pub fn flush_meta(
 }
 
 ///|
-/// RLE-compress every rolled-over (non-active) segment of `dir` in place. Each
-/// compressed segment records its uncompressed size and a checksum of the raw
-/// data in its index, and the manifest is refreshed. Returns the number of
-/// segments compressed.
+/// Compress every rolled-over (non-active) segment of `dir` in place with `algo`
+/// (1 = RLE, 2 = LZSS). Each compressed segment records its uncompressed size,
+/// algorithm and a checksum of the raw data in its index, and the manifest is
+/// refreshed. Returns the number of segments compressed.
 pub fn compress_log_dir(
   dir : String,
   roll_size : Int64,
+  algo~ : Int32 = 2,
 ) -> Int32 raise @io.IoError {
   let log = open_log_dir(dir, roll_size)
   let n = log.segment_count()
@@ -773,11 +785,16 @@ pub fn compress_log_dir(
         let raw_size = seg.byte_size()
         let raw = seg.reader.read_at((0 : Int64), raw_size.to_int())
         seg.set_checksum(@core.crc32(raw))
+        let packed_bytes = if algo == 1 {
+          @core.rle_compress(raw)
+        } else {
+          @core.lz_compress(raw)
+        }
         write_file(
           dir + "/" + @segment.segment_file_name(seg.base_offset),
-          @core.rle_compress(raw),
+          packed_bytes,
         )
-        seg.mark_compressed(raw_size)
+        seg.mark_compressed(raw_size, algo)
         packed = packed + 1
       }
     }

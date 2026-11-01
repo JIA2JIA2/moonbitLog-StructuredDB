@@ -240,6 +240,7 @@ u32 crc32          (仅覆盖 body)
 - M47 持久化 key 索引：每段内存维护 key→最新 offset（含 tombstone 标志），`flush_meta` 写入 `.keys` sidecar；重开直接加载（缺失/损坏回退重建扫描），`build_key_index` 不再全量扫段
 - M48 表驱动 CRC32：`crc32` 改为加载时构建 256 项查表，替代逐位计算
 - M49 段内时间索引：段记录 timestamp 是否非递减（meta v6 持久化）；`scan_time_range` 对有序段二分定位 `[lo, hi)` 的 offset 窗口，无序段回退线性过滤
+- M50 段压缩增强：新增纯 MoonBit LZSS（`core.lz_compress` / `lz_decompress`，4 KiB 窗口）与 RLE 并存；CLI `compress <dir> [rle|lzss]` 可选算法（默认 lzss），meta v7 记录算法以正确解压
 
 ## 许可
 

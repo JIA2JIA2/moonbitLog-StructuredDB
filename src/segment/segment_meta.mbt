@@ -14,7 +14,7 @@
 ///   u32 entry_count
 ///   entries[entry_count]: { u64 record_index, i64 position }
 ///   (v2+) bloom ; (v3+) min_ts/max_ts/time_known ; (v4+) data_crc/crc_known
-///   (v5+) compressed/raw_size ; (v6+) ts_sorted ; u32 crc32
+///   (v5+) compressed/raw_size ; (v6+) ts_sorted ; (v7+) comp_algo ; u32 crc32
 pub(all) struct SegmentMeta {
   base_offset : UInt64
   next_offset : UInt64
@@ -31,13 +31,14 @@ pub(all) struct SegmentMeta {
   compressed : Bool
   raw_size : Int64
   ts_sorted : Bool
+  comp_algo : Int32
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 6
+const SEGMENT_META_VERSION : UInt32 = 7
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -96,6 +97,7 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   body.write_uint_le(if self.compressed { 1 } else { 0 })
   body.write_int64_le(self.raw_size)
   body.write_uint_le(if self.ts_sorted { 1 } else { 0 })
+  body.write_uint_le(self.comp_algo.reinterpret_as_uint())
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -196,6 +198,14 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
       raise @core.MetaError::Truncated(pos)
     }
     ts_sorted = meta_u32(data, pos) == 1
+    pos = pos + 4
+  }
+  let mut comp_algo = if compressed { 1 } else { 0 }
+  if version >= 7 {
+    if pos + 4 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    comp_algo = meta_u32(data, pos).reinterpret_as_int()
   }
   {
     base_offset,
@@ -213,6 +223,7 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     compressed,
     raw_size,
     ts_sorted,
+    comp_algo,
   }
 }
 
@@ -235,6 +246,7 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     compressed: self.compressed,
     raw_size: self.raw_size,
     ts_sorted: self.ts_sorted,
+    comp_algo: self.comp_algo,
   }
 }
 
@@ -262,5 +274,6 @@ pub fn[W, R] Segment::apply_meta(
   self.compressed = meta.compressed
   self.raw_size = meta.raw_size
   self.ts_sorted = meta.ts_sorted
+  self.comp_algo = meta.comp_algo
   self.meta_loaded = true
 }

@@ -33,7 +33,7 @@
 ///   export <dir> <file>              write all records to a portable file
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
-///   compress <dir>                   RLE-compress every rolled-over segment
+///   compress <dir> [rle|lzss]        compress rolled-over segments
 ///   fsck <dir>                       verify record/offset integrity
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
 ///
@@ -644,11 +644,19 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
-/// RLE-compress every rolled-over (non-active) segment in place. The active
-/// segment keeps growing, so it is left uncompressed.
-fn cmd_compress(dir : String) -> Unit raise @io.IoError {
+/// Compress every rolled-over (non-active) segment in place. The active segment
+/// keeps growing, so it is left uncompressed. `algo` is `rle` or `lzss`
+/// (default).
+fn cmd_compress(dir : String, algo : String) -> Unit raise @io.IoError {
+  let a = if algo == "rle" {
+    1
+  } else if algo == "lzss" || algo == "lz" {
+    2
+  } else {
+    raise @io.IoError::Invalid("unknown compression algorithm: " + algo)
+  }
   run_locked(dir, true, () => {
-    let n = @backend_native.compress_log_dir(dir, ROLL_SIZE)
+    let n = @backend_native.compress_log_dir(dir, ROLL_SIZE, algo=a)
     println("compressed " + n.to_string() + " segments")
   })
 }
@@ -809,7 +817,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "compact" {
     cmd_compact(args[2])
   } else if cmd == "compress" {
-    cmd_compress(args[2])
+    let algo = if args.length() > 3 { args[3] } else { "lzss" }
+    cmd_compress(args[2], algo)
   } else if cmd == "cursor-commit" {
     if args.length() < 4 {
       println(USAGE)

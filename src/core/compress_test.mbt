@@ -38,3 +38,47 @@ test "rle decompress rejects a truncated escape" {
   }
   assert_true(raised)
 }
+
+///|
+test "lzss round-trips assorted data" {
+  let cases : Array[Bytes] = [
+    b"", b"a", b"abc", b"aaaaaaaaaaaaaaaaaaaaaaaa", b"abcabcabcabcabcabc", b"the quick brown fox jumps over the lazy dog",
+    b"aaaaaaaaaabbbbbbbbbbccccccccccaaaaaaaaaa",
+  ]
+  for c in cases {
+    let enc = @core.lz_compress(c)
+    let dec = @core.lz_decompress(enc, c.length().to_int64()) catch {
+      _ => panic()
+    }
+    assert_eq(dec, c)
+  }
+}
+
+///|
+test "lzss compacts repeated data" {
+  let buf = @buffer.Buffer::Buffer()
+  for i = 0; i < 200; i = i + 1 {
+    buf.write_bytes(b"abcdefgh")
+  }
+  let src = buf.to_bytes()
+  let enc = @core.lz_compress(src)
+  assert_true(enc.length() < src.length())
+  let dec = @core.lz_decompress(enc, src.length().to_int64()) catch {
+    _ => panic()
+  }
+  assert_eq(dec, src)
+}
+
+///|
+test "lzss round-trips a patterned buffer" {
+  let buf = @buffer.Buffer::Buffer()
+  for i = 0; i < 5000; i = i + 1 {
+    buf.write_byte((i % 7).to_byte())
+  }
+  let src = buf.to_bytes()
+  let enc = @core.lz_compress(src)
+  let dec = @core.lz_decompress(enc, src.length().to_int64()) catch {
+    _ => panic()
+  }
+  assert_eq(dec, src)
+}

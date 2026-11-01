@@ -23,6 +23,7 @@ pub(all) struct Segment[W, R] {
   mut compressed : Bool
   mut raw_size : Int64
   mut ts_sorted : Bool
+  mut comp_algo : Int32
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
 }
@@ -70,6 +71,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     compressed: false,
     raw_size: 0,
     ts_sorted: true,
+    comp_algo: 0,
     keys: @hashmap.HashMap::HashMap([]),
     meta_loaded: false,
   }
@@ -201,14 +203,23 @@ pub fn[W, R] Segment::is_compressed(self : Segment[W, R]) -> Bool {
 }
 
 ///|
-/// Record that this segment is now stored compressed, holding `raw_size` bytes
-/// of uncompressed data.
+/// The compression algorithm used for this segment's data (0 = none, 1 = RLE,
+/// 2 = LZSS).
+pub fn[W, R] Segment::comp_algo(self : Segment[W, R]) -> Int32 {
+  self.comp_algo
+}
+
+///|
+/// Record that this segment is now stored compressed with `algo`, holding
+/// `raw_size` bytes of uncompressed data.
 pub fn[W, R] Segment::mark_compressed(
   self : Segment[W, R],
   raw_size : Int64,
+  algo : Int32,
 ) -> Unit {
   self.compressed = true
   self.raw_size = raw_size
+  self.comp_algo = algo
 }
 
 ///|

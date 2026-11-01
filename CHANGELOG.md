@@ -17,6 +17,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   non-decreasing (persisted in metadata v6); `scan_time_range` binary-searches
   sorted segments for the `[lo, hi)` offset window and falls back to a linear
   filter for unsorted ones.
+- **LZSS segment compression (M50)**：`core.lz_compress` / `lz_decompress`
+  (4 KiB window) complement RLE. The `compress` CLI command takes an optional
+  `rle` / `lzss` (default) argument, and metadata v7 records which algorithm a
+  segment uses so it is decompressed correctly on reopen.
 
 ## 0.3.0 - 2026-11-01
 
