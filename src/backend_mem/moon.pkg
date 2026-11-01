@@ -1,5 +1,5 @@
 import {
-  "moonlog/lsdb/src/io",
-  "moonlog/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/io",
+  "JIA2JIA2/lsdb/src/core",
   "moonbitlang/core/buffer",
 }

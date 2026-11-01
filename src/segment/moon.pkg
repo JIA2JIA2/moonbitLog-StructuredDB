@@ -1,12 +1,12 @@
 import {
-  "moonlog/lsdb/src/core",
-  "moonlog/lsdb/src/io",
+  "JIA2JIA2/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/io",
   "moonbitlang/core/buffer",
   "moonbitlang/core/hashmap",
 }
 
 import {
-  "moonlog/lsdb/src/backend_mem",
-  "moonlog/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/backend_mem",
+  "JIA2JIA2/lsdb/src/core",
   "moonbitlang/core/buffer",
 } for "test"

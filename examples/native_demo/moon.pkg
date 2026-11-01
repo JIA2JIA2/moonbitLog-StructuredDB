@@ -3,8 +3,8 @@ pkgtype(kind: "executable")
 supported_targets = "-all+native"
 
 import {
-  "moonlog/lsdb/src/core",
-  "moonlog/lsdb/src/log",
-  "moonlog/lsdb/src/backend_native",
+  "JIA2JIA2/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/log",
+  "JIA2JIA2/lsdb/src/backend_native",
   "moonbitlang/core/encoding/utf8",
 }

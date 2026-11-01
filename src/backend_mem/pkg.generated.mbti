@@ -1,8 +1,8 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "moonlog/lsdb/src/backend_mem"
+package "JIA2JIA2/lsdb/src/backend_mem"
 
 import {
-  "moonlog/lsdb/src/io",
+  "JIA2JIA2/lsdb/src/io",
 }
 
 // Values

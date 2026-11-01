@@ -1,8 +1,8 @@
 import {
-  "moonlog/lsdb/src/core",
-  "moonlog/lsdb/src/io",
-  "moonlog/lsdb/src/log",
-  "moonlog/lsdb/src/segment",
+  "JIA2JIA2/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/io",
+  "JIA2JIA2/lsdb/src/log",
+  "JIA2JIA2/lsdb/src/segment",
   "moonbitlang/core/encoding/utf8",
   "moonbitlang/core/string",
 }
@@ -10,7 +10,7 @@ import {
 supported_targets = "-all+native"
 
 import {
-  "moonlog/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/core",
   "moonbitlang/core/bench",
 } for "test"
 

@@ -1,11 +1,11 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "moonlog/lsdb/src/log"
+package "JIA2JIA2/lsdb/src/log"
 
 import {
+  "JIA2JIA2/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/io",
+  "JIA2JIA2/lsdb/src/segment",
   "moonbitlang/core/hashmap",
-  "moonlog/lsdb/src/core",
-  "moonlog/lsdb/src/io",
-  "moonlog/lsdb/src/segment",
 }
 
 // Values

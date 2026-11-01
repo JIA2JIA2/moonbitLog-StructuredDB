@@ -1,8 +1,8 @@
 pkgtype(kind: "executable")
 
 import {
-  "moonlog/lsdb/src/log",
-  "moonlog/lsdb/src/segment",
-  "moonlog/lsdb/src/backend_mem",
+  "JIA2JIA2/lsdb/src/log",
+  "JIA2JIA2/lsdb/src/segment",
+  "JIA2JIA2/lsdb/src/backend_mem",
   "moonbitlang/core/encoding/utf8",
 }

@@ -1,5 +1,5 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "moonlog/lsdb/src/core"
+package "JIA2JIA2/lsdb/src/core"
 
 import {
   "moonbitlang/core/debug",
