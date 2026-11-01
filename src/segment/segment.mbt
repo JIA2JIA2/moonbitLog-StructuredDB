@@ -27,6 +27,7 @@ pub(all) struct Segment[W, R] {
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
   mut meta_dirty : Bool
+  mut ts_samples : Array[(UInt64, Int64)]
 }
 
 ///|
@@ -76,6 +77,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     keys: @hashmap.HashMap::HashMap([]),
     meta_loaded: false,
     meta_dirty: true,
+    ts_samples: [],
   }
 }
 
@@ -146,23 +148,64 @@ pub fn[W, R] Segment::is_ts_sorted(self : Segment[W, R]) -> Bool {
 pub fn[W, R : @io.LogReader] Segment::lower_bound_ts(
   self : Segment[W, R],
   ts : Int64,
-) -> UInt64 {
-  let mut lo = self.base_offset
-  let mut hi = self.base_offset + self.record_count.to_uint64()
+) -> UInt64 raise @io.IoError {
+  if self.ts_samples.length() == 0 {
+    // No in-memory samples (e.g. a freshly loaded segment): binary search over
+    // record offsets with point probes.
+    let mut lo = self.base_offset
+    let mut hi = self.base_offset + self.record_count.to_uint64()
+    while lo < hi {
+      let mid = lo + (hi - lo) / (2 : UInt64)
+      let probe = self.get(mid) catch { _ => return lo }
+      match probe {
+        Some(rec) =>
+          if rec.timestamp < ts {
+            lo = mid + (1 : UInt64)
+          } else {
+            hi = mid
+          }
+        None => hi = mid
+      }
+    }
+    return lo
+  }
+  // In-memory timestamp samples: binary search without any I/O, then walk at
+  // most one sampling interval. Valid because ts_samples mirrors the sparse
+  // index and the segment is timestamp-sorted.
+  let samples = self.ts_samples
+  let m = samples.length()
+  let mut lo = 0
+  let mut hi = m
   while lo < hi {
-    let mid = lo + (hi - lo) / (2 : UInt64)
-    let probe = self.get(mid) catch { _ => return lo }
-    match probe {
-      Some(rec) =>
-        if rec.timestamp < ts {
-          lo = mid + (1 : UInt64)
-        } else {
-          hi = mid
-        }
-      None => hi = mid
+    let mid = (lo + hi) / 2
+    let (_ri, t) = samples[mid]
+    if t < ts {
+      lo = mid + 1
+    } else {
+      hi = mid
     }
   }
-  lo
+  let start_record = if lo > 0 {
+    let (ri, _t) = samples[lo - 1]
+    ri
+  } else {
+    (0 : UInt64)
+  }
+  let stop_record = if lo < m {
+    let (ri, _t) = samples[lo]
+    ri + (1 : UInt64)
+  } else {
+    self.record_count.to_uint64()
+  }
+  let from = self.base_offset + start_record
+  let to = self.base_offset + stop_record
+  let mut result = to
+  self.for_each(from, to, rec => {
+    if rec.timestamp >= ts && rec.offset < result {
+      result = rec.offset
+    }
+  })
+  result
 }
 
 ///|
@@ -253,6 +296,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   let offset = self.next_offset
   if self.index.should_index(self.record_count) {
     self.index.push(self.record_count.to_uint64(), self.size)
+    self.ts_samples.push((self.record_count.to_uint64(), timestamp))
   }
   let rec : @core.Record = { offset, timestamp, kind, key, value, }
   let bytes = rec.encode()
@@ -467,6 +511,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self.time_known = false
   self.ts_sorted = true
   self.meta_dirty = true
+  self.ts_samples = []
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -481,6 +526,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
+          self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1
         pos = next
@@ -509,6 +555,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self.time_known = false
   self.ts_sorted = true
   self.meta_dirty = true
+  self.ts_samples = []
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -531,6 +578,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
           self.index.push(n.to_uint64(), pos)
+          self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1
         pos = next

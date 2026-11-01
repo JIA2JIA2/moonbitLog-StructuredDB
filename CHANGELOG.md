@@ -15,6 +15,11 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   through the key index (one point lookup per live key, then sorted by offset)
   instead of a second full scan, which pays off once many records have been
   superseded or deleted.
+- **In-memory timestamp samples (M69)**：`Segment` keeps a ts sample array
+  alongside the sparse index (filled by append/rebuild), so
+  `Segment::lower_bound_ts` locates the target with a binary search over
+  samples (no I/O) plus at most one interval walk; freshly loaded segments
+  without samples fall back to the point-probe binary search.
 
 ## 0.5.0 - 2026-11-01
 

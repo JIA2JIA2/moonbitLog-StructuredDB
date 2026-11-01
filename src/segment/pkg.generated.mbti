@@ -53,6 +53,7 @@ pub(all) struct Segment[W, R] {
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
   mut meta_dirty : Bool
+  mut ts_samples : Array[(UInt64, Int64)]
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::apply_meta(Self[W, R], SegmentMeta) -> Unit
@@ -71,7 +72,7 @@ pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
 pub fn[W, R] Segment::is_ts_sorted(Self[W, R]) -> Bool
 pub fn[W, R] Segment::key_count(Self[W, R]) -> Int32
 pub fn[W, R] Segment::load_keys(Self[W, R], Bytes) -> Unit raise @core.MetaError
-pub fn[W, R : @io.LogReader] Segment::lower_bound_ts(Self[W, R], Int64) -> UInt64
+pub fn[W, R : @io.LogReader] Segment::lower_bound_ts(Self[W, R], Int64) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::mark_compressed(Self[W, R], Int64, Int32) -> Unit
 pub fn[W, R] Segment::mark_meta_clean(Self[W, R]) -> Unit
 pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
