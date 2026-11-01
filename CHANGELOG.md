@@ -7,6 +7,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Property test (M62)**：a deterministic (fixed-seed xorshift64) randomized
+  sequence of puts/deletes/reads is checked against an in-memory model while
+  segments roll, followed by a full `verify` — guarding the live view and
+  integrity against regressions beyond fixed test cases.
+
+### Added
+
 - **Persisted key index (M47)**：each segment keeps an in-memory key → latest
   offset map (with tombstone flags), persisted to a `.keys` sidecar by
   `flush_meta`. Reopening loads it directly (falling back to a rebuild scan when
