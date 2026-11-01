@@ -81,7 +81,7 @@ moonlog <command> <dir> [args...]
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   compact-expired <dir> <ttl>   折叠 live 记录并剔除已过期记录（offset 重排）
-  fsck <dir>                    校验记录/offset 完整性
+  fsck <dir> [fast]             校验完整性（fast 跳过记录解码，段级 CRC）
 stats <dir> [json]            打印逐段统计（可选 JSON）
 ```
 
@@ -211,6 +211,13 @@ u32 crc32          (仅覆盖 body)
 - `prune-superseded` / `prune-bytes` / `prune-before` / `prune-expired` / `maintain` 会自动枚举目录下全部游标（`CURSOR` 与 `CURSOR.*`），**跳过仍含未消费记录的段**（段尾 offset 大于最小游标位置），消费者不会因回收而丢失未读数据；游标文件损坏时按位置 0 保守处理（保护全部段）。
 - `compact` / `compact-expired` / `import` 会**重排 offset**：执行后所有游标位置失效，命令会输出警告——请用 `cursor-commit 0`（或 `cursor-save <name> 0`）重置游标后重新消费。
 - `merge` 不删除任何记录（offset 保留），游标位置在合并后依然有效。
+
+### 运维指南（M75）
+
+- **fd 上限**：每个打开的段占用 1 个文件描述符（另有 `LOCK` 等少量 fd）。段数接近 `ulimit -n` 时，`open_log_dir` / 写命令会以 `Syscall` 错误失败——用 `merge <dir> <max-segments>` 或 `maintain` 减少段数，或调高 `ulimit -n`。
+- **维护周期**：建议定期执行 `maintain <dir> <max-segments> [ttl]`：段合并控制读放大与 fd 占用，`prune-superseded` 回收冗余空间，`compact-expired <ttl>` 回收过期数据。
+- **游标语义**：`prune-*` 系列自动保护未消费段；`compact` / `compact-expired` / `import` 重排 offset 后需重置游标——详见「游标与段回收语义（M72）」。
+- **fsck 两档**：日常巡检用 `fsck <dir> fast`（不解码记录体，段级 CRC）；事故排查用 `fsck <dir>`（全量解码，能定位记录级损坏）。
 
 ## 里程碑
 
