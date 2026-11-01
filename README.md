@@ -206,6 +206,12 @@ u32 crc32          (仅覆盖 body)
 - `LOCK`：`flock` 建议锁的载体。写者取独占锁，读者取共享锁；`DirLock::acquire_timeout` 在有限时间内重试忙锁（CLI 默认 5s，可用 `MOONLOG_LOCK_TIMEOUT` 调整），使多写者排队而非立即失败；`compact` 会保留该文件。
 - `CURSOR` / `CURSOR.<name>`：CLI 持久化的（命名）消费游标位置。编码为 `u32 magic("MLCU") + u64 position + u32 crc32`，损坏或缺失时回退为 `0`；写入采用原子替换。
 
+### 游标与段回收语义（M72）
+
+- `prune-superseded` / `prune-bytes` / `prune-before` / `prune-expired` / `maintain` 会自动枚举目录下全部游标（`CURSOR` 与 `CURSOR.*`），**跳过仍含未消费记录的段**（段尾 offset 大于最小游标位置），消费者不会因回收而丢失未读数据；游标文件损坏时按位置 0 保守处理（保护全部段）。
+- `compact` / `compact-expired` / `import` 会**重排 offset**：执行后所有游标位置失效，命令会输出警告——请用 `cursor-commit 0`（或 `cursor-save <name> 0`）重置游标后重新消费。
+- `merge` 不删除任何记录（offset 保留），游标位置在合并后依然有效。
+
 ## 里程碑
 
 - M0/M1 脚手架、记录编码与内存后端、单段 append

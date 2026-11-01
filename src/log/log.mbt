@@ -28,6 +28,7 @@ pub(all) struct Log[W, R] {
   sync : SyncPolicy
   mut index_cache : KeyIndex?
   mut index_builds : Int32
+  mut cursor_guard : UInt64?
 }
 
 ///|
@@ -44,6 +45,7 @@ pub fn[W, R] Log::new(
     sync,
     index_cache: None,
     index_builds: 0,
+    cursor_guard: None,
   }
 }
 
@@ -69,6 +71,7 @@ pub fn[W, R] Log::recover(
     sync,
     index_cache: None,
     index_builds: 0,
+    cursor_guard: None,
   }
 }
 
@@ -92,6 +95,26 @@ pub fn[W, R] Log::count(self : Log[W, R]) -> Int32 {
 /// Offset that the next appended record will receive.
 pub fn[W, R] Log::next_offset(self : Log[W, R]) -> UInt64 {
   self.next_offset
+}
+
+///|
+/// Set the consumer-cursor guard: segments still holding records at or after
+/// `Some(g)` are skipped by retention/prune operations so consumers never lose
+/// unread data. `None` disables the guard.
+pub fn[W, R] Log::set_cursor_guard(self : Log[W, R], g : UInt64?) -> Unit {
+  self.cursor_guard = g
+}
+
+///|
+/// Whether `seg` still holds records the consumer has not committed past.
+fn[W, R] Log::segment_guarded(
+  self : Log[W, R],
+  seg : @segment.Segment[W, R],
+) -> Bool {
+  match self.cursor_guard {
+    Some(g) => seg.base_offset + seg.record_count.to_uint64() > g
+    None => false
+  }
 }
 
 ///|
@@ -400,7 +423,7 @@ pub fn[W, R] Log::drop_before(
   for i = 0; i < n; i = i + 1 {
     let seg = self.segments[i]
     let seg_end = seg.base_offset + seg.record_count.to_uint64()
-    if i < n - 1 && seg_end <= offset {
+    if i < n - 1 && seg_end <= offset && !self.segment_guarded(seg) {
       on_drop(seg)
       dropped = dropped + 1
     } else {
@@ -426,7 +449,7 @@ pub fn[W, R] Log::retain_last(
   let kept : Array[@segment.Segment[W, R]] = []
   let mut dropped = 0
   for i = 0; i < n; i = i + 1 {
-    if i < drop_count {
+    if i < drop_count && !self.segment_guarded(self.segments[i]) {
       on_drop(self.segments[i])
       dropped = dropped + 1
     } else {
@@ -456,7 +479,7 @@ pub fn[W, R] Log::retain_max_bytes(
   let mut dropped = 0
   for i = 0; i < n; i = i + 1 {
     let seg = self.segments[i]
-    if i < n - 1 && total > max_bytes {
+    if i < n - 1 && total > max_bytes && !self.segment_guarded(seg) {
       on_drop(seg)
       total = total - seg.size
       dropped = dropped + 1
@@ -503,7 +526,9 @@ pub fn[W, R : @io.LogReader] Log::prune_superseded(
   let mut i = 0
   while i < n {
     let seg = self.segments[i]
-    if i < n - 1 && segment_all_superseded(seg, index) {
+    if i < n - 1 &&
+      !self.segment_guarded(seg) &&
+      segment_all_superseded(seg, index) {
       on_drop(seg)
       dropped = dropped + 1
     } else {
@@ -603,7 +628,7 @@ pub fn[W, R : @io.LogReader] Log::retain_before(
     } else {
       true
     }
-    if i < n - 1 && expired {
+    if i < n - 1 && expired && !self.segment_guarded(seg) {
       on_drop(seg)
       dropped = dropped + 1
     } else {

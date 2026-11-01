@@ -103,9 +103,27 @@ fn desired_sync() -> @log.SyncPolicy {
 }
 
 ///|
+/// Smallest committed cursor position across the default and all named
+/// cursors, or `None` when no cursor exists (nothing to protect).
+fn min_cursor_guard(dir : String) -> UInt64? {
+  let positions = @backend_native.list_cursor_positions(dir) catch { _ => [] }
+  let mut min : UInt64? = (None : UInt64?)
+  for pair in positions {
+    let (_name, pos) = pair
+    match min {
+      Some(m) => if pos < m { min = Some(pos) }
+      None => min = Some(pos)
+    }
+  }
+  min
+}
+
+///|
 fn open_log(dir : String) -> CliLog raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  @backend_native.open_log_dir(dir, ROLL_SIZE, sync=desired_sync())
+  let log = @backend_native.open_log_dir(dir, ROLL_SIZE, sync=desired_sync())
+  log.set_cursor_guard(min_cursor_guard(dir))
+  log
 }
 
 ///|
@@ -822,6 +840,7 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
     })
     @backend_native.flush_meta(dir, log)
     println("compacted " + n.to_string() + " records")
+    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
   })
 }
@@ -842,6 +861,7 @@ fn cmd_compact_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
     })
     @backend_native.flush_meta(dir, log)
     println("compacted " + n.to_string() + " records")
+    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
   })
 }
@@ -895,6 +915,7 @@ fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
     let n = log.import_bytes(data)
     @backend_native.flush_meta(dir, log)
     println("imported " + n.to_string() + " records")
+    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
   })
 }

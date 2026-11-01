@@ -921,6 +921,23 @@ pub fn list_named_cursors(dir : String) -> Array[String] raise @io.IoError {
 }
 
 ///|
+/// All persisted consumer positions in `dir`: the default cursor (name "")
+/// plus every named cursor. A corrupt cursor file reads back as position 0,
+/// which conservatively protects every segment.
+pub fn list_cursor_positions(
+  dir : String,
+) -> Array[(String, UInt64)] raise @io.IoError {
+  let out : Array[(String, UInt64)] = []
+  if file_exists(cursor_path(dir)) {
+    out.push(("", load_cursor(dir)))
+  }
+  for name in list_named_cursors(dir) {
+    out.push((name, load_named_cursor(dir, name)))
+  }
+  out
+}
+
+///|
 /// Delete a named consumer cursor's position file.
 pub fn remove_named_cursor(dir : String, name : String) -> Unit {
   ignore(remove_file(named_cursor_path(dir, name)))

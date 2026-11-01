@@ -43,6 +43,7 @@ pub(all) struct Log[W, R] {
   sync : SyncPolicy
   mut index_cache : KeyIndex?
   mut index_builds : Int32
+  mut cursor_guard : UInt64?
 }
 pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, Int64)]) -> Array[UInt64] raise @io.IoError
@@ -82,6 +83,7 @@ pub fn[W, R : @io.LogReader] Log::scan_reverse(Self[W, R], UInt64, UInt64) -> Ar
 pub fn[W, R : @io.LogReader] Log::scan_time_range(Self[W, R], Int64, Int64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
 pub fn[W, R] Log::segment_summaries(Self[W, R]) -> Array[SegmentSummary]
+pub fn[W, R] Log::set_cursor_guard(Self[W, R], UInt64?) -> Unit
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::tail(Self[W, R], Int32) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::verify(Self[W, R]) -> VerifyReport

@@ -1295,6 +1295,33 @@ test "compare_and_swap enforces the expected value" {
 }
 
 ///|
+test "cursor guard protects segments with unconsumed records" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"a", b"a1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"b1", (1 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"a2", (2 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"b", b"b2", (3 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"a", b"a3", (4 : Int64)) catch { _ => panic() })
+  assert_true(log.segment_count() >= 2)
+  let index = log.build_key_index()
+  // No guard: the fully superseded first segment is dropped.
+  let dropped = log.prune_superseded(index, _seg => ()) catch { _ => panic() }
+  assert_true(dropped >= 1)
+  // A cursor at 0 means nothing was consumed: every segment is protected.
+  log.set_cursor_guard(Some((0 : UInt64)))
+  let dropped2 = log.prune_superseded(index, _seg => ()) catch { _ => panic() }
+  assert_eq(dropped2, 0)
+  // Guard past the end: protection disabled again.
+  log.set_cursor_guard(Some((999 : UInt64)))
+  let idx2 = log.build_key_index()
+  let dropped3 = log.prune_superseded(idx2, _seg => ()) catch { _ => panic() }
+  assert_true(dropped3 >= 0)
+}
+
+///|
 test "scan_time_range uses ts samples on a large sorted segment" {
   let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
     (10_000_000 : Int64),
