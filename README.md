@@ -87,18 +87,20 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | 类型 / 函数 | 包 | 用途 |
 | --- | --- | --- |
 | `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
-| `Log::append` / `append_batch` / `Log::delete` | `log` | 追加单条 / 批量记录 / tombstone，返回全局 offset |
-| `Log::get` / `scan` / `scan_range` / `scan_time_range` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 时间区间 / 流式遍历 |
+| `Log::append` / `append_batch` / `append_batch_atomic` / `Log::delete` | `log` | 追加单条 / 批量 / 原子批量（失败回滚）/ tombstone |
+| `Log::get` / `scan` / `scan_range` / `scan_reverse` / `scan_time_range` / `tail` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 逆序区间 / 时间区间 / 最近 N 条 / 流式遍历 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
-| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 前缀扫描 / key 区间扫描 / 折叠 live 记录 / 原地重写 |
+| `Log::build_key_index` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` | `log` | KV 逻辑视图 / TTL 读取 / Bloom 快查 / 批量点查 / 前缀扫描 / key 区间扫描 / 折叠 live 记录 / 原地重写 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
 | `ConsumerCursor::new` / `poll` / `seek` | `log` | 按批消费、提交与回退读位置 |
 | `SyncPolicy` / `Log::flush` | `log` | `Never` / `Always` / `Batch` 持久化策略与显式 fsync |
 | `Manifest::encode` / `decode_manifest` | `log` | 目录级元数据编解码 |
-| `Log::verify` / `VerifyReport` | `log` | 全日志顺序完整性校验 |
+| `Log::verify` / `VerifyReport` | `log` | 全日志顺序与段校验和完整性校验 |
+| `Log::segment_summaries` / `SegmentSummary` | `log` | 逐段计数 / 大小 / 压缩标志 / 时间跨度统计 |
+| `rle_compress` / `rle_decompress` | `core` | 纯 MoonBit RLE 段数据压缩 / 解压（wasm 可用） |
 | `Segment` / `SparseIndex` | `segment` | 单段读写、稀疏索引、崩溃恢复 |
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
-| `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、目录锁 |
+| `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `compress_log_dir` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、段压缩、目录锁 |
 | `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
