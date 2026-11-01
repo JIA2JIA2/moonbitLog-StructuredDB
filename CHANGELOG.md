@@ -3,14 +3,14 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## 0.6.0 - 2026-11-01
+## 0.7.0 - 2026-11-01
 
 ### Added
 
-- **Native crash-injection property test (M67)**：the randomized-op property
-  test now also runs against the file backend, periodically simulating a torn
-  tail (truncating the last segment's data file after fsync) and rebuilding the
-  model from the surviving record count.
+- **Cursor-aware segment reclamation (M72)**：maintenance commands enumerate
+  all consumer cursors and skip segments that still hold unconsumed records;
+  `compact` / `compact-expired` / `import` renumber offsets and now warn that
+  cursors must be reset. Documented under「游标与段回收语义（M72）」.
 - **Selective fsync (M73)**：`Segment.fsync_dirty` tracks segments with data not
   yet fsynced; `Log::flush` / `SyncPolicy::Always` only fsync those, so a
   many-segment directory no longer pays an fsync per segment per write.
@@ -20,6 +20,17 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   consistency and the stored whole-segment CRC32 without decoding record
   bodies; exposed as `fsck <dir> fast`. It cannot detect corruption inside
   individual records — `fsck <dir>` (full) remains the thorough check.
+- **Operations guide (M75)**：README gains an operations section (fd limits vs
+  segment count, maintenance cadence, cursor/reclamation semantics).
+
+## 0.6.0 - 2026-11-01
+
+### Added
+
+- **Native crash-injection property test (M67)**：the randomized-op property
+  test now also runs against the file backend, periodically simulating a torn
+  tail (truncating the last segment's data file after fsync) and rebuilding the
+  model from the surviving record count.
 - **Point-lookup folding (M68)**：`snapshot` / `scan_live` collect the live view
   through the key index (one point lookup per live key, then sorted by offset)
   instead of a second full scan, which pays off once many records have been

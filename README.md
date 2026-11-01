@@ -292,6 +292,7 @@ u32 crc32          (仅覆盖 body)
 - M69 段内 ts 采样索引：`Segment` 维护与稀疏索引同步的内存 ts 采样（append/rebuild 填充），`lower_bound_ts` 先对采样二分（零 I/O）再至多走一个采样区间；无采样的新打开段回退点探二分
 - M70 一键维护：CLI `maintain <dir> <max-segments> [ttl]` 聚合段合并 + 冗余段回收 + 过期折叠（可选）+ fsck 报告
 - M71 发布 0.6.0：native property 测试（含 torn tail 注入）、live 折叠点查化、ts 采样索引、maintain 命令随包发布
+- M76 发布 0.7.0：游标感知回收、选择性 fsync（flush 幂等化）、fsck fast、运维指南随包发布
 
 ## 许可
 
