@@ -547,3 +547,59 @@ test "open_log_dir picks a roll-size scaled index interval" {
   }
   clean_dir(dir)
 }
+
+///|
+test "flush_meta records segment checksums and verify detects tampering" {
+  let dir = "/tmp/moonlog_segment_checksum"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  let ok = reopened.verify()
+  match ok.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let data = @backend_native.read_file(path)
+  assert_true(data.length() > 0)
+  let head : Bytes = if data.at(0).to_int() == 0 { b"\x01" } else { b"\x00" }
+  let tampered = head + @core.slice(data, 1, data.length())
+  @backend_native.write_file(path, tampered) catch {
+    _ => panic()
+  }
+  let reopened2 = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  let report = reopened2.verify()
+  match report.first_bad_checksum {
+    Some(base) => assert_eq(base, (0 : UInt64))
+    None => panic()
+  }
+  for seg in reopened2.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}

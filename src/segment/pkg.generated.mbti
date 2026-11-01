@@ -43,14 +43,18 @@ pub(all) struct Segment[W, R] {
   mut min_ts : Int64
   mut max_ts : Int64
   mut time_known : Bool
+  mut data_crc : UInt32
+  mut crc_known : Bool
   mut meta_loaded : Bool
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::apply_meta(Self[W, R], SegmentMeta) -> Unit
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
+pub fn[W, R : @io.LogReader] Segment::compute_checksum(Self[W, R]) -> UInt32 raise @io.IoError
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
+pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
 pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
@@ -64,6 +68,8 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(Self[W, R]) -> Int32 raise @
 pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(Self[W, R]) -> Int32 raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::scan_range(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
+pub fn[W, R] Segment::set_checksum(Self[W, R], UInt32) -> Unit
+pub fn[W, R] Segment::stored_checksum(Self[W, R]) -> UInt32
 pub fn[W, R] Segment::to_meta(Self[W, R]) -> SegmentMeta
 
 pub(all) struct SegmentMeta {
@@ -77,6 +83,8 @@ pub(all) struct SegmentMeta {
   min_ts : Int64
   max_ts : Int64
   time_known : Bool
+  data_crc : UInt32
+  crc_known : Bool
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 

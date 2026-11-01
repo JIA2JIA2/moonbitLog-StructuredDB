@@ -24,6 +24,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Binary-safe key index (M37)**：the key index now keys on raw key bytes rather
   than a lossy UTF-8 decoding, so distinct binary keys can no longer collapse
   into one another; `scan_prefix` likewise matches raw bytes.
+- **Segment data checksums (M38)**：every rolled-over segment records a CRC32
+  over its whole data range in `.index` (metadata v4; older versions read back as
+  "unverified"). `Log::verify` reports the first segment whose stored checksum
+  does not match via `VerifyReport::first_bad_checksum`.
 
 ## 0.2.0 - 2026-10-31
 

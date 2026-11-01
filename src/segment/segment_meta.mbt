@@ -13,6 +13,7 @@
 ///   u32 interval
 ///   u32 entry_count
 ///   entries[entry_count]: { u64 record_index, i64 position }
+///   (v2+) bloom ; (v3+) min_ts/max_ts/time_known ; (v4+) data_crc/crc_known
 ///   u32 crc32
 pub(all) struct SegmentMeta {
   base_offset : UInt64
@@ -25,13 +26,15 @@ pub(all) struct SegmentMeta {
   min_ts : Int64
   max_ts : Int64
   time_known : Bool
+  data_crc : UInt32
+  crc_known : Bool
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 3
+const SEGMENT_META_VERSION : UInt32 = 4
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -85,6 +88,8 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   body.write_int64_le(self.min_ts)
   body.write_int64_le(self.max_ts)
   body.write_uint_le(if self.time_known { 1 } else { 0 })
+  body.write_uint_le(self.data_crc)
+  body.write_uint_le(if self.crc_known { 1 } else { 0 })
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -157,6 +162,16 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     min_ts = meta_i64(data, pos)
     max_ts = meta_i64(data, pos + 8)
     time_known = meta_u32(data, pos + 16) == 1
+    pos = pos + 20
+  }
+  let mut data_crc : UInt32 = 0
+  let mut crc_known = false
+  if version >= 4 {
+    if pos + 8 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    data_crc = meta_u32(data, pos)
+    crc_known = meta_u32(data, pos + 4) == 1
   }
   {
     base_offset,
@@ -169,6 +184,8 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     min_ts,
     max_ts,
     time_known,
+    data_crc,
+    crc_known,
   }
 }
 
@@ -186,6 +203,8 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     min_ts: self.min_ts,
     max_ts: self.max_ts,
     time_known: self.time_known,
+    data_crc: self.data_crc,
+    crc_known: self.crc_known,
   }
 }
 
@@ -208,5 +227,7 @@ pub fn[W, R] Segment::apply_meta(
   self.min_ts = meta.min_ts
   self.max_ts = meta.max_ts
   self.time_known = meta.time_known
+  self.data_crc = meta.data_crc
+  self.crc_known = meta.crc_known
   self.meta_loaded = true
 }

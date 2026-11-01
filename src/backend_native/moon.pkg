@@ -8,6 +8,7 @@ import {
 supported_targets = "-all+native"
 
 import {
+  "moonlog/lsdb/src/core",
   "moonbitlang/core/bench",
 } for "test"
 

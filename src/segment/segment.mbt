@@ -18,6 +18,8 @@ pub(all) struct Segment[W, R] {
   mut min_ts : Int64
   mut max_ts : Int64
   mut time_known : Bool
+  mut data_crc : UInt32
+  mut crc_known : Bool
   mut meta_loaded : Bool
 }
 
@@ -59,6 +61,8 @@ pub fn[W, R] Segment::new_with_index_interval(
     min_ts: 0,
     max_ts: 0,
     time_known: false,
+    data_crc: 0,
+    crc_known: false,
     meta_loaded: false,
   }
 }
@@ -115,6 +119,39 @@ pub fn[W, R] Segment::has_time_range(self : Segment[W, R]) -> Bool {
 }
 
 ///|
+/// Whether the segment carries a finalized whole-segment checksum (recorded
+/// once it stops growing).
+pub fn[W, R] Segment::has_checksum(self : Segment[W, R]) -> Bool {
+  self.crc_known
+}
+
+///|
+/// The persisted whole-segment CRC32; valid only when `has_checksum`.
+pub fn[W, R] Segment::stored_checksum(self : Segment[W, R]) -> UInt32 {
+  self.data_crc
+}
+
+///|
+/// Record `crc` as this segment's finalized whole-segment checksum.
+pub fn[W, R] Segment::set_checksum(self : Segment[W, R], crc : UInt32) -> Unit {
+  self.data_crc = crc
+  self.crc_known = true
+}
+
+///|
+/// Recompute the CRC32 over the segment's whole byte range.
+pub fn[W, R : @io.LogReader] Segment::compute_checksum(
+  self : Segment[W, R],
+) -> UInt32 raise @io.IoError {
+  let total = self.reader.length()
+  if total <= (0 : Int64) {
+    return 0
+  }
+  let data = self.reader.read_at((0 : Int64), total.to_int())
+  @core.crc32(data)
+}
+
+///|
 /// Append one record, assigning it the next logical offset. Returns the
 /// offset that was assigned.
 pub fn[W : @io.LogWriter, R] Segment::append(
@@ -136,6 +173,7 @@ pub fn[W : @io.LogWriter, R] Segment::append(
   self.next_offset = offset + (1 : UInt64)
   self.record_count = self.record_count + 1
   self.size = self.size + bytes.length().to_int64()
+  self.crc_known = false
   offset
 }
 

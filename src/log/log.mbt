@@ -387,6 +387,7 @@ pub(all) struct VerifyReport {
   segments : Int32
   records : Int32
   first_bad_offset : UInt64?
+  first_bad_checksum : UInt64?
 }
 
 ///|
@@ -399,10 +400,28 @@ pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
   let mut records : Int32 = 0
   let mut bad_found = false
   let mut bad_at : UInt64 = 0
+  let mut bad_ck_found = false
+  let mut bad_ck_at : UInt64 = 0
   for seg in self.segments {
     if !bad_found && seg.base_offset != expected {
       bad_found = true
       bad_at = expected
+    }
+    if seg.has_checksum() {
+      let stored = seg.stored_checksum()
+      let actual = Some(seg.compute_checksum()) catch { _ => None }
+      match actual {
+        Some(a) =>
+          if a != stored && !bad_ck_found {
+            bad_ck_found = true
+            bad_ck_at = seg.base_offset
+          }
+        None =>
+          if !bad_ck_found {
+            bad_ck_found = true
+            bad_ck_at = seg.base_offset
+          }
+      }
     }
     let recs = seg.scan() catch {
       _ => {
@@ -427,6 +446,11 @@ pub fn[W, R : @io.LogReader] Log::verify(self : Log[W, R]) -> VerifyReport {
     records,
     first_bad_offset: if bad_found {
       Some(bad_at)
+    } else {
+      None
+    },
+    first_bad_checksum: if bad_ck_found {
+      Some(bad_ck_at)
     } else {
       None
     },

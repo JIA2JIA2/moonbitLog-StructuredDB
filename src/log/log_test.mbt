@@ -850,3 +850,26 @@ test "scan_prefix matches raw bytes rather than lossy text" {
   let none = log.scan_prefix(b"\x00") catch { _ => panic() }
   assert_eq(none.length(), 0)
 }
+
+///|
+test "verify reports a segment checksum mismatch" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 4; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  let ok = log.verify()
+  match ok.first_bad_checksum {
+    Some(_) => panic()
+    None => ()
+  }
+  let crc = log.segments[0].compute_checksum() catch { _ => panic() }
+  log.segments[0].set_checksum(crc ^ (1 : UInt32))
+  let bad = log.verify()
+  match bad.first_bad_checksum {
+    Some(base) => assert_eq(base, log.segments[0].base_offset)
+    None => panic()
+  }
+}

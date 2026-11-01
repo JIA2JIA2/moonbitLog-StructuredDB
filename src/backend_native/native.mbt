@@ -513,7 +513,13 @@ pub fn flush_meta(
 ) -> Unit raise @io.IoError {
   let bases : Array[UInt64] = []
   let sizes : Array[Int64] = []
+  let n = log.segments.length()
+  let mut i = 0
   for seg in log.segments {
+    let is_active = i == n - 1
+    if !is_active && !seg.has_checksum() {
+      seg.set_checksum(seg.compute_checksum())
+    }
     write_file_atomic(
       dir,
       segment_index_name(seg.base_offset),
@@ -521,6 +527,7 @@ pub fn flush_meta(
     )
     bases.push(seg.base_offset)
     sizes.push(seg.byte_size())
+    i = i + 1
   }
   let manifest : @log.Manifest = {
     roll_size: log.roll_size,

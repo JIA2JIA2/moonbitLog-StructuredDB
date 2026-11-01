@@ -91,6 +91,7 @@ pub(all) struct VerifyReport {
   segments : Int32
   records : Int32
   first_bad_offset : UInt64?
+  first_bad_checksum : UInt64?
 }
 
 // Type aliases

@@ -396,3 +396,20 @@ test "segment meta round-trips the timestamp span" {
   assert_eq(decoded.min_ts, (10 : Int64))
   assert_eq(decoded.max_ts, (90 : Int64))
 }
+
+///|
+test "segment meta round-trips the data checksum" {
+  let seg = indexed_mem_segment((0 : UInt64), (4 : Int32))
+  ignore(seg.append(b"k", b"v", (0 : Int64)) catch { _ => panic() })
+  assert_true(!seg.has_checksum())
+  let crc = seg.compute_checksum() catch { _ => panic() }
+  seg.set_checksum(crc)
+  assert_true(seg.has_checksum())
+  let decoded = @segment.decode_segment_meta(seg.to_meta().encode()) catch {
+    _ => panic()
+  }
+  assert_true(decoded.crc_known)
+  assert_eq(decoded.data_crc, crc)
+  ignore(seg.append(b"k2", b"v2", (1 : Int64)) catch { _ => panic() })
+  assert_true(!seg.has_checksum())
+}

@@ -177,7 +177,7 @@ u32 crc32          (仅覆盖 body)
 
 ### 持久化元数据（M8）
 
-- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照、该段 key 的 Bloom 过滤器与时间跨度（min/max timestamp）（含 CRC32），重开时可直接恢复，无需扫描数据。
+- 每个段旁挂 `<name>.log.index`：保存该段计数、稀疏索引快照、该段 key 的 Bloom 过滤器、时间跨度（min/max timestamp），以及已 roll 段的整段数据 CRC32（整体含 CRC32），重开时可直接恢复，无需扫描数据。
 - 目录级 `MANIFEST`：记录 `roll_size`、`next_offset` 与段清单（每段的 `base_offset` 与 `byte_size`，整体附 CRC32）。打开时据此校验每个段文件的真实大小，不符则回退全量恢复。
 - `open_log_dir` 优先使用上述元数据（快速路径）；缺失或校验失败时回退到 `recover_log_dir` 全量恢复。
 - 元数据（`MANIFEST` 与每段 `.index`）以**原子替换**落盘：写入 `<name>.tmp` → fsync → `rename` 覆盖 → fsync 目录。进程在任意时刻崩溃只会留下旧版或新版，不会出现半写文件。
@@ -226,6 +226,7 @@ u32 crc32          (仅覆盖 body)
 - M35 时间范围查询：段级 min/max timestamp 持久化进 `.index`（meta v3），`Log::scan_time_range` 跳过无重叠段；CLI `scan-time`
 - M36 key 区间扫描：`Log::scan_key_range` 按 `[lo, hi)` 返回每个 live key 的最新记录（按 key 排序，空 `hi` 表示无上界）；CLI `scan-range`
 - M37 二进制安全 key 索引：`KeyIndex` 改以 key 原始字节为键（此前用有损 `utf8.decode_lossy`，非法 UTF-8 的不同 key 会塌缩冲突），`scan_prefix` 改按原始字节匹配；新增回归测试
+- M38 段数据校验和：已 roll 段在 `.index` 记录整段数据 CRC32（meta v4，旧版本读为未校验）；`Log::verify` 报告首个校验和不符的段（`VerifyReport::first_bad_checksum`）
 
 ## 许可
 

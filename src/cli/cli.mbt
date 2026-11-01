@@ -306,9 +306,23 @@ fn cmd_fsck(dir : String) -> Unit raise @io.IoError {
     let report = log.verify()
     println("segments " + report.segments.to_string())
     println("records " + report.records.to_string())
+    let mut ok = true
     match report.first_bad_offset {
-      Some(off) => println("corrupt: offset mismatch at " + off.to_string())
-      None => println("ok")
+      Some(off) => {
+        ok = false
+        println("corrupt: offset mismatch at " + off.to_string())
+      }
+      None => ()
+    }
+    match report.first_bad_checksum {
+      Some(off) => {
+        ok = false
+        println("corrupt: checksum mismatch at " + off.to_string())
+      }
+      None => ()
+    }
+    if ok {
+      println("ok")
     }
     close_log(log)
   })
