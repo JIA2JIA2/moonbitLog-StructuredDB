@@ -20,6 +20,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Segment::lower_bound_ts` locates the target with a binary search over
   samples (no I/O) plus at most one interval walk; freshly loaded segments
   without samples fall back to the point-probe binary search.
+- **`maintain` command (M70)**：one-shot maintenance that merges contiguous
+  rolled-over segments down to a target count, drops fully-superseded segments,
+  optionally folds away expired records (`<ttl>`), and finishes with an fsck
+  report.
 
 ## 0.5.0 - 2026-11-01
 

@@ -24,6 +24,8 @@
 ///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
 ///   prune-superseded <dir>           drop segments fully superseded by later records
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
+///   maintain <dir> <max-segments> [ttl]
+///                                    merge + prune-superseded + compact-expired + fsck
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
@@ -53,7 +55,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -567,6 +569,80 @@ fn cmd_merge(dir : String, max_str : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// One-shot maintenance: merge contiguous rolled-over segments down to
+/// `max_segments`, drop fully-superseded segments, fold away expired records
+/// when `ttl` is given, then finish with an fsck report.
+fn cmd_maintain(
+  dir : String,
+  max_str : String,
+  ttl : String?,
+) -> Unit raise @io.IoError {
+  let max = @string.parse_int(max_str) catch {
+    _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
+  }
+  let ttl_ms : Int64? = match ttl {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid ttl: " + s)
+        },
+      )
+    None => (None : Int64?)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let merged = log.merge_segments(max, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    let index = log.build_key_index()
+    let dropped = log.prune_superseded(index, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    let folded : Int32 = match ttl_ms {
+      Some(t) =>
+        log.compact_expired(now_ms(), t, on_drop=seg => {
+          @backend_native.remove_segment_files(dir, seg.base_offset)
+          seg.writer.close()
+        })
+      None => -1
+    }
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+    println("merged " + merged.to_string())
+    println("superseded dropped " + dropped.to_string())
+    match ttl_ms {
+      Some(_) => println("expired folded " + folded.to_string())
+      None => ()
+    }
+    let reopened = open_log(dir)
+    let report = reopened.verify()
+    println("segments " + report.segments.to_string())
+    println("records " + report.records.to_string())
+    let mut ok = true
+    match report.first_bad_offset {
+      Some(off) => {
+        ok = false
+        println("corrupt: offset mismatch at " + off.to_string())
+      }
+      None => ()
+    }
+    match report.first_bad_checksum {
+      Some(off) => {
+        ok = false
+        println("corrupt: checksum mismatch at " + off.to_string())
+      }
+      None => ()
+    }
+    if ok {
+      println("ok")
+    }
+    close_log(reopened)
+  })
+}
+
+///|
 /// Poll a consumer cursor batch. `start` may be `-` to resume from the
 /// persisted position written by `cursor-commit`.
 fn cmd_cursor(
@@ -931,6 +1007,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_merge(args[2], args[3])
+    }
+  } else if cmd == "maintain" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let ttl : String? = if args.length() > 4 {
+        Some(args[4])
+      } else {
+        (None : String?)
+      }
+      cmd_maintain(args[2], args[3], ttl)
     }
   } else if cmd == "cursor" {
     if args.length() < 5 {

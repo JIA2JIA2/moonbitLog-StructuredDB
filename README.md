@@ -66,6 +66,8 @@ moonlog <command> <dir> [args...]
   prune-expired <dir> <ttl>     回收末条记录早于 now-ttl 的段
   prune-superseded <dir>        回收所有记录均被后续覆盖的段
   merge <dir> <max-segments>    将连续的已 roll 段合并至不超过 N 段
+  maintain <dir> <max-segments> [ttl]
+                                一键维护：合并 + 冗余回收 + 过期折叠 + fsck
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
@@ -273,6 +275,7 @@ u32 crc32          (仅覆盖 body)
 - M67 native property 测试：文件后端随机操作 + 周期性注入 torn tail（fsync 后截断最后段数据文件），模型按存活记录数重建
 - M68 live 折叠点查化：`snapshot` / `scan_live` 经 key 索引逐 key 点查（按 offset 排序保持输出顺序），替代二次全量扫描
 - M69 段内 ts 采样索引：`Segment` 维护与稀疏索引同步的内存 ts 采样（append/rebuild 填充），`lower_bound_ts` 先对采样二分（零 I/O）再至多走一个采样区间；无采样的新打开段回退点探二分
+- M70 一键维护：CLI `maintain <dir> <max-segments> [ttl]` 聚合段合并 + 冗余段回收 + 过期折叠（可选）+ fsck 报告
 
 ## 许可
 
