@@ -1364,6 +1364,46 @@ test "scan_time_range uses ts samples on a large sorted segment" {
 }
 
 ///|
+test "get_many works across segments with out-of-order keys" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  let keys : Array[Bytes] = [
+    b"k0", b"k1", b"k2", b"k3", b"k4", b"k5", b"k6", b"k7",
+  ]
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(keys[i], b"v", i.to_int64()) catch { _ => panic() })
+  }
+  ignore(log.delete(b"k2", (8 : Int64)) catch { _ => panic() })
+  assert_true(log.segment_count() >= 2)
+  let recs = log.get_many([b"k7", b"k0", b"k4", b"k2", b"missing"]) catch {
+    _ => panic()
+  }
+  assert_eq(recs.length(), 5)
+  match recs[0] {
+    Some(rec) => assert_eq(rec.key, b"k7")
+    None => panic()
+  }
+  match recs[1] {
+    Some(rec) => assert_eq(rec.key, b"k0")
+    None => panic()
+  }
+  match recs[2] {
+    Some(rec) => assert_eq(rec.key, b"k4")
+    None => panic()
+  }
+  match recs[3] {
+    Some(_) => panic()
+    None => ()
+  }
+  match recs[4] {
+    Some(_) => panic()
+    None => ()
+  }
+}
+
+///|
 test "verify_fast agrees with verify and detects checksum damage" {
   let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
     (60 : Int64),

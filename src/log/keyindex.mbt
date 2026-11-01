@@ -98,9 +98,46 @@ pub fn[W, R : @io.LogReader] Log::get_many(
   keys : Array[Bytes],
 ) -> Array[@core.Record?] raise @io.IoError {
   let index = self.build_key_index()
-  let out : Array[@core.Record?] = []
-  for k in keys {
-    out.push(self.get_latest(index, k))
+  let out : Array[@core.Record?] = Array::make(
+    keys.length(),
+    (None : @core.Record?),
+  )
+  let wanted : Array[(Int32, UInt64)] = []
+  for i = 0; i < keys.length(); i = i + 1 {
+    match index.latest(keys[i]) {
+      Some(off) => wanted.push((i, off))
+      None => ()
+    }
+  }
+  wanted.sort_by(fn(a, b) {
+    if a.1 < b.1 {
+      -1
+    } else if a.1 > b.1 {
+      1
+    } else {
+      0
+    }
+  })
+  // Walk segments in offset order so each segment is located once and read
+  // forward, instead of re-locating per key.
+  let mut w = 0
+  for seg in self.segments {
+    let base = seg.base_offset
+    let seg_end = base + seg.record_count.to_uint64()
+    while w < wanted.length() {
+      let off = wanted[w].1
+      if off < base {
+        w = w + 1
+      } else if off >= seg_end {
+        break
+      } else {
+        match seg.get(off) {
+          Some(rec) => if !rec.is_delete() { out[wanted[w].0] = Some(rec) }
+          None => ()
+        }
+        w = w + 1
+      }
+    }
   }
   out
 }

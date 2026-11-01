@@ -26,6 +26,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (metadata v8; v1–v7 remain readable), so a freshly loaded segment restores its
   in-memory ts samples and `scan_time_range` uses the sample binary search
   immediately instead of falling back to point probes.
+- **Grouped `get_many` (M79)**：batch point lookups are sorted by offset and
+  served with a single forward walk over the segments instead of re-locating
+  the segment per key.
 
 ## 0.7.0 - 2026-11-01
 

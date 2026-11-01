@@ -295,6 +295,7 @@ u32 crc32          (仅覆盖 body)
 - M76 发布 0.7.0：游标感知回收、选择性 fsync（flush 幂等化）、fsck fast、运维指南随包发布
 - M77 维护/游标 property 测试 + 修复：随机维护（merge/prune-superseded/compact）与游标推进的 property 测试；**修复** `prune_superseded` 不再删除含 tombstone 的段（防旧 put 复活）
 - M78 ts 采样持久化（meta v8）：稀疏索引条目附 timestamp（兼容读 v1–v7），打开的段加载即恢复内存 ts 采样，`scan_time_range` 立即使用采样二分
+- M79 `get_many` 段分组点查：批量点查按 offset 排序后单次顺序遍历段，替代逐 key 重复定位
 
 ## 许可
 
