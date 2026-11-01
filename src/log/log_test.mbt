@@ -1011,3 +1011,34 @@ test "segment_summaries reports one row per segment with totals" {
   assert_eq(total, log.count())
   assert_true(bytes > (0 : Int64))
 }
+
+///|
+test "scan_time_range bisects sorted segments and scans unsorted ones" {
+  let sorted : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(sorted.append(b"a", b"1", (100 : Int64)) catch { _ => panic() })
+  ignore(sorted.append(b"b", b"2", (200 : Int64)) catch { _ => panic() })
+  ignore(sorted.append(b"c", b"3", (300 : Int64)) catch { _ => panic() })
+  assert_true(sorted.segments[0].is_ts_sorted())
+  let hit = sorted.scan_time_range((150 : Int64), (300 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(hit.length(), 1)
+  assert_eq(hit[0].key, b"b")
+
+  let unsorted : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(unsorted.append(b"a", b"1", (300 : Int64)) catch { _ => panic() })
+  ignore(unsorted.append(b"b", b"2", (100 : Int64)) catch { _ => panic() })
+  ignore(unsorted.append(b"c", b"3", (200 : Int64)) catch { _ => panic() })
+  assert_true(!unsorted.segments[0].is_ts_sorted())
+  let mid = unsorted.scan_time_range((150 : Int64), (250 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(mid.length(), 1)
+  assert_eq(mid[0].key, b"c")
+}

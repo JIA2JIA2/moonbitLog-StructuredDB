@@ -336,12 +336,20 @@ pub fn[W, R : @io.LogReader] Log::scan_time_range(
       true
     }
     if overlaps {
-      let end = seg.base_offset + seg.record_count.to_uint64()
-      seg.for_each(seg.base_offset, end, rec => {
-        if rec.timestamp >= lo && rec.timestamp < hi {
-          out.push(rec)
+      if seg.is_ts_sorted() {
+        let from = seg.lower_bound_ts(lo)
+        let to = seg.lower_bound_ts(hi)
+        if from < to {
+          seg.for_each(from, to, rec => out.push(rec))
         }
-      })
+      } else {
+        let end = seg.base_offset + seg.record_count.to_uint64()
+        seg.for_each(seg.base_offset, end, rec => {
+          if rec.timestamp >= lo && rec.timestamp < hi {
+            out.push(rec)
+          }
+        })
+      }
     }
   }
   out

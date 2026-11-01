@@ -13,6 +13,10 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   missing or corrupt), so key-index-based reads no longer re-scan segments.
 - **Table-driven CRC32 (M48)**：`crc32` now uses a 256-entry lookup table built
   once at load instead of a bit-by-bit loop.
+- **In-segment time index (M49)**：segments track whether their timestamps are
+  non-decreasing (persisted in metadata v6); `scan_time_range` binary-searches
+  sorted segments for the `[lo, hi)` offset window and falls back to a linear
+  filter for unsorted ones.
 
 ## 0.3.0 - 2026-11-01
 

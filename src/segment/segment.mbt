@@ -22,6 +22,7 @@ pub(all) struct Segment[W, R] {
   mut crc_known : Bool
   mut compressed : Bool
   mut raw_size : Int64
+  mut ts_sorted : Bool
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
 }
@@ -68,6 +69,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     crc_known: false,
     compressed: false,
     raw_size: 0,
+    ts_sorted: true,
     keys: @hashmap.HashMap::HashMap([]),
     meta_loaded: false,
   }
@@ -94,6 +96,9 @@ pub fn[W, R] Segment::note_timestamp(self : Segment[W, R], ts : Int64) -> Unit {
     self.max_ts = ts
     self.time_known = true
   } else {
+    if ts < self.max_ts {
+      self.ts_sorted = false
+    }
     if ts < self.min_ts {
       self.min_ts = ts
     }
@@ -122,6 +127,38 @@ pub fn[W, R] Segment::max_timestamp(self : Segment[W, R]) -> Int64 {
 /// metadata written before time ranges were persisted).
 pub fn[W, R] Segment::has_time_range(self : Segment[W, R]) -> Bool {
   self.time_known
+}
+
+///|
+/// Whether this segment's records are ordered by non-decreasing timestamp.
+pub fn[W, R] Segment::is_ts_sorted(self : Segment[W, R]) -> Bool {
+  self.ts_sorted
+}
+
+///|
+/// Offset of the first record whose timestamp is >= `ts`. Valid only when the
+/// segment is timestamp-sorted (see `is_ts_sorted`); uses the sparse index and
+/// binary search over record offsets.
+pub fn[W, R : @io.LogReader] Segment::lower_bound_ts(
+  self : Segment[W, R],
+  ts : Int64,
+) -> UInt64 {
+  let mut lo = self.base_offset
+  let mut hi = self.base_offset + self.record_count.to_uint64()
+  while lo < hi {
+    let mid = lo + (hi - lo) / (2 : UInt64)
+    let probe = self.get(mid) catch { _ => return lo }
+    match probe {
+      Some(rec) =>
+        if rec.timestamp < ts {
+          lo = mid + (1 : UInt64)
+        } else {
+          hi = mid
+        }
+      None => hi = mid
+    }
+  }
+  lo
 }
 
 ///|
@@ -398,6 +435,7 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self.bloom = BloomFilter::new()
   self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
+  self.ts_sorted = true
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0
@@ -438,6 +476,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self.bloom = BloomFilter::new()
   self.keys = @hashmap.HashMap::HashMap([])
   self.time_known = false
+  self.ts_sorted = true
   let total = self.reader.length()
   let mut pos : Int64 = 0
   let mut n : Int32 = 0

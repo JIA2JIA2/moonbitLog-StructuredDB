@@ -14,7 +14,7 @@
 ///   u32 entry_count
 ///   entries[entry_count]: { u64 record_index, i64 position }
 ///   (v2+) bloom ; (v3+) min_ts/max_ts/time_known ; (v4+) data_crc/crc_known
-///   (v5+) compressed/raw_size ; u32 crc32
+///   (v5+) compressed/raw_size ; (v6+) ts_sorted ; u32 crc32
 pub(all) struct SegmentMeta {
   base_offset : UInt64
   next_offset : UInt64
@@ -30,13 +30,14 @@ pub(all) struct SegmentMeta {
   crc_known : Bool
   compressed : Bool
   raw_size : Int64
+  ts_sorted : Bool
 }
 
 ///|
 const SEGMENT_META_MAGIC : UInt32 = 0x4D4C5347
 
 ///|
-const SEGMENT_META_VERSION : UInt32 = 5
+const SEGMENT_META_VERSION : UInt32 = 6
 
 ///|
 const SEGMENT_META_HEADER : Int32 = 44
@@ -94,6 +95,7 @@ pub fn SegmentMeta::encode(self : SegmentMeta) -> Bytes {
   body.write_uint_le(if self.crc_known { 1 } else { 0 })
   body.write_uint_le(if self.compressed { 1 } else { 0 })
   body.write_int64_le(self.raw_size)
+  body.write_uint_le(if self.ts_sorted { 1 } else { 0 })
   let bytes = body.to_bytes()
   let out = @buffer.Buffer::Buffer()
   out.write_bytes(bytes)
@@ -186,6 +188,14 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     }
     compressed = meta_u32(data, pos) == 1
     raw_size = meta_i64(data, pos + 4)
+    pos = pos + 12
+  }
+  let mut ts_sorted = false
+  if version >= 6 {
+    if pos + 4 > body_end {
+      raise @core.MetaError::Truncated(pos)
+    }
+    ts_sorted = meta_u32(data, pos) == 1
   }
   {
     base_offset,
@@ -202,6 +212,7 @@ pub fn decode_segment_meta(data : Bytes) -> SegmentMeta raise @core.MetaError {
     crc_known,
     compressed,
     raw_size,
+    ts_sorted,
   }
 }
 
@@ -223,6 +234,7 @@ pub fn[W, R] Segment::to_meta(self : Segment[W, R]) -> SegmentMeta {
     crc_known: self.crc_known,
     compressed: self.compressed,
     raw_size: self.raw_size,
+    ts_sorted: self.ts_sorted,
   }
 }
 
@@ -249,5 +261,6 @@ pub fn[W, R] Segment::apply_meta(
   self.crc_known = meta.crc_known
   self.compressed = meta.compressed
   self.raw_size = meta.raw_size
+  self.ts_sorted = meta.ts_sorted
   self.meta_loaded = true
 }

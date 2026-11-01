@@ -48,6 +48,7 @@ pub(all) struct Segment[W, R] {
   mut crc_known : Bool
   mut compressed : Bool
   mut raw_size : Int64
+  mut ts_sorted : Bool
   mut keys : @hashmap.HashMap[Bytes, (UInt64, Bool)]
   mut meta_loaded : Bool
 }
@@ -64,8 +65,10 @@ pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
 pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
+pub fn[W, R] Segment::is_ts_sorted(Self[W, R]) -> Bool
 pub fn[W, R] Segment::key_count(Self[W, R]) -> Int32
 pub fn[W, R] Segment::load_keys(Self[W, R], Bytes) -> Unit raise @core.MetaError
+pub fn[W, R : @io.LogReader] Segment::lower_bound_ts(Self[W, R], Int64) -> UInt64
 pub fn[W, R] Segment::mark_compressed(Self[W, R], Int64) -> Unit
 pub fn[W, R] Segment::max_timestamp(Self[W, R]) -> Int64
 pub fn[W, R] Segment::may_contain(Self[W, R], Bytes) -> Bool
@@ -97,6 +100,7 @@ pub(all) struct SegmentMeta {
   crc_known : Bool
   compressed : Bool
   raw_size : Int64
+  ts_sorted : Bool
 }
 pub fn SegmentMeta::encode(Self) -> Bytes
 
