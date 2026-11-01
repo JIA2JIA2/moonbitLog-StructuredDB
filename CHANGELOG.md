@@ -40,6 +40,9 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Metadata compatibility tests (M56)**：tests build segment-meta buffers for
   every historical layout (v1–v7) and assert the current reader decodes each,
   guarding backward compatibility.
+- **Crash-consistency tests (M57)**：tests corrupt the `.index` sidecar and
+  delete the manifest / `.index` / `.keys` files, then assert `open_log_dir`
+  still recovers the records and rebuilds the key index from segment data alone.
 
 ## 0.3.0 - 2026-11-01
 

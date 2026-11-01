@@ -755,3 +755,93 @@ test "acquire_timeout retries a busy lock and fails on timeout" {
   again.release()
   clean_dir(dir)
 }
+
+///|
+test "open_log_dir recovers when the index sidecar is corrupt" {
+  let dir = "/tmp/moonlog_corrupt_index"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 6; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let ip = @backend_native.segment_index_path(dir, (0 : UInt64))
+  let data = @backend_native.read_file(ip)
+  assert_true(data.length() > 0)
+  let head : Bytes = if data.at(0).to_int() == 0 { b"\x01" } else { b"\x00" }
+  @backend_native.write_file(ip, head + @core.slice(data, 1, data.length())) catch {
+    _ => panic()
+  }
+  let reopened = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 6)
+  let index = reopened.build_key_index()
+  let got = reopened.get_latest(index, b"k") catch { _ => panic() }
+  match got {
+    Some(rec) => assert_eq(rec.value, b"value")
+    None => panic()
+  }
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+test "open_log_dir rebuilds keys when manifest and sidecars are missing" {
+  let dir = "/tmp/moonlog_missing_sidecars"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  let keys : Array[Bytes] = [
+    b"k0", b"k1", b"k2", b"k3", b"k4", b"k5", b"k6", b"k7",
+  ]
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(keys[i], b"v", i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let names = @backend_native.list_dir(dir) catch { _ => panic() }
+  for name in names {
+    if name.has_suffix(".index") ||
+      name.has_suffix(".keys") ||
+      name == @backend_native.MANIFEST_NAME {
+      ignore(@backend_native.remove_file(dir + "/" + name))
+    }
+  }
+  let reopened = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(reopened.count(), 8)
+  let index = reopened.build_key_index()
+  assert_eq(index.size(), 8)
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
