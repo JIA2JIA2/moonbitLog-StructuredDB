@@ -3,6 +3,15 @@
 All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## Unreleased
+
+### Added
+
+- **Native crash-injection property test (M67)**：the randomized-op property
+  test now also runs against the file backend, periodically simulating a torn
+  tail (truncating the last segment's data file after fsync) and rebuilding the
+  model from the surviving record count.
+
 ## 0.5.0 - 2026-11-01
 
 ### Added
