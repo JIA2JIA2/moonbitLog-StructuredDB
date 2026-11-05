@@ -1,6 +1,6 @@
 name = "JIA2JIA2/lsdb"
 
-version = "0.1.0"
+version = "0.9.0"
 
 readme = "README.md"
 

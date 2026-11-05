@@ -366,6 +366,7 @@ u32 crc32          (仅覆盖 body)
 - M94 修复预览：`repair_log_dir` 增加 `dry_run` 模式（只读探测 `probe_records`），CLI `fsck --dry-run` 打印修复计划——将截断/隔离/删除什么，不改盘；dry-run 计划与实际修复结果一致（测试断言）
 - M95 KeyIndex 增量维护：`append` 将新记录增量折叠进缓存的 key 索引（`KeyIndex::update`——新 offset 恒更大，put 刷新 latest、tombstone 移除键），`sorted_keys` 视图惰性重算；仅段集合结构变化（保留/合并/压缩/导入重放）才整体失效，写密集点查消除 O(全部 key) 的全量重建
 - M96 Bloom 快查 O(1) 化：`latest_key_in_segment` 直接查段的内存 key 映射（append/rebuild/`.keys` sidecar 加载恒就绪）取 latest offset 后单点读取，`get_latest_bloom` 从 O(段大小解码) 降为 O(1)，不再全段扫描
+- M97 发布 0.9.0：物理备份/恢复（增量 + 恢复即校验）、fsck --fix/--dry-run、follow/serve 守护、cursor-lag、JSONL 导出与压缩指标、流式遍历与批量读（recover 16.7×）、增量 key 索引与 Bloom 快查 O(1) 随包发布
 
 ## 许可
 
