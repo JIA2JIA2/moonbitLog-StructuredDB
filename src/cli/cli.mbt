@@ -1235,10 +1235,18 @@ fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
 }
 
 ///|
-/// Restore a backup made by `backup` into the empty directory `dst`.
+/// Restore a backup made by `backup` into the empty directory `dst`, then
+/// verify the restored copy (fast mode) so a silently corrupt backup is
+/// caught before it is put into service.
 fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
   let n = @backend_native.restore_log_dir(src, dst)
   println("restored " + n.to_string() + " segments to " + dst)
+  run_locked(dst, false, () => {
+    let log = open_log(dst)
+    let report = log.verify_fast()
+    print_verify(report)
+    close_log(log)
+  })
 }
 
 ///|

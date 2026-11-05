@@ -95,7 +95,8 @@ moonlog <command> <dir> [args...]
                                 flush 数据与元数据后原样拷贝段文件、sidecar
                                 与 MANIFEST；不拷贝 LOCK 与游标文件）
   restore <src> <dst>           将 backup 产物还原到空目录 dst（offset 原样
-                                保留，恢复后可无缝续写、游标仍有效）
+                                保留，恢复后可无缝续写、游标仍有效；完成后
+                                自动 verify_fast 校验并输出报告）
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
   has-key <dir> <key>           用段级 Bloom 过滤判断 key 是否存在
@@ -359,6 +360,7 @@ u32 crc32          (仅覆盖 body)
 - M90 批量读快路径：`scan`/`rebuild_index`/`recover` 改为单次读全段后内存顺序解码（`decode_in`），消除逐记录 pread——native bench 段恢复 86.9ms→5.2ms（16.7×）、全量顺序扫描 2.77ms→0.86ms（3.2×），点查/写入持平
 - M91 观测与导出：`SegmentSummary` 增加逻辑字节与 `disk_bytes`，`stats` 输出每段与总体的压缩尺寸（文本/JSON）；CLI `export-jsonl` 以 JSON Lines 导出（text/base64 双模式，内置 RFC 4648 base64 编码器）
 - M92 复制方案文档化：运维指南新增「异地同步/复制」——增量 backup + rsync 搭建主→备只读副本（offset/游标语义保留），并明确单写多读边界
+- M93 恢复即校验：`restore` 完成后自动对恢复副本执行 `verify_fast` 并输出报告，静默损坏的备份在投入使用前即被拦截
 
 ## 许可
 
