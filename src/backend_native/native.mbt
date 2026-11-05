@@ -1025,3 +1025,309 @@ pub fn DirLock::acquire_timeout(
   }
   { fd, held: true, }
 }
+
+///|
+/// Sleep for `ms` milliseconds. Used by long-running CLI commands (`follow`,
+/// `serve`) that poll the directory between iterations.
+pub fn sleep_ms(ms : Int32) -> Unit {
+  ignore(moonlog_sleep_ms(ms))
+}
+
+///|
+/// Rename `from` to `to`. Returns true on success; false when the source is
+/// missing or the rename fails.
+pub fn rename_file(from : String, to : String) -> Bool {
+  moonlog_rename(@utf8.encode(from), @utf8.encode(to)) >= 0
+}
+
+///|
+/// Whether `name` belongs to a log directory's durable state and is carried by
+/// a backup: segment data files, their `.index`/`.keys` sidecars, and the
+/// manifest. `LOCK` and consumer-cursor files are deliberately excluded — a
+/// backup snapshots the data, not consumer progress or process state.
+fn is_backup_file(name : String) -> Bool {
+  name == MANIFEST_NAME ||
+  name.has_suffix(".log") ||
+  name.has_suffix(".log.index") ||
+  name.has_suffix(".log.keys")
+}
+
+///|
+/// Number of segment data files among the entries of `dir`.
+fn count_segment_files(dir : String) -> Int32 raise @io.IoError {
+  let mut n = 0
+  for name in list_dir(dir) {
+    if name.has_suffix(".log") {
+      n = n + 1
+    }
+  }
+  n
+}
+
+///|
+/// Copy every durable-state file from `src` into the empty (or not yet
+/// existing) directory `dst`, returning the number of segment data files
+/// copied. The caller must hold the exclusive directory lock on `src` and
+/// have flushed both data (`Log::flush`) and metadata (`flush_meta`)
+/// beforehand, so the copied files form a consistent snapshot. `dst` must not
+/// already contain files, so a backup can never silently overwrite data.
+pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
+  ignore(ensure_dir(dst))
+  if list_dir(dst).length() > 0 {
+    raise @io.IoError::Invalid("backup target not empty: " + dst)
+  }
+  for name in list_dir(src) {
+    if is_backup_file(name) {
+      write_file(dst + "/" + name, read_file(src + "/" + name))
+    }
+  }
+  fsync_dir(dst)
+  count_segment_files(dst)
+}
+
+///|
+/// Materialize a backup made by `backup_log_dir`: copy its files into the
+/// empty (or not yet existing) directory `dst`. The backup must contain a
+/// decodable `MANIFEST`. Files are copied verbatim, so offsets are preserved
+/// exactly — the restored copy continues where the source stopped. Returns
+/// the number of segment data files restored.
+pub fn restore_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
+  let mpath = src + "/" + MANIFEST_NAME
+  if !file_exists(mpath) {
+    raise @io.IoError::Invalid("not a backup (missing MANIFEST): " + src)
+  }
+  let manifest_ok = try {
+    let m = @log.decode_manifest(read_file(mpath))
+    ignore(m.encode())
+    true
+  } catch {
+    _ => false
+  }
+  if !manifest_ok {
+    raise @io.IoError::Invalid("corrupt MANIFEST in backup: " + src)
+  }
+  ignore(ensure_dir(dst))
+  if list_dir(dst).length() > 0 {
+    raise @io.IoError::Invalid("restore target not empty: " + dst)
+  }
+  for name in list_dir(src) {
+    if is_backup_file(name) {
+      write_file(dst + "/" + name, read_file(src + "/" + name))
+    }
+  }
+  fsync_dir(dst)
+  count_segment_files(dst)
+}
+
+///|
+/// Rename a corrupt segment and its sidecars out of the way (suffix
+/// `.corrupt`) so a repair can rebuild without them while preserving the
+/// evidence for later inspection.
+fn quarantine_segment(dir : String, base : UInt64) -> Unit {
+  let data = dir + "/" + @segment.segment_file_name(base)
+  ignore(rename_file(data, data + ".corrupt"))
+  ignore(
+    rename_file(
+      segment_index_path(dir, base),
+      segment_index_path(dir, base) + ".corrupt",
+    ),
+  )
+  ignore(
+    rename_file(
+      segment_keys_path(dir, base),
+      segment_keys_path(dir, base) + ".corrupt",
+    ),
+  )
+  ignore(fsync_dir(dir) catch { _ => () })
+}
+
+///|
+/// Outcome of `repair_log_dir`.
+pub(all) struct RepairReport {
+  segments : Int32
+  records : Int32
+  /// Segments whose torn or corrupt tail was cut back to the last good record.
+  truncated : Int32
+  /// Segments quarantined as `<name>.corrupt` (unreadable, or failing their
+  /// whole-segment checksum), together with their sidecars.
+  isolated : Int32
+  /// Empty segment files removed during the pass.
+  removed_empty : Int32
+  /// Whether the manifest and per-segment sidecars were rewritten.
+  rebuilt_meta : Bool
+  /// First problem a fast verification still reports after the repair, if any.
+  still_bad : UInt64?
+}
+
+///|
+/// Inspect every segment file in `dir`, repair what can be repaired, and
+/// rebuild the manifest and sidecars:
+///
+/// - a segment failing its stored whole-segment checksum, or unreadable
+///   through its sidecar (e.g. a compressed segment with a broken index), is
+///   quarantined as `<name>.corrupt` and excluded from the rebuilt log;
+/// - a non-compressed segment with a torn or corrupt tail is truncated to the
+///   last good record boundary;
+/// - empty segment files are removed;
+/// - `MANIFEST` and every surviving segment's sidecars are rewritten
+///   atomically, whatever their previous state (missing, corrupt, stale).
+///
+/// Offsets of surviving segments are preserved, so the repaired log may have
+/// holes where segments were quarantined — the same state retention leaves
+/// behind, and reads of `verify` treat holes as legal. Returns a report
+/// including a fast re-verification of the result. The caller must hold the
+/// exclusive directory lock.
+pub fn repair_log_dir(
+  dir : String,
+  roll_size : Int64,
+) -> RepairReport raise @io.IoError {
+  ignore(ensure_dir(dir))
+  let bases : Array[UInt64] = []
+  for name in list_dir(dir) {
+    match parse_base_from_log_name(name) {
+      Some(base) => bases.push(base)
+      None => ()
+    }
+  }
+  bases.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+  let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
+  let mut truncated = 0
+  let mut isolated = 0
+  let mut removed_empty = 0
+  for base in bases {
+    let data_path = dir + "/" + @segment.segment_file_name(base)
+    let ip = segment_index_path(dir, base)
+    let meta : @segment.SegmentMeta? = if file_exists(ip) {
+      Some(@segment.decode_segment_meta(read_file(ip))) catch {
+        _ => None
+      }
+    } else {
+      None
+    }
+    let valid : @segment.SegmentMeta? = match meta {
+      Some(m) => if m.base_offset == base { Some(m) } else { None }
+      None => None
+    }
+    // A compressed segment can only be read through its sidecar; verify it
+    // through the decompressing view and quarantine on any failure.
+    let compressed_check : Bool? = match valid {
+      Some(m) =>
+        if m.compressed {
+          Some(
+            try {
+              let f = NativeFileLog::open_compressed(
+                data_path,
+                m.raw_size,
+                m.comp_algo,
+              )
+              let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
+                f, f, base,
+              )
+              seg.apply_meta(m)
+              let ok = !m.crc_known || seg.compute_checksum() == m.data_crc
+              f.close()
+              ok
+            } catch {
+              _ => false
+            },
+          )
+        } else {
+          None
+        }
+      None => None
+    }
+    match compressed_check {
+      Some(ok) => {
+        if ok {
+          // Reload through the normal fast path so it joins the rebuilt log.
+          let loaded = Some(load_segment(dir, base)) catch { _ => None }
+          match loaded {
+            Some(seg) => segs.push(seg)
+            None => {
+              quarantine_segment(dir, base)
+              isolated = isolated + 1
+            }
+          }
+        } else {
+          quarantine_segment(dir, base)
+          isolated = isolated + 1
+        }
+        continue
+      }
+      None => ()
+    }
+    // Uncompressed (or sidecar-less): open raw and recover, cutting any torn
+    // tail back to the last good record.
+    let opened = Some(NativeFileLog::open(data_path)) catch { _ => None }
+    match opened {
+      None => {
+        quarantine_segment(dir, base)
+        isolated = isolated + 1
+      }
+      Some(w) => {
+        let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
+          w, w, base,
+        )
+        match valid {
+          Some(m) => seg.apply_meta(m)
+          None => ()
+        }
+        // A stored whole-segment checksum that no longer matches quarantines
+        // the segment: recovery only understands damage at the tail, and
+        // letting it run over a segment corrupted in the middle would drop
+        // data without a trace.
+        let checksum_bad = if seg.has_checksum() {
+          let actual = Some(seg.compute_checksum()) catch { _ => None }
+          actual != Some(seg.stored_checksum())
+        } else {
+          false
+        }
+        if checksum_bad {
+          w.close()
+          quarantine_segment(dir, base)
+          isolated = isolated + 1
+        } else {
+          let before = w.size
+          let n = seg.recover() catch { _ => 0 }
+          if n <= 0 {
+            w.close()
+            remove_segment_files(dir, base)
+            removed_empty = removed_empty + 1
+          } else {
+            if seg.size < before {
+              truncated = truncated + 1
+            }
+            segs.push(seg)
+          }
+        }
+      }
+    }
+  }
+  let log = @log.Log::recover(
+    roll_size,
+    base => {
+      open_segment_in_dir(dir, base, interval=index_interval_for(roll_size))
+    },
+    segs,
+  )
+  flush_meta(dir, log)
+  let segments = log.segment_count()
+  let records = log.count()
+  let check = log.verify_fast()
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let still_bad : UInt64? = match check.first_bad_offset {
+    Some(off) => Some(off)
+    None => check.first_bad_checksum
+  }
+  {
+    segments,
+    records,
+    truncated,
+    isolated,
+    removed_empty,
+    rebuilt_meta: true,
+    still_bad,
+  }
+}

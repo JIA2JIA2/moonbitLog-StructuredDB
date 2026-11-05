@@ -14,6 +14,10 @@
 - **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes` / `Log::retain_before`（按 offset / 段数 / 总字节 / 时间戳）以整段删除方式回收旧数据。
 - **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
+- **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读。
+- **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
+- **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
+- **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
 - **工程化**：property/fuzz 随机截断与损坏恢复测试、`moon bench` 基准、GitHub Actions CI。
@@ -74,6 +78,21 @@ moonlog <command> <dir> [args...]
   cursor-load <dir> <name>      读取命名消费游标位置
   cursor-list <dir>             列出全部命名消费游标位置
   cursor-drop <dir> <name>      删除命名消费游标位置
+  follow <dir> [start|-|tail] [--once] [--commit]
+                                持续打印新追加的记录（`-` 从持久化游标续读，
+                                `tail` 从当前末尾开始；`--commit` 每批后提交
+                                游标；`--once` 拉取一轮即退出；轮询间隔可用
+                                `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
+  serve <dir> <max-segments> [ttl] [--every ms] [--once]
+                                周期性执行维护（合并 + 冗余回收 + 可选过期折
+                                叠 + flush 元数据）；`--every` 或
+                                `MOONLOG_SERVE_INTERVAL` 设置周期，默认
+                                60000ms；`--once` 执行一轮即退出
+  backup <dir> <dst>            将目录的一致快照拷贝到空目录 dst（独占锁内
+                                flush 数据与元数据后原样拷贝段文件、sidecar
+                                与 MANIFEST；不拷贝 LOCK 与游标文件）
+  restore <src> <dst>           将 backup 产物还原到空目录 dst（offset 原样
+                                保留，恢复后可无缝续写、游标仍有效）
   getkey <dir> <key>            查询 key 的最新值（tombstone 生效）
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
   has-key <dir> <key>           用段级 Bloom 过滤判断 key 是否存在
@@ -81,7 +100,11 @@ moonlog <command> <dir> [args...]
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   compact-expired <dir> <ttl>   折叠 live 记录并剔除已过期记录（offset 重排）
-  fsck <dir> [fast]             校验完整性（fast 跳过记录解码，段级 CRC）
+  fsck <dir> [fast] [--fix]     校验完整性（fast 跳过记录解码，段级 CRC）；
+                                `--fix` 先执行修复：隔离整段校验失败的段
+                                （改名 `<name>.corrupt` 保留证据）、截断损坏
+                                尾部、重建 MANIFEST 与全部段 sidecar，随后
+                                再校验一次并输出报告
 stats <dir> [json]            打印逐段统计（可选 JSON）
 ```
 
@@ -109,6 +132,9 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
 | `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `compress_log_dir` / `count_compressible_segments` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、段压缩与计数、目录锁（含超时重试） |
 | `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
+| `backup_log_dir` / `restore_log_dir` | `backend_native` | 目录级物理备份 / 恢复（拷贝段文件、sidecar 与 MANIFEST，offset 保留） |
+| `repair_log_dir` / `RepairReport` | `backend_native` | 修复：坏段隔离（`.corrupt`）、torn-tail 截断、MANIFEST/sidecar 重建 |
+| `sleep_ms` / `rename_file` | `backend_native` | 轮询休眠与文件改名（`follow`/`serve`/`repair` 支撑） |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
 
@@ -297,6 +323,10 @@ u32 crc32          (仅覆盖 body)
 - M78 ts 采样持久化（meta v8）：稀疏索引条目附 timestamp（兼容读 v1–v7），打开的段加载即恢复内存 ts 采样，`scan_time_range` 立即使用采样二分
 - M79 `get_many` 段分组点查：批量点查按 offset 排序后单次顺序遍历段，替代逐 key 重复定位
 - M80 发布 0.8.0：维护/游标 property 测试、tombstone 安全修剪修复、ts 采样持久化、get_many 段分组随包发布
+- M81 物理备份/恢复：`backup_log_dir` / `restore_log_dir` 与 CLI `backup` / `restore`（独占锁内 flush 后原样拷贝，空目录强制、MANIFEST 校验，offset 保留）
+- M82 修复模式：`repair_log_dir` 与 CLI `fsck --fix`（整段 CRC 失败隔离为 `.corrupt`、torn-tail 截断、空段清理、MANIFEST 与段 sidecar 原子重建）
+- M83 尾随读：CLI `follow`（轮询新记录持续输出，`-`/`tail`/offset 起点、`--commit` 自动提交游标、`--once` 单轮、`MOONLOG_FOLLOW_INTERVAL` 间隔）
+- M84 自动维护：CLI `serve`（周期性维护管线，`--every`/`MOONLOG_SERVE_INTERVAL` 周期、`--once` 单轮；`maintain` 核心重构为共享的 `run_maintenance`）
 
 ## 许可
 

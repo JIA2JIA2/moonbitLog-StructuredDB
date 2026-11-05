@@ -26,6 +26,12 @@
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   maintain <dir> <max-segments> [ttl]
 ///                                    merge + prune-superseded + compact-expired + fsck
+///   serve <dir> <max-segments> [ttl] [--every ms] [--once]
+///                                    run maintenance periodically
+///   follow <dir> [start|-|tail] [--once] [--commit]
+///                                    print new records as they are appended
+///   backup <dir> <dst>               copy a consistent snapshot into dst
+///   restore <src> <dst>              materialize a backup into dst
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
@@ -41,7 +47,7 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
-///   fsck <dir> [fast]                verify integrity (fast skips record decoding)
+///   fsck <dir> [fast] [--fix]        verify integrity; --fix repairs what it can
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
@@ -55,7 +61,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -144,21 +150,23 @@ fn lock_timeout_ms() -> Int32 {
 }
 
 ///|
-/// Run `action` while holding the directory lock (exclusive for writers). Waits
-/// up to `lock_timeout_ms()` for a busy lock so concurrent writers can queue.
-fn run_locked(
+/// Run `action` while holding the directory lock (exclusive for writers) and
+/// return its result. Waits up to `lock_timeout_ms()` for a busy lock so
+/// concurrent writers can queue.
+fn[T] run_locked(
   dir : String,
   exclusive : Bool,
-  action : () -> Unit raise @io.IoError,
-) -> Unit raise @io.IoError {
+  action : () -> T raise @io.IoError,
+) -> T raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
   let lock = @backend_native.DirLock::acquire_timeout(
     dir,
     exclusive,
     lock_timeout_ms(),
   )
-  action()
+  let result = action()
   lock.release()
+  result
 }
 
 ///|
@@ -449,37 +457,64 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Print a VerifyReport in the shared fsck/maintain format.
+fn print_verify(report : @log.VerifyReport) -> Unit {
+  println("segments " + report.segments.to_string())
+  println("records " + report.records.to_string())
+  let mut ok = true
+  match report.first_bad_offset {
+    Some(off) => {
+      ok = false
+      println("corrupt: offset mismatch at " + off.to_string())
+    }
+    None => ()
+  }
+  match report.first_bad_checksum {
+    Some(off) => {
+      ok = false
+      println("corrupt: checksum mismatch at " + off.to_string())
+    }
+    None => ()
+  }
+  if ok {
+    println("ok")
+  }
+}
+
+///|
 /// Sweep the log and report whether offsets are contiguous throughout. With
 /// `fast`, only segment metadata and stored whole-segment checksums are
 /// checked (no record decoding) — much cheaper on large directories, but it
-/// cannot detect corruption inside individual records.
-fn cmd_fsck(dir : String, fast : Bool) -> Unit raise @io.IoError {
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let report = if fast { log.verify_fast() } else { log.verify() }
-    println("mode " + (if fast { "fast" } else { "full" }))
-    println("segments " + report.segments.to_string())
-    println("records " + report.records.to_string())
-    let mut ok = true
-    match report.first_bad_offset {
-      Some(off) => {
-        ok = false
-        println("corrupt: offset mismatch at " + off.to_string())
-      }
-      None => ()
-    }
-    match report.first_bad_checksum {
-      Some(off) => {
-        ok = false
-        println("corrupt: checksum mismatch at " + off.to_string())
-      }
-      None => ()
-    }
-    if ok {
-      println("ok")
-    }
-    close_log(log)
-  })
+/// cannot detect corruption inside individual records. With `fix`, run a
+/// repair pass first (quarantine segments failing their checksum, cut torn
+/// tails, rebuild the manifest and sidecars) and then verify the result.
+fn cmd_fsck(dir : String, fast : Bool, fix : Bool) -> Unit raise @io.IoError {
+  if fix {
+    run_locked(dir, true, () => {
+      let rep = @backend_native.repair_log_dir(dir, ROLL_SIZE)
+      println(
+        "repaired truncated " +
+        rep.truncated.to_string() +
+        " isolated " +
+        rep.isolated.to_string() +
+        " removed-empty " +
+        rep.removed_empty.to_string(),
+      )
+      let log = open_log(dir)
+      let report = if fast { log.verify_fast() } else { log.verify() }
+      println("mode " + (if fast { "fast" } else { "full" }) + " (post-fix)")
+      print_verify(report)
+      close_log(log)
+    })
+  } else {
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let report = if fast { log.verify_fast() } else { log.verify() }
+      println("mode " + (if fast { "fast" } else { "full" }))
+      print_verify(report)
+      close_log(log)
+    })
+  }
 }
 
 ///|
@@ -591,29 +626,19 @@ fn cmd_merge(dir : String, max_str : String) -> Unit raise @io.IoError {
 }
 
 ///|
-/// One-shot maintenance: merge contiguous rolled-over segments down to
-/// `max_segments`, drop fully-superseded segments, fold away expired records
-/// when `ttl` is given, then finish with an fsck report.
-fn cmd_maintain(
+/// One maintenance pass inside the exclusive lock: merge contiguous
+/// rolled-over segments down to `max_segments`, drop fully-superseded
+/// segments, fold away expired records when `ttl_ms` is given, then flush the
+/// manifest and sidecars. Returns `(merged, dropped, folded)`; `folded` is -1
+/// when no TTL was given.
+fn run_maintenance(
   dir : String,
-  max_str : String,
-  ttl : String?,
-) -> Unit raise @io.IoError {
-  let max = @string.parse_int(max_str) catch {
-    _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
-  }
-  let ttl_ms : Int64? = match ttl {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid ttl: " + s)
-        },
-      )
-    None => (None : Int64?)
-  }
+  max_segments : Int32,
+  ttl_ms : Int64?,
+) -> (Int32, Int32, Int32) raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
-    let merged = log.merge_segments(max, seg => {
+    let merged = log.merge_segments(max_segments, seg => {
       @backend_native.remove_segment_files(dir, seg.base_offset)
       seg.writer.close()
     })
@@ -632,36 +657,103 @@ fn cmd_maintain(
     }
     @backend_native.flush_meta(dir, log)
     close_log(log)
-    println("merged " + merged.to_string())
-    println("superseded dropped " + dropped.to_string())
-    match ttl_ms {
-      Some(_) => println("expired folded " + folded.to_string())
-      None => ()
-    }
+    (merged, dropped, folded)
+  })
+}
+
+///|
+/// Parse a `maintain`/`serve` TTL argument (milliseconds).
+fn parse_ttl(ttl : String?) -> Int64? raise @io.IoError {
+  match ttl {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid ttl: " + s)
+        },
+      )
+    None => (None : Int64?)
+  }
+}
+
+///|
+/// One-shot maintenance: merge contiguous rolled-over segments down to
+/// `max_segments`, drop fully-superseded segments, fold away expired records
+/// when `ttl` is given, then finish with an fsck report.
+fn cmd_maintain(
+  dir : String,
+  max_str : String,
+  ttl : String?,
+) -> Unit raise @io.IoError {
+  let max = @string.parse_int(max_str) catch {
+    _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
+  }
+  let ttl_ms = parse_ttl(ttl)
+  let (merged, dropped, folded) = run_maintenance(dir, max, ttl_ms)
+  println("merged " + merged.to_string())
+  println("superseded dropped " + dropped.to_string())
+  match ttl_ms {
+    Some(_) => println("expired folded " + folded.to_string())
+    None => ()
+  }
+  run_locked(dir, false, () => {
     let reopened = open_log(dir)
     let report = reopened.verify()
-    println("segments " + report.segments.to_string())
-    println("records " + report.records.to_string())
-    let mut ok = true
-    match report.first_bad_offset {
-      Some(off) => {
-        ok = false
-        println("corrupt: offset mismatch at " + off.to_string())
-      }
-      None => ()
-    }
-    match report.first_bad_checksum {
-      Some(off) => {
-        ok = false
-        println("corrupt: checksum mismatch at " + off.to_string())
-      }
-      None => ()
-    }
-    if ok {
-      println("ok")
-    }
+    print_verify(report)
     close_log(reopened)
   })
+}
+
+///|
+/// Periodic maintenance loop: run the one-shot `maintain` pipeline (merge
+/// contiguous rolled segments down to `max_segments`, prune superseded
+/// segments, fold expired records when a TTL is given) and flush metadata,
+/// then sleep and repeat. `--every ms` (or `MOONLOG_SERVE_INTERVAL`, default
+/// 60000) selects the pause between passes; `--once` runs a single pass and
+/// returns, which keeps the command scriptable and testable.
+fn cmd_serve(
+  dir : String,
+  max_str : String,
+  ttl : String?,
+  every : String?,
+  once : Bool,
+) -> Unit raise @io.IoError {
+  let max = @string.parse_int(max_str) catch {
+    _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
+  }
+  let ttl_ms = parse_ttl(ttl)
+  let every_ms = match every {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid interval: " + s)
+      }
+    None =>
+      match @env.get_env_var("MOONLOG_SERVE_INTERVAL") {
+        Some(v) => @string.parse_int(v) catch { _ => 60000 }
+        None => 60000
+      }
+  }
+  let mut cycle = 0
+  let mut go = true
+  while go {
+    let (merged, dropped, folded) = run_maintenance(dir, max, ttl_ms)
+    cycle = cycle + 1
+    let mut line = "cycle " +
+      cycle.to_string() +
+      ": merged " +
+      merged.to_string() +
+      " superseded dropped " +
+      dropped.to_string()
+    match ttl_ms {
+      Some(_) => line = line + " expired folded " + folded.to_string()
+      None => ()
+    }
+    println(line)
+    if once {
+      go = false
+    } else {
+      @backend_native.sleep_ms(every_ms)
+    }
+  }
 }
 
 ///|
@@ -925,6 +1017,104 @@ fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Take a physical backup of `src` into the empty directory `dst`: hold the
+/// exclusive lock, flush data and metadata, then copy the segment files,
+/// sidecars and manifest. Offsets are preserved, so the restored copy
+/// continues where the source stopped and committed cursor positions remain
+/// meaningful against it.
+fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
+  run_locked(src, true, () => {
+    let log = open_log(src)
+    log.flush()
+    @backend_native.flush_meta(src, log)
+    close_log(log)
+    let n = @backend_native.backup_log_dir(src, dst)
+    println("backed up " + n.to_string() + " segments to " + dst)
+  })
+}
+
+///|
+/// Restore a backup made by `backup` into the empty directory `dst`.
+fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
+  let n = @backend_native.restore_log_dir(src, dst)
+  println("restored " + n.to_string() + " segments to " + dst)
+}
+
+///|
+/// Poll interval for `follow`, overridable with `MOONLOG_FOLLOW_INTERVAL`.
+fn follow_interval_ms() -> Int32 {
+  match @env.get_env_var("MOONLOG_FOLLOW_INTERVAL") {
+    Some(v) => @string.parse_int(v) catch { _ => 200 }
+    None => 200
+  }
+}
+
+///|
+/// Tail the log: print new records as they are appended, polling the
+/// directory until interrupted. `start` selects the first offset to print
+/// (`-` resumes from the persisted cursor, `tail` starts at the current end,
+/// default 0). With `--commit`, each batch advances the persisted consumer
+/// cursor so `cursor -` and the next `follow -` resume past it; run only one
+/// committing follower at a time. With `--once`, a single pass is made and
+/// the command returns (for scripts and tests).
+fn cmd_follow(
+  dir : String,
+  start : String,
+  once : Bool,
+  commit : Bool,
+) -> Unit raise @io.IoError {
+  let mut from : UInt64 = (0 : UInt64)
+  if start == "tail" {
+    let lock = @backend_native.DirLock::acquire_timeout(
+      dir,
+      false,
+      lock_timeout_ms(),
+    )
+    let log = open_log(dir)
+    from = log.next_offset()
+    close_log(log)
+    lock.release()
+  } else if start == "-" {
+    from = @backend_native.load_cursor(dir)
+  } else {
+    from = parse_offset(start)
+  }
+  let interval = follow_interval_ms()
+  let mut fetched = 0
+  let mut go = true
+  while go {
+    let lock = @backend_native.DirLock::acquire_timeout(
+      dir,
+      false,
+      lock_timeout_ms(),
+    )
+    let log = open_log(dir)
+    let next = log.next_offset()
+    if next > from {
+      let recs = log.scan_range(from, next)
+      for rec in recs {
+        print_record(rec)
+      }
+      fetched = fetched + recs.length()
+      from = next
+      if commit {
+        @backend_native.save_cursor(dir, from)
+      }
+    }
+    close_log(log)
+    lock.release()
+    if once {
+      go = false
+    } else {
+      @backend_native.sleep_ms(interval)
+    }
+  }
+  println(
+    "(" + fetched.to_string() + " records, cursor " + from.to_string() + ")",
+  )
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -996,8 +1186,72 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let json = args.length() > 3 && args[3] == "json"
     cmd_stats(args[2], json)
   } else if cmd == "fsck" {
-    let fast = args.length() > 3 && args[3] == "fast"
-    cmd_fsck(args[2], fast)
+    let mut fast = false
+    let mut fix = false
+    let mut i = 3
+    while i < args.length() {
+      if args[i] == "fast" {
+        fast = true
+      } else if args[i] == "--fix" {
+        fix = true
+      }
+      i = i + 1
+    }
+    cmd_fsck(args[2], fast, fix)
+  } else if cmd == "backup" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_backup(args[2], args[3])
+    }
+  } else if cmd == "restore" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_restore(args[2], args[3])
+    }
+  } else if cmd == "follow" {
+    let mut start = "0"
+    let mut once = false
+    let mut commit = false
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--once" {
+        once = true
+      } else if a == "--commit" {
+        commit = true
+      } else {
+        start = a
+      }
+      i = i + 1
+    }
+    cmd_follow(args[2], start, once, commit)
+  } else if cmd == "serve" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut ttl : String? = (None : String?)
+      let mut every : String? = (None : String?)
+      let mut once = false
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--once" {
+          once = true
+        } else if a == "--every" && i + 1 < args.length() {
+          every = Some(args[i + 1])
+          i = i + 1
+        } else {
+          match ttl {
+            None => ttl = Some(a)
+            Some(_) => ()
+          }
+        }
+        i = i + 1
+      }
+      cmd_serve(args[2], args[3], ttl, every, once)
+    }
   } else if cmd == "prune" {
     if args.length() < 4 {
       println(USAGE)

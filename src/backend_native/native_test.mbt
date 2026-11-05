@@ -1215,3 +1215,210 @@ test "a freshly loaded segment does not need fsync" {
   }
   clean_dir(dir)
 }
+
+///|
+test "backup and restore roundtrip preserves records and offsets" {
+  let src = "/tmp/moonlog_backup_src"
+  let dst = "/tmp/moonlog_backup_dst"
+  let rst = "/tmp/moonlog_backup_restored"
+  ignore(@backend_native.ensure_dir(src))
+  ignore(@backend_native.ensure_dir(dst))
+  ignore(@backend_native.ensure_dir(rst))
+  clean_dir(src)
+  clean_dir(dst)
+  clean_dir(rst)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(src, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(src, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let n = @backend_native.backup_log_dir(src, dst) catch { _ => panic() }
+  assert_true(n >= 2)
+  // A backup refuses to overwrite a non-empty target.
+  let refused = try {
+    ignore(@backend_native.backup_log_dir(src, dst))
+    false
+  } catch {
+    _ => true
+  }
+  assert_true(refused)
+  let m = @backend_native.restore_log_dir(dst, rst) catch { _ => panic() }
+  assert_eq(m, n)
+  // The restored copy matches the source, offsets included.
+  let rlog = @backend_native.open_log_dir(rst, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), 8)
+  assert_eq(rlog.next_offset(), (8 : UInt64))
+  let recs = rlog.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 8)
+  assert_eq(recs[0].offset, (0 : UInt64))
+  assert_eq(recs[0].timestamp, (0 : Int64))
+  assert_eq(recs[7].offset, (7 : UInt64))
+  // The restored copy is immediately appendable.
+  let off = rlog.append(b"k", b"more", (100 : Int64)) catch { _ => panic() }
+  assert_eq(off, (8 : UInt64))
+  @backend_native.flush_meta(rst, rlog) catch {
+    _ => panic()
+  }
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(src)
+  clean_dir(dst)
+  clean_dir(rst)
+}
+
+///|
+test "restore rejects a directory without a decodable MANIFEST" {
+  let src = "/tmp/moonlog_restore_badsrc"
+  let dst = "/tmp/moonlog_restore_baddst"
+  ignore(@backend_native.ensure_dir(src))
+  ignore(@backend_native.ensure_dir(dst))
+  clean_dir(src)
+  clean_dir(dst)
+  @backend_native.write_file(src + "/MANIFEST", b"garbage") catch {
+    _ => panic()
+  }
+  let rejected = try {
+    ignore(@backend_native.restore_log_dir(src, dst))
+    false
+  } catch {
+    _ => true
+  }
+  assert_true(rejected)
+  clean_dir(src)
+  clean_dir(dst)
+}
+
+///|
+test "repair truncates a torn tail and rebuilds the manifest" {
+  let dir = "/tmp/moonlog_repair_tail"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  ignore(log.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"b", (1 : Int64)) catch { _ => panic() })
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // Inject a torn tail and drop the manifest.
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let f = @backend_native.NativeFileLog::open(path) catch { _ => panic() }
+  ignore(f.append(b"junk") catch { _ => panic() })
+  f.close()
+  ignore(@backend_native.remove_file(dir + "/MANIFEST"))
+  let rep = @backend_native.repair_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rep.truncated, 1)
+  assert_eq(rep.isolated, 0)
+  assert_eq(rep.removed_empty, 0)
+  assert_eq(rep.records, 2)
+  match rep.still_bad {
+    Some(_) => panic()
+    None => ()
+  }
+  // The rebuilt manifest is used by the next open, and appends continue.
+  let rlog = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), 2)
+  let off = rlog.append(b"k", b"c", (2 : Int64)) catch { _ => panic() }
+  assert_eq(off, (2 : UInt64))
+  @backend_native.flush_meta(dir, rlog) catch {
+    _ => panic()
+  }
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+test "repair quarantines a segment failing its stored checksum" {
+  let dir = "/tmp/moonlog_repair_isolate"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let total_segments = log.segment_count()
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // Flip a byte in the first (rolled) segment's data file; the size is
+  // unchanged, so only the whole-segment checksum catches this.
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let data = @backend_native.read_file(path)
+  let head : Bytes = if data.at(0).to_int() == 0 { b"\x01" } else { b"\x00" }
+  @backend_native.write_file(path, head + @core.slice(data, 1, data.length())) catch {
+    _ => panic()
+  }
+  let rep = @backend_native.repair_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rep.isolated, 1)
+  assert_eq(rep.segments, total_segments - 1)
+  assert_true(rep.records > 0)
+  match rep.still_bad {
+    Some(_) => panic()
+    None => ()
+  }
+  // The evidence is kept next to the data as <name>.corrupt.
+  assert_true(
+    @backend_native.file_exists(
+      dir + "/" + @segment.segment_file_name((0 : UInt64)) + ".corrupt",
+    ),
+  )
+  // The surviving log reopens with holes tolerated and stays appendable.
+  let rlog = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), rep.records)
+  let before = rlog.next_offset()
+  let tail = rlog.append(b"k", b"after", (200 : Int64)) catch { _ => panic() }
+  assert_eq(tail, before)
+  @backend_native.flush_meta(dir, rlog) catch {
+    _ => panic()
+  }
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
