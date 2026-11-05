@@ -492,22 +492,18 @@ pub fn[W, R : @io.LogReader] Log::scan_key_range(
 
 ///|
 /// The last record for `key` within a single segment (latest offset wins),
-/// whether a put or a tombstone.
+/// whether a put or a tombstone. The segment's in-memory key map — populated
+/// by appends, rebuilds and sidecar loads, and always holding each key's
+/// latest offset — makes this a map lookup plus one point read instead of a
+/// full segment scan.
 fn[W, R : @io.LogReader] latest_key_in_segment(
   seg : @segment.Segment[W, R],
   key : Bytes,
 ) -> @core.Record? raise @io.IoError {
-  let recs = seg.scan()
-  let mut found : @core.Record? = None
-  for rec in recs {
-    if rec.key == key {
-      match found {
-        Some(prev) => if rec.offset > prev.offset { found = Some(rec) }
-        None => found = Some(rec)
-      }
-    }
+  match seg.keys.get(key) {
+    Some((off, _del)) => seg.get(off)
+    None => (None : @core.Record?)
   }
-  found
 }
 
 ///|
