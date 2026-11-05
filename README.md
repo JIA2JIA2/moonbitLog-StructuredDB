@@ -255,6 +255,19 @@ u32 crc32          (仅覆盖 body)
 - **维护周期**：建议定期执行 `maintain <dir> <max-segments> [ttl]`：段合并控制读放大与 fd 占用，`prune-superseded` 回收冗余空间，`compact-expired <ttl>` 回收过期数据。
 - **游标语义**：`prune-*` 系列自动保护未消费段；`compact` / `compact-expired` / `import` 重排 offset 后需重置游标——详见「游标与段回收语义（M72）」。
 - **fsck 两档**：日常巡检用 `fsck <dir> fast`（不解码记录体，段级 CRC）；事故排查用 `fsck <dir>`（全量解码，能定位记录级损坏）。
+- **异地同步/复制（M92）**：段文件 immutable，是天然的增量复制单元，无需专用协议即可搭建主→备同步：
+
+  ```bash
+  # 主机（生产者）：定时增量推送（backup 幂等，重复执行只传变更段）
+  moonlog backup /data/moonlog primary-bak
+  rsync -a --delete primary-bak/ backup-host:/data/moonlog-replica/
+
+  # 备机（消费者）：首次落地 + 周期刷新
+  moonlog backup /data/moonlog primary-bak   # 增量
+  rsync -a primary-bak/ replica/
+  ```
+
+  备机目录结构与主目录字节一致（MANIFEST/段/sidecar），offset 与游标语义原样保留——备机可直接 `scan` / `getkey` / `follow -` 消费，故障切换时把备机目录交给写者即可（游标文件不随 backup 拷贝，如需保留消费进度先 `cp CURSOR*` 或在备机 `cursor-commit`）。注意：只做单向复制，双主互写不受支持。
 
 ## 里程碑
 
@@ -345,6 +358,7 @@ u32 crc32          (仅覆盖 body)
 - M89 流式遍历：`Segment::for_each_while` / `Log::for_each_while`（`f` 返回 `false` 提前终止，跨段传播）与 `Log::for_each_time_range`；CLI `scan`/`scan-time`/`tail` 改流式输出，大结果集不再物化 Array
 - M90 批量读快路径：`scan`/`rebuild_index`/`recover` 改为单次读全段后内存顺序解码（`decode_in`），消除逐记录 pread——native bench 段恢复 86.9ms→5.2ms（16.7×）、全量顺序扫描 2.77ms→0.86ms（3.2×），点查/写入持平
 - M91 观测与导出：`SegmentSummary` 增加逻辑字节与 `disk_bytes`，`stats` 输出每段与总体的压缩尺寸（文本/JSON）；CLI `export-jsonl` 以 JSON Lines 导出（text/base64 双模式，内置 RFC 4648 base64 编码器）
+- M92 复制方案文档化：运维指南新增「异地同步/复制」——增量 backup + rsync 搭建主→备只读副本（offset/游标语义保留），并明确单写多读边界
 
 ## 许可
 
