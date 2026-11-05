@@ -5,10 +5,23 @@
 pub(all) enum RecordKind {
   Put
   Delete
-} derive(Eq, Debug)
+}
+
+///|
+pub impl Eq for RecordKind with fn equal(self, other : RecordKind) -> Bool {
+  (self is Put) == (other is Put)
+}
 
 ///|
 pub extend RecordKind with Eq::{equal, not_equal}
+
+///|
+pub impl Debug for RecordKind with fn to_repr(self) {
+  match self {
+    Put => Repr::ctor("Put", [])
+    Delete => Repr::ctor("Delete", [])
+  }
+}
 
 ///|
 pub extend RecordKind with @debug.Debug::{to_repr}
@@ -34,7 +47,27 @@ pub(all) struct Record {
   kind : RecordKind
   key : Bytes
   value : Bytes
-} derive(Eq, Debug)
+}
+
+///|
+pub impl Eq for Record with fn equal(self, other : Record) -> Bool {
+  self.offset == other.offset &&
+  self.timestamp == other.timestamp &&
+  self.kind == other.kind &&
+  self.key == other.key &&
+  self.value == other.value
+}
+
+///|
+pub impl Debug for Record with fn to_repr(self) {
+  Repr::ctor("Record", [
+    (Some("offset"), @debug.Repr(self.offset)),
+    (Some("timestamp"), @debug.Repr(self.timestamp)),
+    (Some("kind"), @debug.Repr(self.kind)),
+    (Some("key"), @debug.Repr(self.key)),
+    (Some("value"), @debug.Repr(self.value)),
+  ])
+}
 
 ///|
 pub extend Record with Eq::{equal, not_equal}

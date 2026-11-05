@@ -29,11 +29,13 @@ pub fn ConsumerCursor::seek(Self, UInt64) -> Unit
 pub(all) struct KeyIndex {
   entries : @hashmap.HashMap[Bytes, UInt64]
   mut sorted_keys : Array[Bytes]
+  mut keys_dirty : Bool
 }
 pub fn KeyIndex::latest(Self, Bytes) -> UInt64?
 pub fn KeyIndex::new() -> Self
 pub fn KeyIndex::size(Self) -> Int32
 pub fn KeyIndex::sorted_keys(Self) -> Array[Bytes]
+pub fn KeyIndex::update(Self, Bytes, UInt64, Bool) -> Unit
 
 pub(all) struct Log[W, R] {
   mut segments : Array[@segment.Segment[W, R]]
@@ -59,6 +61,8 @@ pub fn[W, R] Log::drop_before(Self[W, R], UInt64, (@segment.Segment[W, R]) -> Un
 pub fn[W, R : @io.LogReader] Log::export_bytes(Self[W, R]) -> Bytes raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::flush(Self[W, R]) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
+pub fn[W, R : @io.LogReader] Log::for_each_time_range(Self[W, R], Int64, Int64, (@core.Record) -> Bool) -> Unit raise @io.IoError
+pub fn[W, R : @io.LogReader] Log::for_each_while(Self[W, R], UInt64, UInt64, (@core.Record) -> Bool) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest(Self[W, R], KeyIndex, Bytes) -> @core.Record? raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::get_latest_at(Self[W, R], KeyIndex, Bytes, Int64, Int64) -> @core.Record? raise @io.IoError
@@ -82,7 +86,7 @@ pub fn[W, R : @io.LogReader] Log::scan_range(Self[W, R], UInt64, UInt64) -> Arra
 pub fn[W, R : @io.LogReader] Log::scan_reverse(Self[W, R], UInt64, UInt64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::scan_time_range(Self[W, R], Int64, Int64) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R] Log::segment_count(Self[W, R]) -> Int32
-pub fn[W, R] Log::segment_summaries(Self[W, R]) -> Array[SegmentSummary]
+pub fn[W, R : @io.LogReader] Log::segment_summaries(Self[W, R]) -> Array[SegmentSummary]
 pub fn[W, R] Log::set_cursor_guard(Self[W, R], UInt64?) -> Unit
 pub fn[W, R : @io.LogReader] Log::snapshot(Self[W, R]) -> Array[@core.Record] raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::tail(Self[W, R], Int32) -> Array[@core.Record] raise @io.IoError
@@ -101,6 +105,7 @@ pub(all) struct SegmentSummary {
   base_offset : UInt64
   records : Int32
   bytes : Int64
+  disk_bytes : Int64
   compressed : Bool
   has_span : Bool
   min_ts : Int64

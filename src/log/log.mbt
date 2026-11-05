@@ -10,7 +10,17 @@ pub(all) enum SyncPolicy {
   Never
   Always
   Batch
-} derive(Eq)
+}
+
+///|
+pub impl Eq for SyncPolicy with fn equal(self, other : SyncPolicy) -> Bool {
+  match (self, other) {
+    (Never, Never) => true
+    (Always, Always) => true
+    (Batch, Batch) => true
+    _ => false
+  }
+}
 
 ///|
 pub extend SyncPolicy with Eq::{equal, not_equal}

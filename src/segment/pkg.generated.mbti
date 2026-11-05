@@ -66,6 +66,7 @@ pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R] Segment::each_key(Self[W, R], (Bytes, UInt64, Bool) -> Unit) -> Unit
 pub fn[W, R] Segment::encode_keys(Self[W, R]) -> Bytes
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
+pub fn[W, R : @io.LogReader] Segment::for_each_while(Self[W, R], UInt64, UInt64, (@core.Record) -> Bool) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
