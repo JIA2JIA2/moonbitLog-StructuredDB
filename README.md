@@ -81,16 +81,20 @@ moonlog <command> <dir> [args...]
   cursor-load <dir> <name>      读取命名消费游标位置
   cursor-list <dir>             列出全部命名消费游标位置
   cursor-drop <dir> <name>      删除命名消费游标位置
-  follow <dir> [start|-|tail] [--once] [--commit]
+  follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
                                 持续打印新追加的记录（`-` 从持久化游标续读，
                                 `tail` 从当前末尾开始；`--commit` 每批后提交
-                                游标；`--once` 拉取一轮即退出；轮询间隔可用
+                                游标，`--name` 指定命名游标以支持多消费者各
+                                自 follow/提交；`--json` 以单行 JSON 输出
+                                （UTF-8 文本，与 export-jsonl 同构）；`--once`
+                                拉取一轮即退出；轮询间隔可用
                                 `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
-  serve <dir> <max-segments> [ttl] [--every ms] [--once]
+  serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
                                 周期性执行维护（合并 + 冗余回收 + 可选过期折
-                                叠 + flush 元数据）；`--every` 或
+                                叠 + 压缩 + flush 元数据）；`--every` 或
                                 `MOONLOG_SERVE_INTERVAL` 设置周期，默认
-                                60000ms；`--once` 执行一轮即退出
+                                60000ms；`--fsck-every N` 每 N 轮跑一次快
+                                速 fsck 并输出报告；`--once` 执行一轮即退出
   backup <dir> <dst>            将目录的一致快照拷贝到空目录 dst（独占锁内
                                 flush 数据与元数据后原样拷贝段文件、sidecar
                                 与 MANIFEST；不拷贝 LOCK 与游标文件）
@@ -368,6 +372,8 @@ u32 crc32          (仅覆盖 body)
 - M96 Bloom 快查 O(1) 化：`latest_key_in_segment` 直接查段的内存 key 映射（append/rebuild/`.keys` sidecar 加载恒就绪）取 latest offset 后单点读取，`get_latest_bloom` 从 O(段大小解码) 降为 O(1)，不再全段扫描
 - M97 前缀/区间扫描段分组读取：`scan_prefix` / `scan_key_range` 按 offset 顺序单遍读取（复用 get_many 的段分组模式 M79）后按 key 序重排，消除逐 key 跨段定位的读放大
 - M98 增量备份 property 测试：固定 seed 随机写序列（put/delete 交错、每三轮 compact）× 8 轮增量 backup → restore，断言与源端逐记录等价；该测试暴露并驱动修复了"同名同尺寸跳过"启发式在 compact 重写同名段时的 stale 数据缺陷（改用纳秒级 mtime 判断）
+- M99 follow 程序化消费：`--json` 以单行 JSON 输出记录（UTF-8 文本、控制字符转义，与 export-jsonl 同构）；`--name <cursor>` 支持命名游标的读取与提交，多消费者可各自 follow 互不干扰
+- M100 serve 周期巡检：`--fsck-every N` 每 N 轮维护后对日志执行 `verify_fast` 并输出报告，常驻守护自带完整性巡检
 
 ## 许可
 

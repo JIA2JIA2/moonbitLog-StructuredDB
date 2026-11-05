@@ -27,9 +27,10 @@
 ///   maintain <dir> <max-segments> [ttl]
 ///                                    merge + prune-superseded + compact-expired
 ///                                    + compress + fsck
-///   serve <dir> <max-segments> [ttl] [--every ms] [--once]
-///                                    run maintenance periodically
-///   follow <dir> [start|-|tail] [--once] [--commit]
+///   serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
+///                                    run maintenance periodically, with an
+///                                    optional fast fsck every N cycles
+///   follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
 ///                                    print new records as they are appended
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
@@ -187,6 +188,81 @@ fn print_record(rec : @core.Record) -> Unit {
     bytes_to_string(rec.key) +
     "=" +
     bytes_to_string(rec.value),
+  )
+}
+
+///|
+/// Two hex digits for a value below 256, used by JSON \u00XX escapes.
+fn hex2(v : Int32) -> String {
+  let d = fn(x : Int32) -> String {
+    match x {
+      0 => "0"
+      1 => "1"
+      2 => "2"
+      3 => "3"
+      4 => "4"
+      5 => "5"
+      6 => "6"
+      7 => "7"
+      8 => "8"
+      9 => "9"
+      10 => "a"
+      11 => "b"
+      12 => "c"
+      13 => "d"
+      14 => "e"
+      _ => "f"
+    }
+  }
+  d(v / 16) + d(v % 16)
+}
+
+///|
+/// Escape a string for embedding in a JSON document: quotes, backslashes
+/// and control characters are escaped; other characters pass through.
+fn json_escape_str(s : String) -> String {
+  let sb = StringBuilder()
+  for ch in s {
+    let c = ch.to_int()
+    if c == 34 {
+      sb.write_string("\\\"")
+    } else if c == 92 {
+      sb.write_string("\\\\")
+    } else if c == 10 {
+      sb.write_string("\\n")
+    } else if c == 13 {
+      sb.write_string("\\r")
+    } else if c == 9 {
+      sb.write_string("\\t")
+    } else if c == 8 {
+      sb.write_string("\\b")
+    } else if c == 12 {
+      sb.write_string("\\f")
+    } else if c < 32 {
+      sb.write_string("\\u00" + hex2(c))
+    } else {
+      sb.write_char(ch)
+    }
+  }
+  sb.to_string()
+}
+
+///|
+/// Print one record as a single-line JSON object (the same shape as
+/// `export-jsonl`'s text mode; keys and values are assumed to be UTF-8 text).
+fn print_json_record(rec : @core.Record) -> Unit {
+  println(
+    "{\"offset\":" +
+    rec.offset.to_string() +
+    ",\"timestamp\":" +
+    rec.timestamp.to_string() +
+    ",\"kind\":\"" +
+    (if rec.is_delete() { "delete" } else { "put" }) +
+    "\",\"key\":\"" +
+    json_escape_str(bytes_to_string(rec.key)) +
+    "\",\"value\":\"" +
+    json_escape_str(bytes_to_string(rec.value)) +
+    "\"}",
   )
 }
 
@@ -761,15 +837,18 @@ fn cmd_maintain(
 ///|
 /// Periodic maintenance loop: run the one-shot `maintain` pipeline (merge
 /// contiguous rolled segments down to `max_segments`, prune superseded
-/// segments, fold expired records when a TTL is given) and flush metadata,
-/// then sleep and repeat. `--every ms` (or `MOONLOG_SERVE_INTERVAL`, default
-/// 60000) selects the pause between passes; `--once` runs a single pass and
-/// returns, which keeps the command scriptable and testable.
+/// segments, fold expired records when a TTL is given, compress rolled-over
+/// segments) and flush metadata, then sleep and repeat. `--every ms` (or
+/// `MOONLOG_SERVE_INTERVAL`, default 60000) selects the pause between passes;
+/// `--fsck-every N` runs a fast fsck every N cycles and prints its report;
+/// `--once` runs a single pass and returns, which keeps the command
+/// scriptable and testable.
 fn cmd_serve(
   dir : String,
   max_str : String,
   ttl : String?,
   every : String?,
+  fsck_every : String?,
   once : Bool,
 ) -> Unit raise @io.IoError {
   let max = @string.parse_int(max_str) catch {
@@ -786,6 +865,13 @@ fn cmd_serve(
         Some(v) => @string.parse_int(v) catch { _ => 60000 }
         None => 60000
       }
+  }
+  let fsck_n = match fsck_every {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid fsck interval: " + s)
+      }
+    None => 0
   }
   let mut cycle = 0
   let mut go = true
@@ -805,6 +891,19 @@ fn cmd_serve(
       None => ()
     }
     println(line)
+    if fsck_n > 0 && cycle % fsck_n == 0 {
+      let lock = @backend_native.DirLock::acquire_timeout(
+        dir,
+        false,
+        lock_timeout_ms(),
+      )
+      let log = open_log(dir)
+      let report = log.verify_fast()
+      println("fsck cycle " + cycle.to_string() + ":")
+      print_verify(report)
+      close_log(log)
+      lock.release()
+    }
     if once {
       go = false
     } else {
@@ -1282,15 +1381,19 @@ fn follow_interval_ms() -> Int32 {
 /// Tail the log: print new records as they are appended, polling the
 /// directory until interrupted. `start` selects the first offset to print
 /// (`-` resumes from the persisted cursor, `tail` starts at the current end,
-/// default 0). With `--commit`, each batch advances the persisted consumer
-/// cursor so `cursor -` and the next `follow -` resume past it; run only one
-/// committing follower at a time. With `--once`, a single pass is made and
-/// the command returns (for scripts and tests).
+/// default 0); with `--name <cursor>` the persisted cursor is the named one.
+/// With `--commit`, each batch advances that cursor so later runs resume
+/// past it; run only one committing follower per cursor at a time. With
+/// `--json`, records print as single-line JSON objects (UTF-8 text assumed)
+/// instead of the plain form. With `--once`, a single pass is made and the
+/// command returns (for scripts and tests).
 fn cmd_follow(
   dir : String,
   start : String,
   once : Bool,
   commit : Bool,
+  json : Bool,
+  name : String?,
 ) -> Unit raise @io.IoError {
   let mut from : UInt64 = (0 : UInt64)
   if start == "tail" {
@@ -1304,7 +1407,10 @@ fn cmd_follow(
     close_log(log)
     lock.release()
   } else if start == "-" {
-    from = @backend_native.load_cursor(dir)
+    from = match name {
+      Some(n) => @backend_native.load_named_cursor(dir, n)
+      None => @backend_native.load_cursor(dir)
+    }
   } else {
     from = parse_offset(start)
   }
@@ -1322,12 +1428,19 @@ fn cmd_follow(
     if next > from {
       let recs = log.scan_range(from, next)
       for rec in recs {
-        print_record(rec)
+        if json {
+          print_json_record(rec)
+        } else {
+          print_record(rec)
+        }
       }
       fetched = fetched + recs.length()
       from = next
       if commit {
-        @backend_native.save_cursor(dir, from)
+        match name {
+          Some(n) => @backend_native.save_named_cursor(dir, n, from)
+          None => @backend_native.save_cursor(dir, from)
+        }
       }
     }
     close_log(log)
@@ -1447,6 +1560,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let mut start = "0"
     let mut once = false
     let mut commit = false
+    let mut json = false
+    let mut name : String? = (None : String?)
     let mut i = 3
     while i < args.length() {
       let a = args[i]
@@ -1454,18 +1569,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         once = true
       } else if a == "--commit" {
         commit = true
+      } else if a == "--json" {
+        json = true
+      } else if a == "--name" && i + 1 < args.length() {
+        name = Some(args[i + 1])
+        i = i + 1
       } else {
         start = a
       }
       i = i + 1
     }
-    cmd_follow(args[2], start, once, commit)
+    cmd_follow(args[2], start, once, commit, json, name)
   } else if cmd == "serve" {
     if args.length() < 4 {
       println(USAGE)
     } else {
       let mut ttl : String? = (None : String?)
       let mut every : String? = (None : String?)
+      let mut fsck_every : String? = (None : String?)
       let mut once = false
       let mut i = 4
       while i < args.length() {
@@ -1475,6 +1596,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--every" && i + 1 < args.length() {
           every = Some(args[i + 1])
           i = i + 1
+        } else if a == "--fsck-every" && i + 1 < args.length() {
+          fsck_every = Some(args[i + 1])
+          i = i + 1
         } else {
           match ttl {
             None => ttl = Some(a)
@@ -1483,7 +1607,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         }
         i = i + 1
       }
-      cmd_serve(args[2], args[3], ttl, every, once)
+      cmd_serve(args[2], args[3], ttl, every, fsck_every, once)
     }
   } else if cmd == "prune" {
     if args.length() < 4 {
