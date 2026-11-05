@@ -772,16 +772,15 @@ pub fn flush_meta(
 }
 
 ///|
-/// Compress every rolled-over (non-active) segment of `dir` in place with `algo`
-/// (1 = RLE, 2 = LZSS). Each compressed segment records its uncompressed size,
-/// algorithm and a checksum of the raw data in its index, and the manifest is
-/// refreshed. Returns the number of segments compressed.
-pub fn compress_log_dir(
+/// Compress every rolled-over (non-active) segment of an already-open log in
+/// place with `algo` (1 = RLE, 2 = LZSS), rewriting each segment's data file
+/// atomically and recording its checksum, raw size and algorithm for the next
+/// metadata flush. Returns the number of segments compressed.
+pub fn compress_rolled_segments(
   dir : String,
-  roll_size : Int64,
+  log : @log.Log[NativeFileLog, NativeFileLog],
   algo~ : Int32 = 2,
 ) -> Int32 raise @io.IoError {
-  let log = open_log_dir(dir, roll_size)
   let n = log.segment_count()
   let mut packed = 0
   let mut i = 0
@@ -809,6 +808,21 @@ pub fn compress_log_dir(
     }
     i = i + 1
   }
+  packed
+}
+
+///|
+/// Compress every rolled-over (non-active) segment of `dir` in place with `algo`
+/// (1 = RLE, 2 = LZSS). Each compressed segment records its uncompressed size,
+/// algorithm and a checksum of the raw data in its index, and the manifest is
+/// refreshed. Returns the number of segments compressed.
+pub fn compress_log_dir(
+  dir : String,
+  roll_size : Int64,
+  algo~ : Int32 = 2,
+) -> Int32 raise @io.IoError {
+  let log = open_log_dir(dir, roll_size)
+  let packed = compress_rolled_segments(dir, log, algo~)
   flush_meta(dir, log)
   for seg in log.segments {
     seg.writer.close()
@@ -1065,24 +1079,80 @@ fn count_segment_files(dir : String) -> Int32 raise @io.IoError {
 }
 
 ///|
-/// Copy every durable-state file from `src` into the empty (or not yet
-/// existing) directory `dst`, returning the number of segment data files
-/// copied. The caller must hold the exclusive directory lock on `src` and
-/// have flushed both data (`Log::flush`) and metadata (`flush_meta`)
-/// beforehand, so the copied files form a consistent snapshot. `dst` must not
-/// already contain files, so a backup can never silently overwrite data.
+/// The byte size of a file, or -1 when it cannot be opened.
+pub fn file_size(path : String) -> Int64 {
+  let fd = moonlog_open_ro(@utf8.encode(path))
+  if fd < 0 {
+    return (-1 : Int64)
+  }
+  let s = moonlog_size(fd)
+  ignore(moonlog_close(fd))
+  s
+}
+
+///|
+fn contains_u64(arr : Array[UInt64], v : UInt64) -> Bool {
+  for x in arr {
+    if x == v {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Copy every durable-state file from `src` into directory `dst`, returning
+/// the number of segment data files copied this run. The caller must hold the
+/// exclusive directory lock on `src` and have flushed both data (`Log::flush`)
+/// and metadata (`flush_meta`) beforehand, so the copied files form a
+/// consistent snapshot.
+///
+/// Backing up over an earlier backup makes an incremental pass: segment data
+/// files are append-only, so a segment already present in `dst` with the same
+/// byte size is skipped, and backups of segments that no longer exist at the
+/// source (merged, compacted or pruned away) are deleted. The small manifest
+/// and per-segment sidecars may change in place, so they are always recopied.
+/// The first run into an empty (or not yet existing) `dst` is a full backup.
 pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
   ignore(ensure_dir(dst))
-  if list_dir(dst).length() > 0 {
-    raise @io.IoError::Invalid("backup target not empty: " + dst)
+  let src_names = list_dir(src)
+  let src_segments : Array[UInt64] = []
+  for name in src_names {
+    match parse_base_from_log_name(name) {
+      Some(base) => src_segments.push(base)
+      None => ()
+    }
   }
-  for name in list_dir(src) {
-    if is_backup_file(name) {
-      write_file(dst + "/" + name, read_file(src + "/" + name))
+  for name in list_dir(dst) {
+    match parse_base_from_log_name(name) {
+      Some(base) =>
+        if !contains_u64(src_segments, base) {
+          remove_segment_files(dst, base)
+        }
+      None => ()
+    }
+  }
+  let mut copied = 0
+  for name in src_names {
+    if !is_backup_file(name) {
+      continue
+    }
+    let dst_path = dst + "/" + name
+    let existing = file_size(dst_path)
+    // Segment data only grows, so the same byte size means the same content;
+    // the manifest and sidecars are rewritten in place, so recopy them.
+    let skip = name.has_suffix(".log") &&
+      existing >= (0 : Int64) &&
+      existing == file_size(src + "/" + name)
+    if !skip {
+      write_file(dst_path, read_file(src + "/" + name))
+      if name.has_suffix(".log") {
+        copied = copied + 1
+      }
     }
   }
   fsync_dir(dst)
-  count_segment_files(dst)
+  copied
 }
 
 ///|

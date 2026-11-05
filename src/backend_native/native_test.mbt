@@ -1247,30 +1247,41 @@ test "backup and restore roundtrip preserves records and offsets" {
   }
   let n = @backend_native.backup_log_dir(src, dst) catch { _ => panic() }
   assert_true(n >= 2)
-  // A backup refuses to overwrite a non-empty target.
-  let refused = try {
-    ignore(@backend_native.backup_log_dir(src, dst))
-    false
-  } catch {
-    _ => true
+  // An incremental pass with nothing changed copies no segments.
+  let none = @backend_native.backup_log_dir(src, dst) catch { _ => panic() }
+  assert_eq(none, 0)
+  // New appends change only the active segment (and may roll one), so the
+  // next incremental pass copies just what changed.
+  let log2 = @backend_native.open_log_dir(src, (60 : Int64)) catch {
+    _ => panic()
   }
-  assert_true(refused)
+  ignore(log2.append(b"k", b"more", (100 : Int64)) catch { _ => panic() })
+  ignore(log2.append(b"k", b"more2", (101 : Int64)) catch { _ => panic() })
+  @backend_native.flush_meta(src, log2) catch {
+    _ => panic()
+  }
+  for seg in log2.segments {
+    seg.writer.close()
+  }
+  let inc = @backend_native.backup_log_dir(src, dst) catch { _ => panic() }
+  assert_true(inc >= 1)
   let m = @backend_native.restore_log_dir(dst, rst) catch { _ => panic() }
-  assert_eq(m, n)
+  assert_true(m >= n)
   // The restored copy matches the source, offsets included.
   let rlog = @backend_native.open_log_dir(rst, (60 : Int64)) catch {
     _ => panic()
   }
-  assert_eq(rlog.count(), 8)
-  assert_eq(rlog.next_offset(), (8 : UInt64))
+  assert_eq(rlog.count(), 10)
+  assert_eq(rlog.next_offset(), (10 : UInt64))
   let recs = rlog.scan() catch { _ => panic() }
-  assert_eq(recs.length(), 8)
+  assert_eq(recs.length(), 10)
   assert_eq(recs[0].offset, (0 : UInt64))
   assert_eq(recs[0].timestamp, (0 : Int64))
   assert_eq(recs[7].offset, (7 : UInt64))
+  assert_eq(recs[9].value, b"more2")
   // The restored copy is immediately appendable.
   let off = rlog.append(b"k", b"more", (100 : Int64)) catch { _ => panic() }
-  assert_eq(off, (8 : UInt64))
+  assert_eq(off, (10 : UInt64))
   @backend_native.flush_meta(rst, rlog) catch {
     _ => panic()
   }
@@ -1419,6 +1430,146 @@ test "repair quarantines a segment failing its stored checksum" {
   }
   for seg in rlog.segments {
     seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+fn repair_lcg(s : UInt64) -> UInt64 {
+  s * 6364136223846793005 + 1442695040888963407
+}
+
+///|
+/// Randomized damage must never lose a surviving record's content: after a
+/// repair pass the log decodes cleanly, every remaining record matches the
+/// original at its offset, and appending continues from the recovered end.
+/// Segments (or tails) destroyed by the injected damage may be dropped —
+/// that is recovery, not corruption.
+test "repair property: random damage preserves surviving records" {
+  let dir = "/tmp/moonlog_repair_prop"
+  ignore(@backend_native.ensure_dir(dir))
+  let mut s : UInt64 = 0x9E3779B97F4A7C15
+  let mut round = 0
+  while round < 40 {
+    clean_dir(dir)
+    s = repair_lcg(s)
+    let n_rec = ((s >> 3) % (5 : UInt64)).to_int() + 4
+    let log : @log.Log[
+      @backend_native.NativeFileLog,
+      @backend_native.NativeFileLog,
+    ] = @log.Log::new((60 : Int64), base => {
+      @backend_native.open_segment_in_dir(dir, base) catch {
+        _ => panic()
+      }
+    })
+    let before : Array[Bytes] = []
+    for i = 0; i < n_rec; i = i + 1 {
+      let v : Bytes = if i % 3 == 0 {
+        b"a"
+      } else if i % 3 == 1 {
+        b"bb"
+      } else {
+        b"ccc"
+      }
+      ignore(log.append(b"k", v, i.to_int64()) catch { _ => panic() })
+      before.push(v)
+    }
+    assert_true(log.segment_count() >= 1)
+    @backend_native.flush_meta(dir, log) catch {
+      _ => panic()
+    }
+    for seg in log.segments {
+      seg.writer.close()
+    }
+    // Inject 1-3 random kinds of damage per round.
+    s = repair_lcg(s)
+    let kinds = ((s >> 5) % (3 : UInt64)).to_int() + 1
+    let mut k = 0
+    while k < kinds {
+      s = repair_lcg(s)
+      let kind = ((s >> 7) % (6 : UInt64)).to_int()
+      let bases : Array[UInt64] = []
+      let names = @backend_native.list_dir(dir) catch { _ => [] }
+      for name in names {
+        if name.has_suffix(".log") {
+          let digits = name[0:name.length() - 4].to_owned()
+          let v = @string.parse_uint64(digits) catch { _ => (0 : UInt64) }
+          bases.push(v)
+        }
+      }
+      bases.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+      if bases.length() == 0 {
+        panic()
+      }
+      let seg_idx = ((s >> 11) % bases.length().to_uint64()).to_int()
+      let seg_path = dir + "/" + @segment.segment_file_name(bases[seg_idx])
+      if kind == 0 {
+        let data = @backend_native.read_file(seg_path)
+        if data.length() > 1 {
+          @backend_native.write_file(
+            seg_path,
+            @core.slice(data, 0, data.length() / 2),
+          ) catch {
+            _ => panic()
+          }
+        }
+      } else if kind == 1 {
+        let data = @backend_native.read_file(seg_path)
+        if data.length() > 0 {
+          let head : Bytes = if data.at(0).to_int() == 0 {
+            b"\x01"
+          } else {
+            b"\x00"
+          }
+          @backend_native.write_file(
+            seg_path,
+            head + @core.slice(data, 1, data.length()),
+          ) catch {
+            _ => panic()
+          }
+        }
+      } else if kind == 2 {
+        ignore(@backend_native.remove_file(dir + "/MANIFEST"))
+      } else if kind == 3 {
+        ignore(@backend_native.remove_file(seg_path + ".index"))
+      } else if kind == 4 {
+        let data = @backend_native.read_file(seg_path)
+        @backend_native.write_file(seg_path, data + b"torn-junk") catch {
+          _ => panic()
+        }
+      } else {
+        ignore(@backend_native.remove_file(seg_path + ".keys"))
+      }
+      k = k + 1
+    }
+    let rep = @backend_native.repair_log_dir(dir, (60 : Int64)) catch {
+      _ => panic()
+    }
+    match rep.still_bad {
+      Some(_) => panic()
+      None => ()
+    }
+    // Surviving records must be byte-identical to the originals.
+    let rlog = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+      _ => panic()
+    }
+    let recs = rlog.scan() catch { _ => panic() }
+    for rec in recs {
+      let idx = rec.offset.to_int()
+      assert_true(idx < before.length())
+      assert_eq(rec.value, before[idx])
+    }
+    // The log stays appendable at the recovered end.
+    let next = rlog.next_offset()
+    let tail = rlog.append(b"k", b"tail", (999 : Int64)) catch { _ => panic() }
+    assert_eq(tail, next)
+    @backend_native.flush_meta(dir, rlog) catch {
+      _ => panic()
+    }
+    for seg in rlog.segments {
+      seg.writer.close()
+    }
+    round = round + 1
   }
   clean_dir(dir)
 }

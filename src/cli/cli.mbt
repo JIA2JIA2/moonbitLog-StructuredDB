@@ -25,14 +25,17 @@
 ///   prune-superseded <dir>           drop segments fully superseded by later records
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   maintain <dir> <max-segments> [ttl]
-///                                    merge + prune-superseded + compact-expired + fsck
+///                                    merge + prune-superseded + compact-expired
+///                                    + compress + fsck
 ///   serve <dir> <max-segments> [ttl] [--every ms] [--once]
 ///                                    run maintenance periodically
 ///   follow <dir> [start|-|tail] [--once] [--commit]
 ///                                    print new records as they are appended
-///   backup <dir> <dst>               copy a consistent snapshot into dst
+///   backup <dir> <dst>               copy a snapshot into dst (incremental
+///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
+///   cursor-lag <dir>                 report each cursor's consumption lag
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
 ///   cursor-load <dir> <name>         read a named consumer position
@@ -61,7 +64,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -635,7 +638,7 @@ fn run_maintenance(
   dir : String,
   max_segments : Int32,
   ttl_ms : Int64?,
-) -> (Int32, Int32, Int32) raise @io.IoError {
+) -> (Int32, Int32, Int32, Int32) raise @io.IoError {
   run_locked(dir, true, () => {
     let log = open_log(dir)
     let merged = log.merge_segments(max_segments, seg => {
@@ -655,9 +658,10 @@ fn run_maintenance(
         })
       None => -1
     }
+    let packed = @backend_native.compress_rolled_segments(dir, log)
     @backend_native.flush_meta(dir, log)
     close_log(log)
-    (merged, dropped, folded)
+    (merged, dropped, folded, packed)
   })
 }
 
@@ -688,9 +692,10 @@ fn cmd_maintain(
     _ => raise @io.IoError::Invalid("invalid segment count: " + max_str)
   }
   let ttl_ms = parse_ttl(ttl)
-  let (merged, dropped, folded) = run_maintenance(dir, max, ttl_ms)
+  let (merged, dropped, folded, packed) = run_maintenance(dir, max, ttl_ms)
   println("merged " + merged.to_string())
   println("superseded dropped " + dropped.to_string())
+  println("compressed " + packed.to_string())
   match ttl_ms {
     Some(_) => println("expired folded " + folded.to_string())
     None => ()
@@ -735,14 +740,16 @@ fn cmd_serve(
   let mut cycle = 0
   let mut go = true
   while go {
-    let (merged, dropped, folded) = run_maintenance(dir, max, ttl_ms)
+    let (merged, dropped, folded, packed) = run_maintenance(dir, max, ttl_ms)
     cycle = cycle + 1
     let mut line = "cycle " +
       cycle.to_string() +
       ": merged " +
       merged.to_string() +
       " superseded dropped " +
-      dropped.to_string()
+      dropped.to_string() +
+      " compressed " +
+      packed.to_string()
     match ttl_ms {
       Some(_) => line = line + " expired folded " + folded.to_string()
       None => ()
@@ -777,6 +784,35 @@ fn cmd_cursor(
       print_record(rec)
     }
     println("cursor " + cur.position().to_string())
+    close_log(log)
+  })
+}
+
+///|
+/// Report how far every persisted consumer cursor (default and named) trails
+/// the log's end, so stalled consumers are visible at a glance.
+fn cmd_cursor_lag(dir : String) -> Unit raise @io.IoError {
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let next = log.next_offset()
+    let positions = @backend_native.list_cursor_positions(dir)
+    if positions.length() == 0 {
+      println("(no cursors)")
+    }
+    for pair in positions {
+      let (name, pos) = pair
+      let label = if name.length() == 0 { "-" } else { name }
+      let lag = if next > pos { next - pos } else { (0 : UInt64) }
+      println(
+        "cursor " +
+        label +
+        " position " +
+        pos.to_string() +
+        " lag " +
+        lag.to_string(),
+      )
+    }
+    println("next_offset " + next.to_string())
     close_log(log)
   })
 }
@@ -1368,6 +1404,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       cmd_cursor_commit(args[2], args[3])
     }
+  } else if cmd == "cursor-lag" {
+    cmd_cursor_lag(args[2])
   } else if cmd == "cursor-save" {
     if args.length() < 5 {
       println(USAGE)

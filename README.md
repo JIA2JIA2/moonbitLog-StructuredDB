@@ -14,7 +14,7 @@
 - **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes` / `Log::retain_before`（按 offset / 段数 / 总字节 / 时间戳）以整段删除方式回收旧数据。
 - **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
-- **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读。
+- **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——段数据只增不变，尺寸相同的段自动跳过、源端已删除的段自动清理，大目录备份成本降为 O(变更)。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -71,9 +71,12 @@ moonlog <command> <dir> [args...]
   prune-superseded <dir>        回收所有记录均被后续覆盖的段
   merge <dir> <max-segments>    将连续的已 roll 段合并至不超过 N 段
   maintain <dir> <max-segments> [ttl]
-                                一键维护：合并 + 冗余回收 + 过期折叠 + fsck
+                                一键维护：合并 + 冗余回收 + 过期折叠 + 压缩
+                                已 roll 段 + fsck
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
+  cursor-lag <dir>              报告每个消费游标的滞后量（next_offset -
+                                position），便于发现停滞的消费者
   cursor-save <dir> <name> <pos> 持久化命名消费游标位置
   cursor-load <dir> <name>      读取命名消费游标位置
   cursor-list <dir>             列出全部命名消费游标位置
@@ -132,9 +135,10 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `MemLog` | `backend_mem` | 内存后端（wasm / js 可用） |
 | `NativeFileLog` / `open_log_dir` / `index_interval_for` / `flush_meta` / `compress_log_dir` / `count_compressible_segments` / `DirLock` | `backend_native` | 文件后端、打开快路径、索引间隔、段压缩与计数、目录锁（含超时重试） |
 | `save_named_cursor` / `load_named_cursor` / `list_named_cursors` / `remove_named_cursor` | `backend_native` | 命名消费游标持久化与管理 |
-| `backup_log_dir` / `restore_log_dir` | `backend_native` | 目录级物理备份 / 恢复（拷贝段文件、sidecar 与 MANIFEST，offset 保留） |
+| `backup_log_dir` / `restore_log_dir` | `backend_native` | 目录级物理备份（对既有备份目录增量拷贝）/ 恢复，offset 保留 |
 | `repair_log_dir` / `RepairReport` | `backend_native` | 修复：坏段隔离（`.corrupt`）、torn-tail 截断、MANIFEST/sidecar 重建 |
-| `sleep_ms` / `rename_file` | `backend_native` | 轮询休眠与文件改名（`follow`/`serve`/`repair` 支撑） |
+| `compress_rolled_segments` / `compress_log_dir` / `count_compressible_segments` | `backend_native` | 对已打开日志 / 目录执行已 roll 段压缩与计数 |
+| `file_size` / `sleep_ms` / `rename_file` | `backend_native` | 文件尺寸 / 轮询休眠 / 文件改名（增量备份、follow/serve/repair 支撑） |
 | `Record` / `crc32` | `core` | 记录编解码 |
 | `LogWriter` / `LogReader` / `LogTruncate` / `IoError` | `io` | 存储抽象 |
 
@@ -327,6 +331,10 @@ u32 crc32          (仅覆盖 body)
 - M82 修复模式：`repair_log_dir` 与 CLI `fsck --fix`（整段 CRC 失败隔离为 `.corrupt`、torn-tail 截断、空段清理、MANIFEST 与段 sidecar 原子重建）
 - M83 尾随读：CLI `follow`（轮询新记录持续输出，`-`/`tail`/offset 起点、`--commit` 自动提交游标、`--once` 单轮、`MOONLOG_FOLLOW_INTERVAL` 间隔）
 - M84 自动维护：CLI `serve`（周期性维护管线，`--every`/`MOONLOG_SERVE_INTERVAL` 周期、`--once` 单轮；`maintain` 核心重构为共享的 `run_maintenance`）
+- M85 增量备份：`backup_log_dir` 对既有备份目录增量执行——尺寸相同的段跳过（段数据只增不变）、源端已删段自动清理、MANIFEST 与 sidecar 始终重拷（原地重写），大目录备份降为 O(变更)
+- M86 维护管线集成压缩：`compress_rolled_segments` 从 `compress_log_dir` 抽出为库 API，`maintain` / `serve` 管线自动压缩全部已 roll 段（LZSS）并输出 `compressed N`
+- M87 消费滞后监控：CLI `cursor-lag` 报告默认与命名游标的 position/lag 与 `next_offset`
+- M88 修复鲁棒性 property 测试：固定 seed 随机注入截断/翻转字节/删 MANIFEST/删 sidecar/追加 torn 尾（1–3 类/轮，40 轮），断言 repair 后存活记录与原始一致、verify 通过、可续写
 
 ## 许可
 
