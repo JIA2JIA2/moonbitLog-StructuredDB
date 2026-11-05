@@ -1169,16 +1169,19 @@ test "prune_superseded drops only fully-superseded segments" {
 }
 
 ///|
-/// A reader wrapper that counts `read_at` calls, so tests can assert that an
-/// operation does not re-read record bodies.
+/// A reader wrapper that counts `read_at` calls and bytes, so tests can assert
+/// that an operation does not re-read record bodies and that windowed reads
+/// move fewer bytes than full scans.
 struct CountReader {
   mem : @backend_mem.MemLog
   mut reads : Int32
+  mut bytes : Int64
 }
 
 ///|
 impl @io.LogReader for CountReader with fn read_at(self, offset, len) {
   self.reads = self.reads + 1
+  self.bytes = self.bytes + len.to_int64()
   self.mem.read_at(offset, len)
 }
 
@@ -1190,7 +1193,7 @@ impl @io.LogReader for CountReader with fn length(self) {
 ///|
 test "build_key_index reads no record bodies" {
   let store = @backend_mem.MemLog::new()
-  let cr : CountReader = { mem: store, reads: 0, }
+  let cr : CountReader = { mem: store, reads: 0, bytes: 0, }
   let log : @log.Log[@backend_mem.MemLog, CountReader] = @log.Log::new(
     (1_000_000 : Int64),
     base => @segment.Segment::new(store, cr, base),
@@ -1256,20 +1259,22 @@ test "key index is cached until the log changes" {
 ///|
 test "scan_range reads only the requested window" {
   let store = @backend_mem.MemLog::new()
-  let cr : CountReader = { mem: store, reads: 0, }
+  let cr : CountReader = { mem: store, reads: 0, bytes: 0, }
   let log : @log.Log[@backend_mem.MemLog, CountReader] = @log.Log::new(
     (1_000_000 : Int64),
     base => @segment.Segment::new(store, cr, base),
   )
-  for i = 0; i < 50; i = i + 1 {
+  // Enough records that the segment outgrows the 4KiB probe window used by
+  // point-style reads, so a windowed scan moves fewer bytes than a full scan.
+  for i = 0; i < 500; i = i + 1 {
     ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
   }
-  cr.reads = 0
+  cr.bytes = 0
   ignore(log.scan() catch { _ => panic() })
-  let full = cr.reads
-  cr.reads = 0
+  let full = cr.bytes
+  cr.bytes = 0
   ignore(log.scan_range((0 : UInt64), (2 : UInt64)) catch { _ => panic() })
-  let partial = cr.reads
+  let partial = cr.bytes
   assert_true(partial < full)
 }
 
@@ -1280,7 +1285,7 @@ test "scan_time_range skips segments that cannot overlap" {
     (60 : Int64),
     base => {
       let store = @backend_mem.MemLog::new()
-      let cr : CountReader = { mem: store, reads: 0, }
+      let cr : CountReader = { mem: store, reads: 0, bytes: 0, }
       readers.push(cr)
       @segment.Segment::new(store, cr, base)
     },

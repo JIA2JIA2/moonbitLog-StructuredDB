@@ -471,7 +471,29 @@ pub fn[W, R : @io.LogReader] Segment::for_each_while(
 }
 
 ///|
+/// Decode the single record that starts at `pos` within an already-read byte
+/// buffer of `total` bytes, returning it together with the position just
+/// after it. Pure in-memory counterpart of `load_record_at` — no I/O.
+fn decode_in(
+  data : Bytes,
+  pos : Int32,
+  total : Int32,
+) -> (@core.Record, Int32)? {
+  if pos < 0 || pos + 4 > total {
+    return None
+  }
+  let body_len = @core.body_len_at(data, pos) catch { _ => return None }
+  let full_len = 4 + body_len + 4
+  if pos + full_len > total {
+    return None
+  }
+  let (rec, next) = @core.decode_record(data, pos) catch { _ => return None }
+  Some((rec, next))
+}
+
+///|
 /// Decode every record actually present in this segment, in append order.
+/// Reads the segment bytes once, then decodes in memory — no per-record I/O.
 /// Walks records from the start of the readable bytes to the end, so it does
 /// not depend on the in-memory `record_count` (which a freshly opened segment
 /// may not have yet). Memory tracks the result, not the segment size.
@@ -479,11 +501,12 @@ pub fn[W, R : @io.LogReader] Segment::scan(
   self : Segment[W, R],
 ) -> Array[@core.Record] raise @io.IoError {
   let out : Array[@core.Record] = []
-  let mut pos : Int64 = 0
+  let data = self.reader.read_at((0 : Int64), self.reader.length().to_int())
+  let total = data.length()
+  let mut pos : Int32 = 0
   let mut go = true
   while go {
-    let loaded = self.load_record_at(pos)
-    match loaded {
+    match decode_in(data, pos, total) {
       None => go = false
       Some((rec, next)) => {
         out.push(rec)
@@ -547,8 +570,9 @@ pub fn[W, R : @io.LogReader] Segment::scan_range(
 
 ///|
 /// Rebuild the sparse index (and derived counters) by decoding the segment's
-/// bytes from the beginning. Returns the number of records discovered. Useful
-/// after reopening a segment whose in-memory index was not persisted.
+/// bytes from the beginning. The bytes are read once and decoded in memory —
+/// no per-record I/O. Returns the number of records discovered. Useful after
+/// reopening a segment whose in-memory index was not persisted.
 pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self : Segment[W, R],
 ) -> Int32 raise @io.IoError {
@@ -559,20 +583,20 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
   self.ts_sorted = true
   self.meta_dirty = true
   self.ts_samples = []
-  let total = self.reader.length()
-  let mut pos : Int64 = 0
+  let data = self.reader.read_at((0 : Int64), self.reader.length().to_int())
+  let total = data.length()
+  let mut pos : Int32 = 0
   let mut n : Int32 = 0
   let mut go = true
   while go {
-    let loaded = self.load_record_at(pos)
-    match loaded {
+    match decode_in(data, pos, total) {
       None => go = false
       Some((rec, next)) => {
         self.bloom.add(rec.key)
         self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
-          self.index.push(n.to_uint64(), pos, rec.timestamp)
+          self.index.push(n.to_uint64(), pos.to_int64(), rec.timestamp)
           self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1
@@ -581,15 +605,16 @@ pub fn[W, R : @io.LogReader] Segment::rebuild_index(
     }
   }
   self.record_count = n
-  self.size = total
+  self.size = total.to_int64()
   self.next_offset = self.base_offset + n.to_uint64()
   n
 }
 
 ///|
 /// Crash recovery for a single segment: walk the bytes from the start,
-/// counting records that decode cleanly with a valid CRC. The first truncated
-/// or corrupt record ends the walk (a crash only ever leaves a torn tail), and
+/// counting records that decode cleanly with a valid CRC. The bytes are read
+/// once and decoded in memory — no per-record I/O. The first truncated or
+/// corrupt record ends the walk (a crash only ever leaves a torn tail), and
 /// the segment is truncated back to the last good boundary. `base_offset` is
 /// corrected from the first record encountered so the caller need not parse it
 /// out of the file name. Returns the number of recovered records.
@@ -604,16 +629,16 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
   self.meta_dirty = true
   self.ts_samples = []
   self.fsync_dirty = true
-  let total = self.reader.length()
-  let mut pos : Int64 = 0
+  let data = self.reader.read_at((0 : Int64), self.reader.length().to_int())
+  let total = data.length()
+  let mut pos : Int32 = 0
   let mut n : Int32 = 0
   let mut first : UInt64 = self.base_offset
   let mut last : UInt64 = self.base_offset
   let mut any = false
   let mut go = true
   while go {
-    let loaded = self.load_record_at(pos)
-    match loaded {
+    match decode_in(data, pos, total) {
       None => go = false
       Some((rec, next)) => {
         if !any {
@@ -625,7 +650,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
         self.keys.set(rec.key, (rec.offset, rec.is_delete()))
         self.note_timestamp(rec.timestamp)
         if self.index.should_index(n) {
-          self.index.push(n.to_uint64(), pos, rec.timestamp)
+          self.index.push(n.to_uint64(), pos.to_int64(), rec.timestamp)
           self.ts_samples.push((n.to_uint64(), rec.timestamp))
         }
         n = n + 1
@@ -634,7 +659,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
     }
   }
   if pos < total {
-    self.writer.truncate(pos)
+    self.writer.truncate(pos.to_int64())
   }
   if any {
     self.base_offset = first
@@ -643,7 +668,7 @@ pub fn[W : @io.LogTruncate, R : @io.LogReader] Segment::recover(
     self.next_offset = self.base_offset
   }
   self.record_count = n
-  self.size = pos
+  self.size = pos.to_int64()
   n
 }
 

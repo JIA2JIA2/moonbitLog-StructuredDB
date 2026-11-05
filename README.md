@@ -337,6 +337,7 @@ u32 crc32          (仅覆盖 body)
 - M87 消费滞后监控：CLI `cursor-lag` 报告默认与命名游标的 position/lag 与 `next_offset`
 - M88 修复鲁棒性 property 测试：固定 seed 随机注入截断/翻转字节/删 MANIFEST/删 sidecar/追加 torn 尾（1–3 类/轮，40 轮），断言 repair 后存活记录与原始一致、verify 通过、可续写
 - M89 流式遍历：`Segment::for_each_while` / `Log::for_each_while`（`f` 返回 `false` 提前终止，跨段传播）与 `Log::for_each_time_range`；CLI `scan`/`scan-time`/`tail` 改流式输出，大结果集不再物化 Array
+- M90 批量读快路径：`scan`/`rebuild_index`/`recover` 改为单次读全段后内存顺序解码（`decode_in`），消除逐记录 pread——native bench 段恢复 86.9ms→5.2ms（16.7×）、全量顺序扫描 2.77ms→0.86ms（3.2×），点查/写入持平
 
 ## 许可
 
