@@ -428,16 +428,71 @@ fn lower_bound(keys : Array[Bytes], target : Bytes) -> Int32 {
 }
 
 ///|
+/// Read the records for `(position, offset)` pairs — produced by prefix and
+/// key-range scans — in offset order, so each segment is located once and
+/// read forward instead of one cross-segment lookup per key. Results are
+/// returned sorted by `position` (i.e. key order).
+fn[W, R : @io.LogReader] Log::read_positions_in_offset_order(
+  self : Log[W, R],
+  wanted : Array[(Int32, UInt64)],
+) -> Array[@core.Record] raise @io.IoError {
+  let hits : Array[(Int32, @core.Record)] = []
+  wanted.sort_by(fn(a, b) {
+    if a.1 < b.1 {
+      -1
+    } else if a.1 > b.1 {
+      1
+    } else {
+      0
+    }
+  })
+  let mut w = 0
+  for seg in self.segments {
+    let base = seg.base_offset
+    let seg_end = base + seg.record_count.to_uint64()
+    while w < wanted.length() {
+      let off = wanted[w].1
+      if off < base {
+        w = w + 1
+      } else if off >= seg_end {
+        break
+      } else {
+        match seg.get(off) {
+          Some(rec) => hits.push((wanted[w].0, rec))
+          None => ()
+        }
+        w = w + 1
+      }
+    }
+  }
+  hits.sort_by(fn(a, b) {
+    if a.0 < b.0 {
+      -1
+    } else if a.0 > b.0 {
+      1
+    } else {
+      0
+    }
+  })
+  let out : Array[@core.Record] = []
+  for h in hits {
+    out.push(h.1)
+  }
+  out
+}
+
+///|
 /// The latest live record for every key that begins with `prefix`, sorted
 /// ascending by key bytes. Tombstoned keys are excluded; superseded puts lose
-/// to the newest one.
+/// to the newest one. Matches are read in offset order (one pass over the
+/// segments) and re-ordered by key afterwards.
 pub fn[W, R : @io.LogReader] Log::scan_prefix(
   self : Log[W, R],
   prefix : Bytes,
 ) -> Array[@core.Record] raise @io.IoError {
   let index = self.build_key_index()
   let keys = index.sorted_keys()
-  let out : Array[@core.Record] = []
+  let wanted : Array[(Int32, UInt64)] = []
   let mut i = lower_bound(keys, prefix)
   while i < keys.length() {
     let k = keys[i]
@@ -445,23 +500,20 @@ pub fn[W, R : @io.LogReader] Log::scan_prefix(
       break
     }
     match index.latest(k) {
-      Some(off) =>
-        match self.get(off) {
-          Some(rec) => out.push(rec)
-          None => ()
-        }
+      Some(off) => wanted.push((i, off))
       None => ()
     }
     i = i + 1
   }
-  out
+  self.read_positions_in_offset_order(wanted)
 }
 
 ///|
 /// The latest live record for every key in the half-open key range `[lo, hi)`,
 /// sorted ascending by key bytes. An empty `hi` leaves the range unbounded
 /// above; an empty `lo` starts from the smallest key. Tombstoned keys are
-/// excluded; superseded puts lose to the newest one.
+/// excluded; superseded puts lose to the newest one. Matches are read in
+/// offset order (one pass over the segments) and re-ordered by key afterwards.
 pub fn[W, R : @io.LogReader] Log::scan_key_range(
   self : Log[W, R],
   lo : Bytes,
@@ -470,7 +522,7 @@ pub fn[W, R : @io.LogReader] Log::scan_key_range(
   let index = self.build_key_index()
   let keys = index.sorted_keys()
   let has_hi = hi.length() > 0
-  let out : Array[@core.Record] = []
+  let wanted : Array[(Int32, UInt64)] = []
   let mut i = lower_bound(keys, lo)
   while i < keys.length() {
     let k = keys[i]
@@ -478,16 +530,12 @@ pub fn[W, R : @io.LogReader] Log::scan_key_range(
       break
     }
     match index.latest(k) {
-      Some(off) =>
-        match self.get(off) {
-          Some(rec) => out.push(rec)
-          None => ()
-        }
+      Some(off) => wanted.push((i, off))
       None => ()
     }
     i = i + 1
   }
-  out
+  self.read_positions_in_offset_order(wanted)
 }
 
 ///|
