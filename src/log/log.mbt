@@ -301,6 +301,39 @@ pub fn[W, R : @io.LogReader] Log::for_each(
 }
 
 ///|
+/// Stream records in `[from, to)` across segments to `f` one at a time;
+/// returning `false` from `f` stops the whole walk early (later segments are
+/// skipped too). Segments that cannot intersect the range are skipped.
+pub fn[W, R : @io.LogReader] Log::for_each_while(
+  self : Log[W, R],
+  from : UInt64,
+  to : UInt64,
+  f : (@core.Record) -> Bool,
+) -> Unit raise @io.IoError {
+  if to <= from {
+    return
+  }
+  let mut stop = false
+  let n = self.segments.length()
+  let mut i = 0
+  while i < n && !stop {
+    let seg = self.segments[i]
+    let base = seg.base_offset
+    let seg_end = base + seg.record_count.to_uint64()
+    if seg_end > from && base < to {
+      seg.for_each_while(from, to, rec => {
+        let more = f(rec)
+        if !more {
+          stop = true
+        }
+        more
+      })
+    }
+    i = i + 1
+  }
+}
+
+///|
 /// Decode every record in every segment, in append order.
 pub fn[W, R : @io.LogReader] Log::scan(
   self : Log[W, R],
@@ -366,19 +399,24 @@ pub fn[W, R : @io.LogReader] Log::tail(
 }
 
 ///|
-/// Records whose timestamp lies in `[lo, hi)`, in log (offset) order and
-/// including tombstones. Segments whose persisted time span cannot overlap the
-/// range are skipped; a segment without a known span is always scanned.
-pub fn[W, R : @io.LogReader] Log::scan_time_range(
+/// Stream records whose timestamp lies in `[lo, hi)` to `f`, in log (offset)
+/// order and including tombstones; returning `false` from `f` stops the walk
+/// early. Segments whose persisted time span cannot overlap the range are
+/// skipped; a segment without a known span is always scanned.
+pub fn[W, R : @io.LogReader] Log::for_each_time_range(
   self : Log[W, R],
   lo : Int64,
   hi : Int64,
-) -> Array[@core.Record] raise @io.IoError {
-  let out : Array[@core.Record] = []
+  f : (@core.Record) -> Bool,
+) -> Unit raise @io.IoError {
   if hi <= lo {
-    return out
+    return
   }
-  for seg in self.segments {
+  let mut stop = false
+  let n = self.segments.length()
+  let mut i = 0
+  while i < n && !stop {
+    let seg = self.segments[i]
     let overlaps = if seg.has_time_range() {
       seg.max_timestamp() >= lo && seg.min_timestamp() < hi
     } else {
@@ -389,18 +427,47 @@ pub fn[W, R : @io.LogReader] Log::scan_time_range(
         let from = seg.lower_bound_ts(lo)
         let to = seg.lower_bound_ts(hi)
         if from < to {
-          seg.for_each(from, to, rec => out.push(rec))
+          seg.for_each_while(from, to, rec => {
+            let more = f(rec)
+            if !more {
+              stop = true
+            }
+            more
+          })
         }
       } else {
         let end = seg.base_offset + seg.record_count.to_uint64()
-        seg.for_each(seg.base_offset, end, rec => {
+        seg.for_each_while(seg.base_offset, end, rec => {
           if rec.timestamp >= lo && rec.timestamp < hi {
-            out.push(rec)
+            let more = f(rec)
+            if !more {
+              stop = true
+            }
+            more
+          } else {
+            true
           }
         })
       }
     }
+    i = i + 1
   }
+}
+
+///|
+/// Records whose timestamp lies in `[lo, hi)`, in log (offset) order and
+/// including tombstones. Segments whose persisted time span cannot overlap the
+/// range are skipped; a segment without a known span is always scanned.
+pub fn[W, R : @io.LogReader] Log::scan_time_range(
+  self : Log[W, R],
+  lo : Int64,
+  hi : Int64,
+) -> Array[@core.Record] raise @io.IoError {
+  let out : Array[@core.Record] = []
+  self.for_each_time_range(lo, hi, rec => {
+    out.push(rec)
+    true
+  })
   out
 }
 

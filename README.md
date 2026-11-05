@@ -122,6 +122,7 @@ stats <dir> [json]            打印逐段统计（可选 JSON）
 | `Log::new` / `Log::recover` | `log` | 建立多段日志 / 从已有段恢复 |
 | `Log::append` / `append_batch` / `append_batch_atomic` / `Log::delete` | `log` | 追加单条 / 批量 / 原子批量（失败回滚）/ tombstone |
 | `Log::get` / `scan` / `scan_range` / `scan_reverse` / `scan_time_range` / `tail` / `for_each` | `log` | 点查 / 全扫 / offset 区间 / 逆序区间 / 时间区间 / 最近 N 条 / 流式遍历 |
+| `Log::for_each_while` / `Log::for_each_time_range` | `log` | 流式遍历（`f` 返回 `false` 提前终止、跨段传播）/ 时间区间流式遍历，大结果集零物化 |
 | `Log::retain_last` / `retain_max_bytes` / `retain_before` / `drop_before` | `log` | 段级保留策略（段数 / 字节 / 时间戳 / offset） |
 | `Log::build_key_index` / `index_build_count` / `get_latest` / `get_latest_at` / `get_latest_bloom` / `get_many` / `scan_live` / `scan_prefix` / `scan_key_range` / `snapshot` / `compact` / `compact_expired` / `merge_segments` / `prune_superseded` | `log` | KV 逻辑视图（带缓存）/ TTL 读取 / Bloom 快查 / 批量点查 / 前缀与区间扫描 / 折叠 live / 过期折叠 / 原地重写 / 段合并 / 冗余段回收 |
 | `Log::export_bytes` / `import_bytes` | `log` | 记录流导出 / 回放（可移植交换） |
@@ -335,6 +336,7 @@ u32 crc32          (仅覆盖 body)
 - M86 维护管线集成压缩：`compress_rolled_segments` 从 `compress_log_dir` 抽出为库 API，`maintain` / `serve` 管线自动压缩全部已 roll 段（LZSS）并输出 `compressed N`
 - M87 消费滞后监控：CLI `cursor-lag` 报告默认与命名游标的 position/lag 与 `next_offset`
 - M88 修复鲁棒性 property 测试：固定 seed 随机注入截断/翻转字节/删 MANIFEST/删 sidecar/追加 torn 尾（1–3 类/轮，40 轮），断言 repair 后存活记录与原始一致、verify 通过、可续写
+- M89 流式遍历：`Segment::for_each_while` / `Log::for_each_while`（`f` 返回 `false` 提前终止，跨段传播）与 `Log::for_each_time_range`；CLI `scan`/`scan-time`/`tail` 改流式输出，大结果集不再物化 Array
 
 ## 许可
 

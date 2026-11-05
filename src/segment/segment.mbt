@@ -395,8 +395,8 @@ fn[W, R : @io.LogReader] Segment::load_record_at(
 }
 
 ///|
-/// Stream every record in `[from, to)` (clamped to this segment) to `f`, one at
-/// a time, without materialising the segment in memory.
+/// Stream every record in `[from, to)` (clamped to this segment) to `f`, one
+/// at a time, without materialising the segment in memory.
 pub fn[W, R : @io.LogReader] Segment::for_each(
   self : Segment[W, R],
   from : UInt64,
@@ -426,6 +426,44 @@ pub fn[W, R : @io.LogReader] Segment::for_each(
           if rec.offset >= lo {
             f(rec)
           }
+          pos = next
+        }
+    }
+  }
+}
+
+///|
+/// Stream records in `[from, to)` (clamped) to `f`; `f` returns `false` to
+/// stop the walk early, skipping the rest of the range. Returns without
+/// touching any record when the range is empty.
+pub fn[W, R : @io.LogReader] Segment::for_each_while(
+  self : Segment[W, R],
+  from : UInt64,
+  to : UInt64,
+  f : (@core.Record) -> Bool,
+) -> Unit raise @io.IoError {
+  let seg_end = self.base_offset + self.record_count.to_uint64()
+  let lo = if from < self.base_offset { self.base_offset } else { from }
+  let hi = if to > seg_end { seg_end } else { to }
+  if lo >= hi {
+    return
+  }
+  let rel = lo - self.base_offset
+  let mut pos : Int64 = match self.index.floor(rel) {
+    Some(e) => e.position
+    None => (0 : Int64)
+  }
+  let mut go = true
+  while go {
+    let loaded = self.load_record_at(pos)
+    match loaded {
+      None => go = false
+      Some((rec, next)) =>
+        if rec.offset >= hi {
+          go = false
+        } else if rec.offset >= lo && !f(rec) {
+          go = false
+        } else {
           pos = next
         }
     }

@@ -44,6 +44,95 @@ test "log rolls segments and preserves global offsets" {
 }
 
 ///|
+test "for_each_while streams and stops early across segments" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  // Full range yields all records in order.
+  let seen : Array[UInt64] = []
+  log.for_each_while((0 : UInt64), (8 : UInt64), rec => {
+    seen.push(rec.offset)
+    true
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(seen.length(), 8)
+  let mut i = 0
+  while i < 8 {
+    assert_eq(seen[i], i.to_uint64())
+    i = i + 1
+  }
+  // A false return stops the whole walk, later segments included.
+  let early : Array[UInt64] = []
+  log.for_each_while((0 : UInt64), (8 : UInt64), rec => {
+    if rec.offset < 3 {
+      early.push(rec.offset)
+      true
+    } else {
+      false
+    }
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(early.length(), 3)
+  // Empty ranges call f zero times.
+  let none : Array[UInt64] = []
+  log.for_each_while((5 : UInt64), (5 : UInt64), rec => {
+    none.push(rec.offset)
+    true
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(none.length(), 0)
+}
+
+///|
+test "for_each_time_range matches scan_time_range and stops early" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  for i = 0; i < 12; i = i + 1 {
+    ignore(log.append(b"k", b"v", (i * 10).to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  let materialised = log.scan_time_range((30 : Int64), (80 : Int64)) catch {
+    _ => panic()
+  }
+  let streamed : Array[UInt64] = []
+  log.for_each_time_range((30 : Int64), (80 : Int64), rec => {
+    streamed.push(rec.offset)
+    true
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(streamed.length(), materialised.length())
+  let mut i = 0
+  while i < materialised.length() {
+    assert_eq(streamed[i], materialised[i].offset)
+    i = i + 1
+  }
+  // Returning false stops the walk once the timestamp reaches 30.
+  let partial : Array[UInt64] = []
+  log.for_each_time_range((0 : Int64), (120 : Int64), rec => {
+    if rec.timestamp < 30 {
+      partial.push(rec.offset)
+      true
+    } else {
+      false
+    }
+  }) catch {
+    _ => panic()
+  }
+  assert_eq(partial.length(), 3)
+}
+
+///|
 test "empty log has no segments and empty scan" {
   let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
     (1024 : Int64),

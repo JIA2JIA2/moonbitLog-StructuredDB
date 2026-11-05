@@ -296,11 +296,14 @@ fn cmd_scan(
       Some(s) => parse_offset(s)
       None => log.next_offset()
     }
-    let recs = log.scan_range(lo, hi)
-    for rec in recs {
+    // Streamed: large ranges never materialise in memory.
+    let mut count = 0
+    log.for_each_while(lo, hi, rec => {
       print_record(rec)
-    }
-    println("(" + recs.length().to_string() + " records)")
+      count = count + 1
+      true
+    })
+    println("(" + count.to_string() + " records)")
     close_log(log)
   })
 }
@@ -358,26 +361,33 @@ fn cmd_scan_time(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
-    let recs = log.scan_time_range(lo_ts, hi_ts)
-    for rec in recs {
+    let mut count = 0
+    log.for_each_time_range(lo_ts, hi_ts, rec => {
       print_record(rec)
-    }
-    println("(" + recs.length().to_string() + " records)")
+      count = count + 1
+      true
+    })
+    println("(" + count.to_string() + " records)")
     close_log(log)
   })
 }
 
 ///|
-/// List the most recent `n` records in append order.
+/// List the most recent `n` records in append order, streamed.
 fn cmd_tail(dir : String, n : String) -> Unit raise @io.IoError {
-  let count = parse_count(n)
+  let count_req = parse_count(n)
   run_locked(dir, false, () => {
     let log = open_log(dir)
-    let recs = log.tail(count)
-    for rec in recs {
+    let total = log.next_offset()
+    let un = count_req.to_uint64()
+    let from = if total > un { total - un } else { (0 : UInt64) }
+    let mut count = 0
+    log.for_each_while(from, total, rec => {
       print_record(rec)
-    }
-    println("(" + recs.length().to_string() + " records)")
+      count = count + 1
+      true
+    })
+    println("(" + count.to_string() + " records)")
     close_log(log)
   })
 }
