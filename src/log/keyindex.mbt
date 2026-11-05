@@ -1,19 +1,36 @@
 ///|
 /// A point-in-time key -> latest-offset index built from a log scan. Keys are
 /// raw bytes (binary-safe); tombstones remove keys, so only live puts remain.
+/// While cached on a log, it is maintained incrementally by appends (see
+/// `update`); the sorted-key view is recomputed lazily after those updates.
 pub(all) struct KeyIndex {
   entries : @hashmap.HashMap[Bytes, UInt64]
   mut sorted_keys : Array[Bytes]
+  mut keys_dirty : Bool
 }
 
 ///|
 pub fn KeyIndex::new() -> KeyIndex {
-  { entries: @hashmap.HashMap::HashMap([]), sorted_keys: [], }
+  {
+    entries: @hashmap.HashMap::HashMap([]),
+    sorted_keys: [],
+    keys_dirty: false,
+  }
 }
 
 ///|
-/// The live keys in ascending byte order. Populated by `build_key_index`.
+/// The live keys in ascending byte order, recomputing the cached view when
+/// incremental updates have made it stale.
 pub fn KeyIndex::sorted_keys(self : KeyIndex) -> Array[Bytes] {
+  if self.keys_dirty {
+    let keys : Array[Bytes] = []
+    for k in self.entries.keys() {
+      keys.push(k)
+    }
+    keys.sort_by(fn(a, b) { bytes_cmp(a, b) })
+    self.sorted_keys = keys
+    self.keys_dirty = false
+  }
   self.sorted_keys
 }
 
@@ -27,6 +44,25 @@ pub fn KeyIndex::latest(self : KeyIndex, key : Bytes) -> UInt64? {
 /// Number of live keys.
 pub fn KeyIndex::size(self : KeyIndex) -> Int32 {
   self.entries.length()
+}
+
+///|
+/// Fold a newly appended record into the index incrementally: a put sets (or
+/// refreshes) the key's latest offset — newly assigned offsets are always
+/// greater than every recorded one, so the latest-wins semantics hold — and
+/// a tombstone removes the key. Marks the sorted-key view stale.
+pub fn KeyIndex::update(
+  self : KeyIndex,
+  key : Bytes,
+  offset : UInt64,
+  is_delete : Bool,
+) -> Unit {
+  if is_delete {
+    self.entries.remove(key)
+  } else {
+    self.entries.set(key, offset)
+  }
+  self.keys_dirty = true
 }
 
 ///|

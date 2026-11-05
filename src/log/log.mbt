@@ -144,7 +144,14 @@ pub fn[W : @io.LogWriter, R] Log::append(
     active.mark_fsync_clean()
   }
   self.next_offset = offset + (1 : UInt64)
-  self.index_cache = None
+  // Maintain a cached key index incrementally: the new offset is greater
+  // than every recorded one, so a put refreshes latest-wins in place and a
+  // tombstone drops the key. Structural changes (retention, merge, compact)
+  // still invalidate the whole cache.
+  match self.index_cache {
+    Some(idx) => idx.update(key, offset, kind is @core.RecordKind::Delete)
+    None => ()
+  }
   offset
 }
 

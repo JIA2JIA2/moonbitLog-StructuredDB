@@ -18,7 +18,7 @@
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
-- **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
+- **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），缓存索引随 `append` **增量维护**（put 刷新、tombstone 移除，段集合结构变化才整体失效），写密集点查不再触发全量重建；`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
 - **工程化**：property/fuzz 随机截断与损坏恢复测试、`moon bench` 基准、GitHub Actions CI。
 - **CLI**：native 命令行工具覆盖上述能力。
@@ -364,6 +364,7 @@ u32 crc32          (仅覆盖 body)
 - M92 复制方案文档化：运维指南新增「异地同步/复制」——增量 backup + rsync 搭建主→备只读副本（offset/游标语义保留），并明确单写多读边界
 - M93 恢复即校验：`restore` 完成后自动对恢复副本执行 `verify_fast` 并输出报告，静默损坏的备份在投入使用前即被拦截
 - M94 修复预览：`repair_log_dir` 增加 `dry_run` 模式（只读探测 `probe_records`），CLI `fsck --dry-run` 打印修复计划——将截断/隔离/删除什么，不改盘；dry-run 计划与实际修复结果一致（测试断言）
+- M95 KeyIndex 增量维护：`append` 将新记录增量折叠进缓存的 key 索引（`KeyIndex::update`——新 offset 恒更大，put 刷新 latest、tombstone 移除键），`sorted_keys` 视图惰性重算；仅段集合结构变化（保留/合并/压缩/导入重放）才整体失效，写密集点查消除 O(全部 key) 的全量重建
 
 ## 许可
 

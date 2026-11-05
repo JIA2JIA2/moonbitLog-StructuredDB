@@ -1237,7 +1237,7 @@ test "merge_segments combines contiguous rolled segments preserving offsets" {
 }
 
 ///|
-test "key index is cached until the log changes" {
+test "key index is cached and maintained incrementally" {
   let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
     (1_000_000 : Int64),
     base => mem_segment(base),
@@ -1250,10 +1250,53 @@ test "key index is cached until the log changes" {
   let i2 = log.build_key_index()
   assert_eq(log.index_build_count(), start + 1)
   assert_eq(i2.size(), 1)
+  // A new append folds into the cached index incrementally — no rebuild.
   ignore(log.append(b"b", b"2", (1 : Int64)) catch { _ => panic() })
   let i3 = log.build_key_index()
-  assert_eq(log.index_build_count(), start + 2)
+  assert_eq(log.index_build_count(), start + 1)
   assert_eq(i3.size(), 2)
+}
+
+///|
+test "incremental key index stays correct across appends and tombstones" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (100 : Int64),
+    base => mem_segment(base),
+  )
+  ignore(log.append(b"k1", b"v1", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k2", b"v2", (1 : Int64)) catch { _ => panic() })
+  let idx = log.build_key_index()
+  assert_eq(idx.size(), 2)
+  // These appends take the incremental path (the cache is live).
+  ignore(log.append(b"k1", b"v1b", (2 : Int64)) catch { _ => panic() })
+  ignore(log.delete(b"k2", (3 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k3", b"v3", (4 : Int64)) catch { _ => panic() })
+  // The same cached index now reflects the new state without a rebuild.
+  let a = log.get_latest(idx, b"k1") catch { _ => panic() }
+  match a {
+    Some(rec) => assert_eq(rec.value, b"v1b")
+    None => panic()
+  }
+  let b = log.get_latest(idx, b"k2") catch { _ => panic() }
+  match b {
+    Some(_) => panic()
+    None => ()
+  }
+  let c = log.get_latest(idx, b"k3") catch { _ => panic() }
+  match c {
+    Some(rec) => assert_eq(rec.value, b"v3")
+    None => panic()
+  }
+  // The sorted-key view is recomputed lazily and stays ordered.
+  let keys = idx.sorted_keys()
+  assert_eq(keys.length(), 2)
+  assert_eq(keys[0], b"k1")
+  assert_eq(keys[1], b"k3")
+  // Prefix scans agree with the incrementally maintained index.
+  let pref = log.scan_prefix(b"k") catch { _ => panic() }
+  assert_eq(pref.length(), 2)
+  assert_eq(pref[0].key, b"k1")
+  assert_eq(pref[1].key, b"k3")
 }
 
 ///|
