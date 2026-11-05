@@ -100,6 +100,11 @@ moonlog <command> <dir> [args...]
   getkey-live <dir> <key> <ttl> 查询 key 的最新值，过期则视为不存在
   has-key <dir> <key>           用段级 Bloom 过滤判断 key 是否存在
   export <dir> <file>           导出全部记录（含 tombstone）到可移植文件
+  export-jsonl <dir> <file> [base64]
+                                导出全部记录为 JSON Lines（每行一个 JSON 对
+                                象：offset/timestamp/kind/key/value；默认文
+                                本模式假定 UTF-8 文本、控制字符转义，`base64`
+                                模式对任意字节无损）
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   compact-expired <dir> <ttl>   折叠 live 记录并剔除已过期记录（offset 重排）
@@ -108,7 +113,8 @@ moonlog <command> <dir> [args...]
                                 （改名 `<name>.corrupt` 保留证据）、截断损坏
                                 尾部、重建 MANIFEST 与全部段 sidecar，随后
                                 再校验一次并输出报告
-stats <dir> [json]            打印逐段统计（可选 JSON）
+stats <dir> [json]            打印逐段统计（含每段逻辑字节 disk 磁盘字节与
+                              压缩汇总；可选 JSON）
 ```
 
 持久性与 `MOONLOG_SYNC`：CLI 写入默认 `Always`，即命令返回时数据已 fsync 落盘；设 `MOONLOG_SYNC=batch` 改为批量 / 导入时一次 fsync，设 `MOONLOG_SYNC=never`（或 `0`）关闭显式 fsync（仅依赖 OS 回写）。
@@ -338,6 +344,7 @@ u32 crc32          (仅覆盖 body)
 - M88 修复鲁棒性 property 测试：固定 seed 随机注入截断/翻转字节/删 MANIFEST/删 sidecar/追加 torn 尾（1–3 类/轮，40 轮），断言 repair 后存活记录与原始一致、verify 通过、可续写
 - M89 流式遍历：`Segment::for_each_while` / `Log::for_each_while`（`f` 返回 `false` 提前终止，跨段传播）与 `Log::for_each_time_range`；CLI `scan`/`scan-time`/`tail` 改流式输出，大结果集不再物化 Array
 - M90 批量读快路径：`scan`/`rebuild_index`/`recover` 改为单次读全段后内存顺序解码（`decode_in`），消除逐记录 pread——native bench 段恢复 86.9ms→5.2ms（16.7×）、全量顺序扫描 2.77ms→0.86ms（3.2×），点查/写入持平
+- M91 观测与导出：`SegmentSummary` 增加逻辑字节与 `disk_bytes`，`stats` 输出每段与总体的压缩尺寸（文本/JSON）；CLI `export-jsonl` 以 JSON Lines 导出（text/base64 双模式，内置 RFC 4648 base64 编码器）
 
 ## 许可
 

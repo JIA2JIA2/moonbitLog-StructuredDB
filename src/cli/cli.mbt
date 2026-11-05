@@ -46,6 +46,8 @@
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
 ///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
+///   export-jsonl <dir> <file> [base64]
+///                                    write all records as JSON Lines
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
@@ -64,7 +66,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -409,12 +411,20 @@ fn cmd_recover(dir : String) -> Unit raise @io.IoError {
 }
 
 ///|
-/// Print per-segment statistics: total counts plus one line per segment. With
-/// a second argument of `json`, emit the same information as JSON.
+/// Print per-segment statistics: total counts plus one line per segment,
+/// including per-segment and total compression sizes (`bytes` is the logical
+/// record size, `disk` what the segment occupies on disk). With a second
+/// argument of `json`, emit the same information as JSON.
 fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let detail = log.segment_summaries()
+    let mut raw_total : Int64 = 0
+    let mut disk_total : Int64 = 0
+    for seg in detail {
+      raw_total = raw_total + seg.bytes
+      disk_total = disk_total + seg.disk_bytes
+    }
     if json {
       let mut s = "{\"records\":" +
         log.count().to_string() +
@@ -422,6 +432,10 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
         log.segment_count().to_string() +
         ",\"next_offset\":" +
         log.next_offset().to_string() +
+        ",\"raw_bytes\":" +
+        raw_total.to_string() +
+        ",\"disk_bytes\":" +
+        disk_total.to_string() +
         ",\"detail\":["
       let mut first = true
       for seg in detail {
@@ -436,6 +450,8 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           seg.records.to_string() +
           ",\"bytes\":" +
           seg.bytes.to_string() +
+          ",\"disk_bytes\":" +
+          seg.disk_bytes.to_string() +
           ",\"compressed\":" +
           (if seg.compressed { "true" } else { "false" })
         if seg.has_span {
@@ -452,6 +468,8 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
       println("records " + log.count().to_string())
       println("segments " + log.segment_count().to_string())
       println("next_offset " + log.next_offset().to_string())
+      println("raw_bytes " + raw_total.to_string())
+      println("disk_bytes " + disk_total.to_string())
       for seg in detail {
         println(
           "seg " +
@@ -460,6 +478,8 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           seg.records.to_string() +
           " bytes=" +
           seg.bytes.to_string() +
+          " disk=" +
+          seg.disk_bytes.to_string() +
           " compressed=" +
           (if seg.compressed { "true" } else { "false" }),
         )
@@ -1049,6 +1069,141 @@ fn cmd_export(dir : String, file : String) -> Unit raise @io.IoError {
 }
 
 ///|
+const B64_ALPHABET : Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+///|
+const HEX_DIGITS : Bytes = b"0123456789abcdef"
+
+///|
+/// Base64-encode arbitrary bytes (RFC 4648, with `=` padding).
+fn b64_encode(data : Bytes) -> Bytes {
+  let out = @buffer.Buffer::Buffer()
+  let n = data.length()
+  let mut i = 0
+  while i + 3 <= n {
+    let v = (data.at(i).to_int() << 16) |
+      (data.at(i + 1).to_int() << 8) |
+      data.at(i + 2).to_int()
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 18) & 63, ((v >> 18) & 63) + 1),
+    )
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 12) & 63, ((v >> 12) & 63) + 1),
+    )
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 6) & 63, ((v >> 6) & 63) + 1),
+    )
+    out.write_bytes(@core.slice(B64_ALPHABET, v & 63, (v & 63) + 1))
+    i = i + 3
+  }
+  let rem = n - i
+  if rem == 1 {
+    let v = data.at(i).to_int() << 16
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 18) & 63, ((v >> 18) & 63) + 1),
+    )
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 12) & 63, ((v >> 12) & 63) + 1),
+    )
+    out.write_bytes(b"==")
+  } else if rem == 2 {
+    let v = (data.at(i).to_int() << 16) | (data.at(i + 1).to_int() << 8)
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 18) & 63, ((v >> 18) & 63) + 1),
+    )
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 12) & 63, ((v >> 12) & 63) + 1),
+    )
+    out.write_bytes(
+      @core.slice(B64_ALPHABET, (v >> 6) & 63, ((v >> 6) & 63) + 1),
+    )
+    out.write_bytes(b"=")
+  }
+  out.to_bytes()
+}
+
+///|
+/// Write `data` as a JSON string literal (with surrounding quotes) to `out`.
+/// In text mode quotes, backslashes and control characters are escaped and
+/// UTF-8 bytes pass through unchanged (output is valid JSON only when the
+/// bytes are UTF-8); in base64 mode the bytes are base64 encoded first,
+/// which is lossless for arbitrary binary.
+fn write_json_string(out : @buffer.Buffer, data : Bytes, b64 : Bool) -> Unit {
+  out.write_bytes(b"\"")
+  if b64 {
+    out.write_bytes(b64_encode(data))
+  } else {
+    let n = data.length()
+    let mut i = 0
+    while i < n {
+      let b = data.at(i).to_int()
+      if b == 34 {
+        out.write_bytes(b"\\\"")
+      } else if b == 92 {
+        out.write_bytes(b"\\\\")
+      } else if b == 8 {
+        out.write_bytes(b"\\b")
+      } else if b == 12 {
+        out.write_bytes(b"\\f")
+      } else if b == 10 {
+        out.write_bytes(b"\\n")
+      } else if b == 13 {
+        out.write_bytes(b"\\r")
+      } else if b == 9 {
+        out.write_bytes(b"\\t")
+      } else if b < 32 {
+        out.write_bytes(b"\\u00")
+        out.write_bytes(@core.slice(HEX_DIGITS, b / 16, b / 16 + 1))
+        out.write_bytes(@core.slice(HEX_DIGITS, b % 16, b % 16 + 1))
+      } else {
+        out.write_bytes(@core.slice(data, i, i + 1))
+      }
+      i = i + 1
+    }
+  }
+  out.write_bytes(b"\"")
+}
+
+///|
+/// Export every record as JSON Lines (one self-contained JSON object per
+/// line: `offset`, `timestamp`, `kind`, `key`, `value`). The default text
+/// mode assumes keys/values are UTF-8 text; pass `base64` as the third
+/// argument for a lossless encoding of arbitrary bytes.
+fn cmd_export_jsonl(
+  dir : String,
+  file : String,
+  mode : String,
+) -> Unit raise @io.IoError {
+  if mode != "text" && mode != "base64" {
+    raise @io.IoError::Invalid("invalid mode: " + mode + " (text|base64)")
+  }
+  let b64 = mode == "base64"
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let buf = @buffer.Buffer::Buffer()
+    let mut count = 0
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      buf.write_bytes(b"{\"offset\":")
+      buf.write_bytes(@utf8.encode(rec.offset.to_string()))
+      buf.write_bytes(b",\"timestamp\":")
+      buf.write_bytes(@utf8.encode(rec.timestamp.to_string()))
+      buf.write_bytes(b",\"kind\":")
+      buf.write_bytes(if rec.is_delete() { b"\"delete\"" } else { b"\"put\"" })
+      buf.write_bytes(b",\"key\":")
+      write_json_string(buf, rec.key, b64)
+      buf.write_bytes(b",\"value\":")
+      write_json_string(buf, rec.value, b64)
+      buf.write_bytes(b"}\n")
+      count = count + 1
+      true
+    })
+    @backend_native.write_file(file, buf.to_bytes())
+    println("exported " + count.to_string() + " records")
+    close_log(log)
+  })
+}
+
+///|
 /// Import records from a file produced by `export` into a log directory.
 fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
@@ -1445,6 +1600,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_export(args[2], args[3])
+    }
+  } else if cmd == "export-jsonl" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mode = if args.length() > 4 { args[4] } else { "text" }
+      cmd_export_jsonl(args[2], args[3], mode)
     }
   } else if cmd == "import" {
     if args.length() < 4 {
