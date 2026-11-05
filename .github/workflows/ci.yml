@@ -68,6 +68,43 @@ jobs:
       - name: Benchmark (native)
         run: moon bench --target native | tee bench_results.txt
 
+      # Gate on the ms-level benchmarks only: µs-level ones are too noisy on
+      # shared runners. Thresholds carry 5-6x headroom over the pinned
+      # toolchain's local numbers (sequential scan 0.9ms, range scan 10ms,
+      # recover 5ms) — they exist to catch order-of-magnitude regressions,
+      # not to measure absolute speed. Tighten deliberately.
+      - name: Performance gate (native)
+        run: |
+          python3 - <<'EOF'
+          import re, sys
+          limits = {
+              "bench native sequential scan": 5.0,
+              "bench range scan": 50.0,
+              "bench segment recover": 30.0,
+          }
+          text = open("bench_results.txt", encoding="utf-8").read()
+          failed = []
+          cur = None
+          for line in text.splitlines():
+              m = re.search(r'\("([^"]+)"\)', line)
+              if m:
+                  cur = m.group(1)
+                  continue
+              t = re.match(r'\s*([\d.]+)\s*(µs|ms)\s*±', line)
+              if t and cur:
+                  ms = float(t.group(1)) * (1.0 if t.group(2) == "ms" else 0.001)
+                  limit = limits.get(cur)
+                  if limit is not None and ms > limit:
+                      failed.append(f"{cur}: {ms:.2f}ms > {limit}ms limit")
+                  cur = None
+          if failed:
+              print("PERFORMANCE REGRESSION:")
+              for f in failed:
+                  print("  " + f)
+              sys.exit(1)
+          print("performance gate passed")
+          EOF
+
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
