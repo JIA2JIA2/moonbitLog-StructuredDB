@@ -20,7 +20,7 @@
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
 - **KV 逻辑视图与 compaction**：`KeyIndex` 提供 key→最新值查询（tombstone 生效），缓存索引随 `append` **增量维护**（put 刷新、tombstone 移除，段集合结构变化才整体失效），写密集点查不再触发全量重建；`Log::snapshot` 生成折叠后的 live 记录，`compact` 命令重写目录。
 - **并发安全**：native 后端基于 `flock` 对目录加建议锁（写者独占 / 读者共享），CLI 写入与 `compact`/`prune` 互斥，读者总是观察到一致的偏移快照。
-- **工程化**：property/fuzz 随机截断与损坏恢复测试、`moon bench` 基准、GitHub Actions CI。
+- **工程化**：property/fuzz 随机截断与损坏恢复测试、`moon bench` 基准、GitHub Actions CI（工具链固定 + `fmt --check`/`.mbti` 快照/bench 阈值四重门禁）。
 - **CLI**：native 命令行工具覆盖上述能力。
 
 ## 包结构
@@ -122,6 +122,7 @@ moonlog <command> <dir> [args...]
                                 复计划（将截断/隔离/删除什么），不改盘
 stats <dir> [json]            打印逐段统计（含每段逻辑字节 disk 磁盘字节与
                               压缩汇总；可选 JSON）
+version                       打印 moonlog 版本号（与 moon.mod 同步）
 ```
 
 持久性与 `MOONLOG_SYNC`：CLI 写入默认 `Always`，即命令返回时数据已 fsync 落盘；设 `MOONLOG_SYNC=batch` 改为批量 / 导入时一次 fsync，设 `MOONLOG_SYNC=never`（或 `0`）关闭显式 fsync（仅依赖 OS 回写）。
@@ -374,6 +375,9 @@ u32 crc32          (仅覆盖 body)
 - M98 增量备份 property 测试：固定 seed 随机写序列（put/delete 交错、每三轮 compact）× 8 轮增量 backup → restore，断言与源端逐记录等价；该测试暴露并驱动修复了"同名同尺寸跳过"启发式在 compact 重写同名段时的 stale 数据缺陷（改用纳秒级 mtime 判断）
 - M99 follow 程序化消费：`--json` 以单行 JSON 输出记录（UTF-8 文本、控制字符转义，与 export-jsonl 同构）；`--name <cursor>` 支持命名游标的读取与提交，多消费者可各自 follow 互不干扰
 - M100 serve 周期巡检：`--fsck-every N` 每 N 轮维护后对日志执行 `verify_fast` 并输出报告，常驻守护自带完整性巡检
+- M101 CLI `version` 命令：输出 moonlog 版本号（与 `moon.mod` 同步维护）
+- M102 CI 性能门禁：ms 级 native 基准（顺序扫描/区间扫描/段恢复）与保守阈值（本地 pinned 工具链值的 5–6 倍余量）比较，仅拦截数量级回退，规避共享 runner 的 µs 级噪声
+- M103 export/import roundtrip property 测试：固定 seed 随机 put/delete 序列 × 6 轮，导出记录流重放进全新目录，断言逐记录等价（offset 连续、timestamp/kind/payload 保留）
 
 ## 许可
 

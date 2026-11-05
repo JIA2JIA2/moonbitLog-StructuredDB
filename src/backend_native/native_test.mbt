@@ -1777,3 +1777,77 @@ test "incremental backup property: repeated passes track the source" {
   clean_dir(dst)
   clean_dir(rst)
 }
+
+///|
+/// Export/import roundtrip invariant: a random log (puts and tombstones over
+/// a small key space) exported to a record stream and replayed into a fresh
+/// directory yields the same records in the same order — offsets (the source
+/// is contiguous), timestamps, kinds and payloads included.
+test "export/import roundtrip property" {
+  let src = "/tmp/moonlog_rt_src"
+  let dst = "/tmp/moonlog_rt_dst"
+  ignore(@backend_native.ensure_dir(src))
+  ignore(@backend_native.ensure_dir(dst))
+  clean_dir(src)
+  clean_dir(dst)
+  let mut s : UInt64 = 0x1234ABCD5E
+  let mut ts : Int64 = 0
+  let mut round = 0
+  while round < 6 {
+    let log = @backend_native.open_log_dir(src, (60 : Int64)) catch {
+      _ => panic()
+    }
+    s = repair_lcg(s)
+    let n_writes = ((s >> 3) % (10 : UInt64)).to_int() + 3
+    let mut w = 0
+    while w < n_writes {
+      s = repair_lcg(s)
+      let slot = ((s >> 5) % (4 : UInt64)).to_int() * 4
+      let key = @core.slice(b"key0key1key2key3", slot, slot + 4)
+      ts = ts + 1
+      if (s >> 9) % (4 : UInt64) == (0 : UInt64) {
+        ignore(log.delete(key, ts) catch { _ => panic() })
+      } else {
+        let v = if (s >> 7) % (2 : UInt64) == (0 : UInt64) {
+          b"even-payload"
+        } else {
+          b"odd"
+        }
+        ignore(log.append(key, v, ts) catch { _ => panic() })
+      }
+      w = w + 1
+    }
+    @backend_native.flush_meta(src, log) catch {
+      _ => panic()
+    }
+    // Roundtrip: export the whole stream, replay it into a fresh directory.
+    let data = log.export_bytes() catch { _ => panic() }
+    clean_dir(dst)
+    let fresh = @backend_native.open_log_dir(dst, (60 : Int64)) catch {
+      _ => panic()
+    }
+    let imported = fresh.import_bytes(data) catch { _ => panic() }
+    let src_recs = log.scan() catch { _ => panic() }
+    let dst_recs = fresh.scan() catch { _ => panic() }
+    assert_eq(imported, src_recs.length())
+    assert_eq(dst_recs.length(), src_recs.length())
+    let mut i = 0
+    while i < src_recs.length() {
+      assert_eq(dst_recs[i], src_recs[i])
+      i = i + 1
+    }
+    @backend_native.flush_meta(dst, fresh) catch {
+      _ => panic()
+    }
+    for seg in log.segments {
+      seg.writer.close()
+    }
+    for seg in fresh.segments {
+      fresh.flush()
+      seg.writer.close()
+    }
+    round = round + 1
+  }
+  clean_dir(src)
+  clean_dir(dst)
+}
