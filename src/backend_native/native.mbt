@@ -49,6 +49,10 @@ extern "C" fn moonlog_readdir(handle : Int64) -> Bytes = "moonlog_readdir"
 extern "C" fn moonlog_closedir(handle : Int64) -> Int32 = "moonlog_closedir"
 
 ///|
+#borrow(path)
+extern "C" fn moonlog_mtime_ns(path : Bytes) -> Int64 = "moonlog_mtime_ns"
+
+///|
 /// Number of buffered bytes at which an append is flushed to the descriptor.
 const WRITE_BUFFER_LIMIT : Int32 = 65536
 
@@ -1101,18 +1105,28 @@ fn contains_u64(arr : Array[UInt64], v : UInt64) -> Bool {
 }
 
 ///|
+/// Last-modification time of a file in nanoseconds since the epoch, or -1
+/// when the file cannot be stat'ed.
+pub fn file_mtime_ns(path : String) -> Int64 {
+  moonlog_mtime_ns(@utf8.encode(path))
+}
+
+///|
 /// Copy every durable-state file from `src` into directory `dst`, returning
 /// the number of segment data files copied this run. The caller must hold the
 /// exclusive directory lock on `src` and have flushed both data (`Log::flush`)
 /// and metadata (`flush_meta`) beforehand, so the copied files form a
 /// consistent snapshot.
 ///
-/// Backing up over an earlier backup makes an incremental pass: segment data
-/// files are append-only, so a segment already present in `dst` with the same
-/// byte size is skipped, and backups of segments that no longer exist at the
-/// source (merged, compacted or pruned away) are deleted. The small manifest
-/// and per-segment sidecars may change in place, so they are always recopied.
-/// The first run into an empty (or not yet existing) `dst` is a full backup.
+/// Backing up over an earlier backup makes an incremental pass: a segment
+/// already present in `dst` whose copy is newer than the source's last
+/// modification is skipped — appends only grow the source, and compaction or
+/// merge rewrite segments under the same file name, so any change makes the
+/// source's mtime newer than the copy. Backups of segments that no longer
+/// exist at the source (merged, compacted or pruned away) are deleted. The
+/// small manifest and per-segment sidecars may change in place, so they are
+/// always recopied. The first run into an empty (or not yet existing) `dst`
+/// is a full backup.
 pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
   ignore(ensure_dir(dst))
   let src_names = list_dir(src)
@@ -1138,14 +1152,21 @@ pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
       continue
     }
     let dst_path = dst + "/" + name
+    let src_path = src + "/" + name
     let existing = file_size(dst_path)
-    // Segment data only grows, so the same byte size means the same content;
-    // the manifest and sidecars are rewritten in place, so recopy them.
+    // A backed-up copy is trustworthy while it is newer than the source's
+    // last modification: appends only grow the source (newer mtime), and
+    // compaction or merge rewrite segments under the same file name (also
+    // newer mtime) — either way the source then wins and is recopied. When
+    // the source has not been touched since the last pass its mtime stays
+    // older than the copy, and the copy is skipped. The manifest and
+    // sidecars are rewritten in place, so recopy them.
     let skip = name.has_suffix(".log") &&
       existing >= (0 : Int64) &&
-      existing == file_size(src + "/" + name)
+      existing == file_size(src_path) &&
+      file_mtime_ns(dst_path) > file_mtime_ns(src_path)
     if !skip {
-      write_file(dst_path, read_file(src + "/" + name))
+      write_file(dst_path, read_file(src_path))
       if name.has_suffix(".log") {
         copied = copied + 1
       }

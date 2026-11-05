@@ -1680,3 +1680,100 @@ test "repair dry-run does not quarantine checksum-bad segments" {
   assert_true(@backend_native.file_exists(path))
   clean_dir(dir)
 }
+
+///|
+/// Incremental backup invariant: any number of append/delete rounds followed
+/// by an incremental `backup_log_dir` pass leaves a backup that restores into
+/// an equivalent log — offsets, timestamps, kinds and payloads included —
+/// even when the source compacts and its old segment files vanish (the
+/// backup must prune its stale copies).
+test "incremental backup property: repeated passes track the source" {
+  let src = "/tmp/moonlog_incbk_src"
+  let dst = "/tmp/moonlog_incbk_dst"
+  let rst = "/tmp/moonlog_incbk_rst"
+  ignore(@backend_native.ensure_dir(src))
+  ignore(@backend_native.ensure_dir(dst))
+  ignore(@backend_native.ensure_dir(rst))
+  clean_dir(src)
+  clean_dir(dst)
+  clean_dir(rst)
+  let mut s : UInt64 = 0xC0FFEEF00D
+  let mut ts : Int64 = 0
+  let mut round = 0
+  while round < 8 {
+    // Random writes accumulate on the source (the backup keeps growing).
+    let log = @backend_native.open_log_dir(src, (60 : Int64)) catch {
+      _ => panic()
+    }
+    s = repair_lcg(s)
+    let n_writes = ((s >> 3) % (6 : UInt64)).to_int() + 1
+    let mut w = 0
+    while w < n_writes {
+      s = repair_lcg(s)
+      let slot = ((s >> 5) % (4 : UInt64)).to_int() * 4
+      let key = @core.slice(b"key0key1key2key3", slot, slot + 4)
+      ts = ts + 1
+      if (s >> 9) % (4 : UInt64) == (0 : UInt64) {
+        ignore(log.delete(key, ts) catch { _ => panic() })
+      } else {
+        let v = if (s >> 7) % (2 : UInt64) == (0 : UInt64) {
+          b"even-payload"
+        } else {
+          b"odd"
+        }
+        ignore(log.append(key, v, ts) catch { _ => panic() })
+      }
+      w = w + 1
+    }
+    @backend_native.flush_meta(src, log) catch {
+      _ => panic()
+    }
+    // Every third round folds the source: old segment files vanish and
+    // offsets renumber, so the backup must prune its stale copies.
+    if round % 3 == 2 {
+      ignore(
+        log.compact(on_drop=seg => {
+          @backend_native.remove_segment_files(src, seg.base_offset)
+          seg.writer.close()
+        }) catch {
+          _ => panic()
+        },
+      )
+      @backend_native.flush_meta(src, log) catch {
+        _ => panic()
+      }
+    }
+    for seg in log.segments {
+      seg.writer.close()
+    }
+    // Incremental pass over the accumulating backup, then the restore must
+    // match the source record for record.
+    ignore(@backend_native.backup_log_dir(src, dst) catch { _ => panic() })
+    clean_dir(rst)
+    ignore(@backend_native.restore_log_dir(dst, rst) catch { _ => panic() })
+    let s_log = @backend_native.open_log_dir(src, (60 : Int64)) catch {
+      _ => panic()
+    }
+    let r_log = @backend_native.open_log_dir(rst, (60 : Int64)) catch {
+      _ => panic()
+    }
+    let s_recs = s_log.scan() catch { _ => panic() }
+    let r_recs = r_log.scan() catch { _ => panic() }
+    assert_eq(r_recs.length(), s_recs.length())
+    let mut i = 0
+    while i < s_recs.length() {
+      assert_eq(r_recs[i], s_recs[i])
+      i = i + 1
+    }
+    for seg in s_log.segments {
+      seg.writer.close()
+    }
+    for seg in r_log.segments {
+      seg.writer.close()
+    }
+    round = round + 1
+  }
+  clean_dir(src)
+  clean_dir(dst)
+  clean_dir(rst)
+}

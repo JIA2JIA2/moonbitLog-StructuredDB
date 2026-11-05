@@ -14,7 +14,7 @@
 - **保留策略**：`Log::drop_before` / `Log::retain_last` / `Log::retain_max_bytes` / `Log::retain_before`（按 offset / 段数 / 总字节 / 时间戳）以整段删除方式回收旧数据。
 - **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
-- **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——段数据只增不变，尺寸相同的段自动跳过、源端已删除的段自动清理，大目录备份成本降为 O(变更)。
+- **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——备份副本比源端段文件新（源端自上次备份未被修改）即跳过，源端已删除的段自动清理，大目录备份成本降为 O(变更)。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -354,7 +354,7 @@ u32 crc32          (仅覆盖 body)
 - M82 修复模式：`repair_log_dir` 与 CLI `fsck --fix`（整段 CRC 失败隔离为 `.corrupt`、torn-tail 截断、空段清理、MANIFEST 与段 sidecar 原子重建）
 - M83 尾随读：CLI `follow`（轮询新记录持续输出，`-`/`tail`/offset 起点、`--commit` 自动提交游标、`--once` 单轮、`MOONLOG_FOLLOW_INTERVAL` 间隔）
 - M84 自动维护：CLI `serve`（周期性维护管线，`--every`/`MOONLOG_SERVE_INTERVAL` 周期、`--once` 单轮；`maintain` 核心重构为共享的 `run_maintenance`）
-- M85 增量备份：`backup_log_dir` 对既有备份目录增量执行——尺寸相同的段跳过（段数据只增不变）、源端已删段自动清理、MANIFEST 与 sidecar 始终重拷（原地重写），大目录备份降为 O(变更)
+- M85 增量备份：`backup_log_dir` 对既有备份目录增量执行——备份副本比源端段文件新（源端自上次备份未被修改）即跳过、源端已删段自动清理、MANIFEST 与 sidecar 始终重拷（原地重写），大目录备份降为 O(变更)。M98 发现并修复了原"同名同尺寸跳过"启发式的缺陷：compact/merge 会以同名重写段文件，尺寸可能不变而内容已变——现改用纳秒级 mtime 判断（`file_mtime_ns`，新增 stub）
 - M86 维护管线集成压缩：`compress_rolled_segments` 从 `compress_log_dir` 抽出为库 API，`maintain` / `serve` 管线自动压缩全部已 roll 段（LZSS）并输出 `compressed N`
 - M87 消费滞后监控：CLI `cursor-lag` 报告默认与命名游标的 position/lag 与 `next_offset`
 - M88 修复鲁棒性 property 测试：固定 seed 随机注入截断/翻转字节/删 MANIFEST/删 sidecar/追加 torn 尾（1–3 类/轮，40 轮），断言 repair 后存活记录与原始一致、verify 通过、可续写
@@ -367,6 +367,7 @@ u32 crc32          (仅覆盖 body)
 - M95 KeyIndex 增量维护：`append` 将新记录增量折叠进缓存的 key 索引（`KeyIndex::update`——新 offset 恒更大，put 刷新 latest、tombstone 移除键），`sorted_keys` 视图惰性重算；仅段集合结构变化（保留/合并/压缩/导入重放）才整体失效，写密集点查消除 O(全部 key) 的全量重建
 - M96 Bloom 快查 O(1) 化：`latest_key_in_segment` 直接查段的内存 key 映射（append/rebuild/`.keys` sidecar 加载恒就绪）取 latest offset 后单点读取，`get_latest_bloom` 从 O(段大小解码) 降为 O(1)，不再全段扫描
 - M97 前缀/区间扫描段分组读取：`scan_prefix` / `scan_key_range` 按 offset 顺序单遍读取（复用 get_many 的段分组模式 M79）后按 key 序重排，消除逐 key 跨段定位的读放大
+- M98 增量备份 property 测试：固定 seed 随机写序列（put/delete 交错、每三轮 compact）× 8 轮增量 backup → restore，断言与源端逐记录等价；该测试暴露并驱动修复了"同名同尺寸跳过"启发式在 compact 重写同名段时的 stale 数据缺陷（改用纳秒级 mtime 判断）
 
 ## 许可
 

@@ -226,6 +226,21 @@ moonbit_bytes_t moonlog_read_file(moonbit_bytes_t path) {
 }
 
 MOONBIT_FFI_EXPORT
+int64_t moonlog_mtime_ns(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  struct stat st;
+  if (stat(p, &st) != 0) {
+    free(p);
+    return -1;
+  }
+  free(p);
+  return (int64_t)st.st_mtim.tv_sec * 1000000000 + (int64_t)st.st_mtim.tv_nsec;
+}
+
+MOONBIT_FFI_EXPORT
 int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
   char *p = moonlog_c_path(path);
   if (p == NULL) {
