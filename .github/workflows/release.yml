@@ -5,11 +5,8 @@ on:
     types: [published]
   workflow_dispatch:
 
-# Keep in sync with ci.yml: releases must be built with the same pinned
-# toolchain the test suite is verified against.
-env:
-  MOONBIT_INSTALL_VERSION: 0.1.20261029
-
+# Keep in sync with ci.yml: the installer only serves `latest`, so releases
+# are built with whatever toolchain is current at publish time.
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -19,9 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install MoonBit (pinned)
+      - name: Install MoonBit
         run: |
-          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash -s -- "$MOONBIT_INSTALL_VERSION"
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
           echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
 
       - name: Show toolchain version
