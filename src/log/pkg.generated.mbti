@@ -116,9 +116,10 @@ pub(all) enum SyncPolicy {
   Never
   Always
   Batch
-} derive(Eq)
+}
 pub fn SyncPolicy::equal(Self, Self) -> Bool
 pub fn SyncPolicy::not_equal(Self, Self) -> Bool
+pub impl Eq for SyncPolicy
 
 pub(all) struct VerifyReport {
   segments : Int32

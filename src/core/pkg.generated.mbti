@@ -44,20 +44,24 @@ pub(all) struct Record {
   kind : RecordKind
   key : Bytes
   value : Bytes
-} derive(Eq, @debug.Debug)
+}
 pub fn Record::encode(Self) -> Bytes
 pub fn Record::equal(Self, Self) -> Bool
 pub fn Record::is_delete(Self) -> Bool
 pub fn Record::not_equal(Self, Self) -> Bool
 pub fn Record::to_repr(Self) -> @debug.Repr
+pub impl Eq for Record
+pub impl @debug.Debug for Record
 
 pub(all) enum RecordKind {
   Put
   Delete
-} derive(Eq, @debug.Debug)
+}
 pub fn RecordKind::equal(Self, Self) -> Bool
 pub fn RecordKind::not_equal(Self, Self) -> Bool
 pub fn RecordKind::to_repr(Self) -> @debug.Repr
+pub impl Eq for RecordKind
+pub impl @debug.Debug for RecordKind
 
 // Type aliases
 
