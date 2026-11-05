@@ -37,6 +37,7 @@
 ///   restore <src> <dst>              materialize a backup into dst
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-lag <dir>                 report each cursor's consumption lag
+///   version                          print the moonlog version
 ///   cursor-commit <dir> <position>   persist the consumer position
 ///   cursor-save <dir> <name> <pos>   persist a named consumer position
 ///   cursor-load <dir> <name>         read a named consumer position
@@ -67,6 +68,9 @@ type CliLog = @log.Log[
 
 ///|
 const ROLL_SIZE : Int64 = 1_048_576
+
+///|
+const MOONLOG_VERSION : String = "0.1.0"
 
 ///|
 const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
@@ -1463,6 +1467,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     return
   }
   let cmd = args[1]
+  if cmd == "version" || cmd == "--version" {
+    println("moonlog " + MOONLOG_VERSION)
+    return
+  }
+  if args.length() < 3 {
+    println(USAGE)
+    return
+  }
   if cmd == "put" {
     if args.length() < 5 {
       println(USAGE)
