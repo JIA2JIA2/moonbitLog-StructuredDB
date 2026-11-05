@@ -52,7 +52,9 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
-///   fsck <dir> [fast] [--fix]        verify integrity; --fix repairs what it can
+///   fsck <dir> [fast] [--fix] [--dry-run]
+///                                    verify integrity; --fix repairs what it
+///                                    can; --dry-run only prints the repair plan
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
@@ -521,23 +523,41 @@ fn print_verify(report : @log.VerifyReport) -> Unit {
 /// cannot detect corruption inside individual records. With `fix`, run a
 /// repair pass first (quarantine segments failing their checksum, cut torn
 /// tails, rebuild the manifest and sidecars) and then verify the result.
-fn cmd_fsck(dir : String, fast : Bool, fix : Bool) -> Unit raise @io.IoError {
+/// With `dry`, print only the repair plan (what would be truncated, isolated
+/// or removed) and change nothing on disk.
+fn cmd_fsck(
+  dir : String,
+  fast : Bool,
+  fix : Bool,
+  dry : Bool,
+) -> Unit raise @io.IoError {
   if fix {
     run_locked(dir, true, () => {
-      let rep = @backend_native.repair_log_dir(dir, ROLL_SIZE)
-      println(
-        "repaired truncated " +
-        rep.truncated.to_string() +
-        " isolated " +
-        rep.isolated.to_string() +
-        " removed-empty " +
-        rep.removed_empty.to_string(),
-      )
-      let log = open_log(dir)
-      let report = if fast { log.verify_fast() } else { log.verify() }
-      println("mode " + (if fast { "fast" } else { "full" }) + " (post-fix)")
-      print_verify(report)
-      close_log(log)
+      let rep = @backend_native.repair_log_dir(dir, ROLL_SIZE, dry_run=dry)
+      if dry {
+        println(
+          "repair plan (dry-run): would truncate " +
+          rep.truncated.to_string() +
+          " isolate " +
+          rep.isolated.to_string() +
+          " remove-empty " +
+          rep.removed_empty.to_string(),
+        )
+      } else {
+        println(
+          "repaired truncated " +
+          rep.truncated.to_string() +
+          " isolated " +
+          rep.isolated.to_string() +
+          " removed-empty " +
+          rep.removed_empty.to_string(),
+        )
+        let log = open_log(dir)
+        let report = if fast { log.verify_fast() } else { log.verify() }
+        println("mode " + (if fast { "fast" } else { "full" }) + " (post-fix)")
+        print_verify(report)
+        close_log(log)
+      }
     })
   } else {
     run_locked(dir, false, () => {
@@ -1397,16 +1417,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "fsck" {
     let mut fast = false
     let mut fix = false
+    let mut dry = false
     let mut i = 3
     while i < args.length() {
       if args[i] == "fast" {
         fast = true
       } else if args[i] == "--fix" {
         fix = true
+      } else if args[i] == "--dry-run" {
+        fix = true
+        dry = true
       }
       i = i + 1
     }
-    cmd_fsck(args[2], fast, fix)
+    cmd_fsck(args[2], fast, fix, dry)
   } else if cmd == "backup" {
     if args.length() < 4 {
       println(USAGE)

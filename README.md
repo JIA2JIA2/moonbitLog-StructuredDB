@@ -109,11 +109,13 @@ moonlog <command> <dir> [args...]
   import <dir> <file>           从可移植文件回放记录
   compact <dir>                 折叠为 live 记录并重写目录
   compact-expired <dir> <ttl>   折叠 live 记录并剔除已过期记录（offset 重排）
-  fsck <dir> [fast] [--fix]     校验完整性（fast 跳过记录解码，段级 CRC）；
+  fsck <dir> [fast] [--fix] [--dry-run]
+                                校验完整性（fast 跳过记录解码，段级 CRC）；
                                 `--fix` 先执行修复：隔离整段校验失败的段
                                 （改名 `<name>.corrupt` 保留证据）、截断损坏
                                 尾部、重建 MANIFEST 与全部段 sidecar，随后
-                                再校验一次并输出报告
+                                再校验一次并输出报告；`--dry-run` 只打印修
+                                复计划（将截断/隔离/删除什么），不改盘
 stats <dir> [json]            打印逐段统计（含每段逻辑字节 disk 磁盘字节与
                               压缩汇总；可选 JSON）
 ```
@@ -361,6 +363,7 @@ u32 crc32          (仅覆盖 body)
 - M91 观测与导出：`SegmentSummary` 增加逻辑字节与 `disk_bytes`，`stats` 输出每段与总体的压缩尺寸（文本/JSON）；CLI `export-jsonl` 以 JSON Lines 导出（text/base64 双模式，内置 RFC 4648 base64 编码器）
 - M92 复制方案文档化：运维指南新增「异地同步/复制」——增量 backup + rsync 搭建主→备只读副本（offset/游标语义保留），并明确单写多读边界
 - M93 恢复即校验：`restore` 完成后自动对恢复副本执行 `verify_fast` 并输出报告，静默损坏的备份在投入使用前即被拦截
+- M94 修复预览：`repair_log_dir` 增加 `dry_run` 模式（只读探测 `probe_records`），CLI `fsck --dry-run` 打印修复计划——将截断/隔离/删除什么，不改盘；dry-run 计划与实际修复结果一致（测试断言）
 
 ## 许可
 

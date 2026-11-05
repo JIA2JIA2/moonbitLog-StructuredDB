@@ -1573,3 +1573,110 @@ test "repair property: random damage preserves surviving records" {
   }
   clean_dir(dir)
 }
+
+///|
+test "repair dry-run reports the torn-tail plan without touching anything" {
+  let dir = "/tmp/moonlog_repair_dryrun"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((1_000_000 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  ignore(log.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"b", (1 : Int64)) catch { _ => panic() })
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // Inject a torn tail.
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let f = @backend_native.NativeFileLog::open(path) catch { _ => panic() }
+  ignore(f.append(b"junk") catch { _ => panic() })
+  f.close()
+  let size_before = @backend_native.file_size(path)
+  let rep = @backend_native.repair_log_dir(
+    dir,
+    (1_000_000 : Int64),
+    dry_run=true,
+  ) catch {
+    _ => panic()
+  }
+  assert_eq(rep.truncated, 1)
+  assert_eq(rep.isolated, 0)
+  assert_eq(rep.removed_empty, 0)
+  assert_eq(rep.records, 2)
+  assert_true(!rep.rebuilt_meta)
+  // Nothing changed on disk: same file size, manifest still present.
+  assert_eq(@backend_native.file_size(path), size_before)
+  assert_true(@backend_native.file_exists(dir + "/MANIFEST"))
+  // The dry-run plan matches what a real repair then does.
+  let real = @backend_native.repair_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(real.truncated, 1)
+  assert_eq(real.records, 2)
+  // Appends continue from the repaired end.
+  let rlog = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  let off = rlog.append(b"k", b"c", (2 : Int64)) catch { _ => panic() }
+  assert_eq(off, (2 : UInt64))
+  @backend_native.flush_meta(dir, rlog) catch {
+    _ => panic()
+  }
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+}
+
+///|
+test "repair dry-run does not quarantine checksum-bad segments" {
+  let dir = "/tmp/moonlog_repair_dryrun_iso"
+  ignore(@backend_native.ensure_dir(dir))
+  clean_dir(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"value", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 2)
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // Flip a byte in the first (rolled) segment so its stored checksum fails.
+  let path = dir + "/" + @segment.segment_file_name((0 : UInt64))
+  let data = @backend_native.read_file(path)
+  let head : Bytes = if data.at(0).to_int() == 0 { b"\x01" } else { b"\x00" }
+  @backend_native.write_file(path, head + @core.slice(data, 1, data.length())) catch {
+    _ => panic()
+  }
+  let rep = @backend_native.repair_log_dir(dir, (60 : Int64), dry_run=true) catch {
+    _ => panic()
+  }
+  assert_eq(rep.isolated, 1)
+  // Nothing was quarantined: no .corrupt file, the original is still in place.
+  assert_true(
+    !@backend_native.file_exists(
+      dir + "/" + @segment.segment_file_name((0 : UInt64)) + ".corrupt",
+    ),
+  )
+  assert_true(@backend_native.file_exists(path))
+  clean_dir(dir)
+}

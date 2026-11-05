@@ -1223,10 +1223,51 @@ pub(all) struct RepairReport {
   isolated : Int32
   /// Empty segment files removed during the pass.
   removed_empty : Int32
-  /// Whether the manifest and per-segment sidecars were rewritten.
+  /// Whether the manifest and per-segment sidecars were rewritten. Always
+  /// false in a dry run.
   rebuilt_meta : Bool
   /// First problem a fast verification still reports after the repair, if any.
+  /// Always empty in a dry run (no repaired state exists to re-check).
   still_bad : UInt64?
+}
+
+///|
+/// Walk an already-read segment buffer, counting records that decode cleanly,
+/// and return `(record_count, valid_bytes)`. Pure probe: no I/O and no
+/// mutation — used by dry-run repair.
+fn probe_records(data : Bytes) -> (Int32, Int32) {
+  let total = data.length()
+  let mut pos : Int32 = 0
+  let mut n : Int32 = 0
+  let mut go = true
+  while go {
+    let body_len : Int32? = if pos + 4 > total {
+      None
+    } else {
+      Some(@core.body_len_at(data, pos) catch { _ => -1 })
+    }
+    match body_len {
+      None => go = false
+      Some(body) =>
+        if body < 0 || pos + 4 + body + 4 > total {
+          go = false
+        } else {
+          let decoded : (@core.Record, Int32)? = Some(
+            @core.decode_record(data, pos),
+          ) catch {
+            _ => None
+          }
+          match decoded {
+            None => go = false
+            Some((_rec, next)) => {
+              n = n + 1
+              pos = next
+            }
+          }
+        }
+    }
+  }
+  (n, pos)
 }
 
 ///|
@@ -1242,6 +1283,11 @@ pub(all) struct RepairReport {
 /// - `MANIFEST` and every surviving segment's sidecars are rewritten
 ///   atomically, whatever their previous state (missing, corrupt, stale).
 ///
+/// With `dry_run`, nothing is written, renamed or truncated: the pass only
+/// reports what a real repair would do — `truncated`/`isolated`/
+/// `removed_empty` become "would ..." counts, `rebuilt_meta` is false and
+/// `still_bad` stays empty since no repaired state exists to re-check.
+///
 /// Offsets of surviving segments are preserved, so the repaired log may have
 /// holes where segments were quarantined — the same state retention leaves
 /// behind, and reads of `verify` treat holes as legal. Returns a report
@@ -1250,6 +1296,7 @@ pub(all) struct RepairReport {
 pub fn repair_log_dir(
   dir : String,
   roll_size : Int64,
+  dry_run~ : Bool = false,
 ) -> RepairReport raise @io.IoError {
   ignore(ensure_dir(dir))
   let bases : Array[UInt64] = []
@@ -1261,6 +1308,7 @@ pub fn repair_log_dir(
   }
   bases.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
   let segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
+  let mut kept_records : Int32 = 0
   let mut truncated = 0
   let mut isolated = 0
   let mut removed_empty = 0
@@ -1309,18 +1357,26 @@ pub fn repair_log_dir(
     match compressed_check {
       Some(ok) => {
         if ok {
-          // Reload through the normal fast path so it joins the rebuilt log.
           let loaded = Some(load_segment(dir, base)) catch { _ => None }
           match loaded {
-            Some(seg) => segs.push(seg)
+            Some(seg) =>
+              if dry_run {
+                kept_records = kept_records + seg.count()
+              } else {
+                segs.push(seg)
+              }
             None => {
-              quarantine_segment(dir, base)
               isolated = isolated + 1
+              if !dry_run {
+                quarantine_segment(dir, base)
+              }
             }
           }
         } else {
-          quarantine_segment(dir, base)
           isolated = isolated + 1
+          if !dry_run {
+            quarantine_segment(dir, base)
+          }
         }
         continue
       }
@@ -1331,8 +1387,10 @@ pub fn repair_log_dir(
     let opened = Some(NativeFileLog::open(data_path)) catch { _ => None }
     match opened {
       None => {
-        quarantine_segment(dir, base)
         isolated = isolated + 1
+        if !dry_run {
+          quarantine_segment(dir, base)
+        }
       }
       Some(w) => {
         let seg : @segment.Segment[NativeFileLog, NativeFileLog] = @segment.Segment::new(
@@ -1354,8 +1412,23 @@ pub fn repair_log_dir(
         }
         if checksum_bad {
           w.close()
-          quarantine_segment(dir, base)
           isolated = isolated + 1
+          if !dry_run {
+            quarantine_segment(dir, base)
+          }
+        } else if dry_run {
+          // Probe only: report what a recover would cut away, change nothing.
+          let data = w.read_at((0 : Int64), w.size.to_int())
+          let (n_probe, valid_bytes) = probe_records(data)
+          if n_probe <= 0 {
+            removed_empty = removed_empty + 1
+          } else {
+            if valid_bytes.to_int64() < w.size {
+              truncated = truncated + 1
+            }
+            kept_records = kept_records + n_probe
+          }
+          w.close()
         } else {
           let before = w.size
           let n = seg.recover() catch { _ => 0 }
@@ -1371,6 +1444,17 @@ pub fn repair_log_dir(
           }
         }
       }
+    }
+  }
+  if dry_run {
+    return {
+      segments: bases.length() - isolated - removed_empty,
+      records: kept_records,
+      truncated,
+      isolated,
+      removed_empty,
+      rebuilt_meta: false,
+      still_bad: (None : UInt64?),
     }
   }
   let log = @log.Log::recover(
