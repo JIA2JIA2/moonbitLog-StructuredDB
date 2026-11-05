@@ -32,6 +32,13 @@
 ///                                    optional fast fsck every N cycles
 ///   follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
 ///                                    print new records as they are appended
+///   ingest <dir> <file> [--follow] [--once] [--format lines|kv] [--key <name>]
+///                     [--key-field <name>] [--from <bytes>] [--batch N]
+///                     [--interval ms]
+///                                    parse a log file into records (batch
+///                                    import, or follow appended lines);
+///                                    resumable via the `ingest-<basename>`
+///                                    cursor
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
@@ -73,7 +80,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1461,6 +1468,228 @@ fn cmd_follow(
 }
 
 ///|
+/// The file-name part of a path (after the last '/'), used to key the ingest
+/// position cursor per source file.
+fn path_basename(path : String) -> String {
+  let mut last = -1
+  let mut i = 0
+  while i < path.length() {
+    if path[i].to_int() == 47 {
+      last = i
+    }
+    i = i + 1
+  }
+  if last < 0 {
+    path
+  } else {
+    path[last + 1:path.length()].to_owned()
+  }
+}
+
+///|
+/// Split `data` into lines (ending at '\n', with a preceding '\r' stripped,
+/// empty lines skipped). Returns the lines and how many bytes they occupy.
+/// With `include_tail`, a trailing fragment without a newline is also a line
+/// and counts as consumed; without it the fragment is left for the next read
+/// so a poller never ingests a half-written line.
+fn split_complete_lines(
+  data : Bytes,
+  include_tail : Bool,
+) -> (Array[Bytes], Int64) {
+  let out : Array[Bytes] = []
+  let mut start = 0
+  let mut consumed = 0
+  let mut i = 0
+  while i < data.length() {
+    if data.at(i).to_int() == 10 {
+      let mut end = i
+      if end > start && data.at(end - 1).to_int() == 13 {
+        end = end - 1
+      }
+      if end > start {
+        out.push(@core.slice(data, start, end))
+      }
+      consumed = i + 1
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if include_tail && start < data.length() {
+    let mut end = data.length()
+    if end > start && data.at(end - 1).to_int() == 13 {
+      end = end - 1
+    }
+    if end > start {
+      out.push(@core.slice(data, start, end))
+    }
+    consumed = data.length()
+  }
+  (out, consumed.to_int64())
+}
+
+///|
+/// Extract one record's `(key, value)` from a log line. `lines` keeps the
+/// whole line as the value with `key` as a constant tag. `kv` parses
+/// space-separated `name=value` pairs, promotes the pair named `key_field` to
+/// the record key (falling back to "log"), and joins the remaining pairs back
+/// into the value.
+fn parse_ingest_line(
+  line : Bytes,
+  format : String,
+  key : Bytes,
+  key_field : Bytes,
+) -> (Bytes, Bytes) {
+  if format == "kv" {
+    let pairs = @core.parse_kv_pairs(line)
+    let mut k : Bytes = b"log"
+    let v = @buffer.Buffer::Buffer()
+    let mut first = true
+    for pair in pairs {
+      if pair.0 == key_field {
+        k = pair.1
+      } else {
+        if !first {
+          v.write_bytes(b" ")
+        }
+        first = false
+        v.write_bytes(pair.0)
+        v.write_bytes(b"=")
+        v.write_bytes(pair.1)
+      }
+    }
+    (k, v.to_bytes())
+  } else {
+    (key, line)
+  }
+}
+
+///|
+/// Read `[offset, current end)` of a file, or empty bytes when the file shrank
+/// below `offset` or cannot be opened.
+fn read_from(path : String, offset : Int64) -> Bytes {
+  let size = @backend_native.file_size(path)
+  if size <= offset {
+    return b""
+  }
+  let f = @backend_native.NativeFileLog::open_readonly(path) catch {
+    _ => return b""
+  }
+  let data = f.read_at(offset, (size - offset).to_int()) catch { _ => b"" }
+  f.close()
+  data
+}
+
+///|
+/// Ingest a log file into the directory: parse each complete line as one
+/// record and append it, flushing in batches. `--once` (default) reads up to
+/// the current end and returns; `--follow` keeps polling for appended lines.
+/// The consumed byte position is persisted as the named cursor
+/// `ingest-<basename>` so later runs resume instead of replaying, unless
+/// `--from <bytes>` overrides it. A truncated or rotated file (size dropping
+/// below the position) restarts from zero, and a missing file is waited for
+/// in follow mode.
+fn cmd_ingest(
+  dir : String,
+  file : String,
+  follow : Bool,
+  format : String,
+  key : String,
+  key_field : String,
+  from : String?,
+  batch : String?,
+  interval : String?,
+) -> Unit raise @io.IoError {
+  if format != "lines" && format != "kv" {
+    raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
+  }
+  let batch_n = match batch {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid batch: " + s)
+      }
+    None => 256
+  }
+  let interval_ms = match interval {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid interval: " + s)
+      }
+    None => 200
+  }
+  let key_bytes = @utf8.encode(key)
+  let field_bytes = @utf8.encode(key_field)
+  let cursor_name = "ingest-" + path_basename(file)
+  let mut pos : Int64 = match from {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid offset: " + s)
+      }
+    None =>
+      @backend_native.load_named_cursor(dir, cursor_name).reinterpret_as_int64()
+  }
+  let mut total = 0
+  let mut go = true
+  while go {
+    let size = @backend_native.file_size(file)
+    if size >= (0 : Int64) && size < pos {
+      pos = 0
+    }
+    if size > pos {
+      let data = read_from(file, pos)
+      let (lines, consumed) = split_complete_lines(data, !follow)
+      let mut i = 0
+      while i < lines.length() {
+        let chunk_end = if i + batch_n < lines.length() {
+          i + batch_n
+        } else {
+          lines.length()
+        }
+        let ts_base = now_ms()
+        run_locked(dir, true, () => {
+          let log = open_log(dir)
+          let mut j = i
+          while j < chunk_end {
+            let (k, v) = parse_ingest_line(
+              lines[j],
+              format,
+              key_bytes,
+              field_bytes,
+            )
+            ignore(log.append(k, v, ts_base + j.to_int64()))
+            j = j + 1
+          }
+          log.flush()
+          @backend_native.flush_meta(dir, log)
+          close_log(log)
+        })
+        i = chunk_end
+      }
+      total = total + lines.length()
+      pos = pos + consumed
+      @backend_native.save_named_cursor(
+        dir,
+        cursor_name,
+        pos.reinterpret_as_uint64(),
+      )
+    }
+    if follow {
+      @backend_native.sleep_ms(interval_ms)
+    } else {
+      go = false
+    }
+  }
+  println(
+    "ingested " +
+    total.to_string() +
+    " records (position " +
+    pos.to_string() +
+    ", cursor " +
+    cursor_name +
+    ")",
+  )
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -1592,6 +1821,57 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       i = i + 1
     }
     cmd_follow(args[2], start, once, commit, json, name)
+  } else if cmd == "ingest" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut follow = false
+      let mut format = "lines"
+      let mut key = "log"
+      let mut key_field = "key"
+      let mut from : String? = (None : String?)
+      let mut batch : String? = (None : String?)
+      let mut interval : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--follow" {
+          follow = true
+        } else if a == "--once" {
+          follow = false
+        } else if a == "--format" && i + 1 < args.length() {
+          format = args[i + 1]
+          i = i + 1
+        } else if a == "--key" && i + 1 < args.length() {
+          key = args[i + 1]
+          i = i + 1
+        } else if a == "--key-field" && i + 1 < args.length() {
+          key_field = args[i + 1]
+          i = i + 1
+        } else if a == "--from" && i + 1 < args.length() {
+          from = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--batch" && i + 1 < args.length() {
+          batch = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--interval" && i + 1 < args.length() {
+          interval = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_ingest(
+        args[2],
+        args[3],
+        follow,
+        format,
+        key,
+        key_field,
+        from,
+        batch,
+        interval,
+      )
+    }
   } else if cmd == "serve" {
     if args.length() < 4 {
       println(USAGE)

@@ -15,6 +15,7 @@
 - **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——备份副本比源端段文件新（源端自上次备份未被修改）即跳过，源端已删除的段自动清理，大目录备份成本降为 O(变更)。
+- **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -89,6 +90,19 @@ moonlog <command> <dir> [args...]
                                 （UTF-8 文本，与 export-jsonl 同构）；`--once`
                                 拉取一轮即退出；轮询间隔可用
                                 `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
+  ingest <dir> <file> [--follow] [--once] [--format lines|kv] [--key <name>]
+                      [--key-field <name>] [--from <bytes>] [--batch N]
+                      [--interval ms]
+                                采集外部日志文件：每行解析为一条记录并写入
+                                （`lines` 默认，整行为 value、`--key` 为常量
+                                键；`kv` 解析空格分隔的 name=value 对，
+                                `--key-field` 指定的字段提升为记录键、其余
+                                字段重组为 value）；`--once` 导入到当前末尾
+                                即退出，`--follow` 持续跟踪追加（半行留待下
+                                轮、截断/轮转自动从零重采）；采集位点以命名
+                                游标 `ingest-<basename>` 持久化，重跑自动
+                                续采（`--from` 可覆盖），`--batch` 控制每批
+                                写入条数（默认 256）
   serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
                                 周期性执行维护（合并 + 冗余回收 + 可选过期折
                                 叠 + 压缩 + flush 元数据）；`--every` 或
@@ -378,6 +392,7 @@ u32 crc32          (仅覆盖 body)
 - M101 CLI `version` 命令：输出 moonlog 版本号（与 `moon.mod` 同步维护）
 - M102 CI 性能门禁：ms 级 native 基准（顺序扫描/区间扫描/段恢复）与保守阈值（本地 pinned 工具链值的 5–6 倍余量）比较，仅拦截数量级回退，规避共享 runner 的 µs 级噪声
 - M103 export/import roundtrip property 测试：固定 seed 随机 put/delete 序列 × 6 轮，导出记录流重放进全新目录，断言逐记录等价（offset 连续、timestamp/kind/payload 保留）
+- M104 日志采集：CLI `ingest` 从外部日志文件批量导入（`--once`）或持续跟踪（`--follow`，半行留待下轮、截断/轮转自动重采）；`lines`/`kv` 两种解析（字段提取与格式化：`--key-field` 提升为记录键、其余字段重组为值，`--key` 常量标签）；采集位点以命名游标 `ingest-<basename>` 持久化实现断点续采；核心解析器 `parse_kv_pairs` 随 core 包提供并有单测
 
 ## 许可
 
