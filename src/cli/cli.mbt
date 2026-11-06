@@ -38,7 +38,13 @@
 ///                                    parse a log file into records (batch
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
-///                                    cursor
+///                                    cursor; `--fifo` subscribes to a named
+///                                    pipe instead (writers push batches)
+///   http <dir> [--port N] [--format lines|kv] [--key <name>]
+///             [--key-field <name>] [--ts-field <name>]
+///                                    HTTP push endpoint on 127.0.0.1 (POST /
+///                                    or /push ingests lines, GET /health,
+///                                    GET /stats); SDK calls use Log::append
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off]
 ///                                    full-text search (linear scan) over keys
@@ -109,7 +115,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1673,6 +1679,7 @@ fn cmd_ingest(
   dir : String,
   file : String,
   follow : Bool,
+  fifo : Bool,
   format : String,
   key : String,
   key_field : String,
@@ -1704,6 +1711,12 @@ fn cmd_ingest(
     Some(f) => Some(@utf8.encode(f))
     None => None
   }
+  if fifo {
+    cmd_ingest_fifo(
+      dir, file, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+    )
+    return
+  }
   let cursor_name = "ingest-" + path_basename(file)
   let mut pos : Int64 = match from {
     Some(s) =>
@@ -1723,54 +1736,10 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let mut i = 0
-      while i < lines.length() {
-        let chunk_end = if i + batch_n < lines.length() {
-          i + batch_n
-        } else {
-          lines.length()
-        }
-        let ts_base = now_ms()
-        run_locked(dir, true, () => {
-          let log = open_log(dir)
-          let mut j = i
-          while j < chunk_end {
-            let (k, v) = parse_ingest_line(
-              lines[j],
-              format,
-              key_bytes,
-              field_bytes,
-            )
-            let rec_ts = match ts_field_bytes {
-              Some(fb) => {
-                let pairs = @core.parse_kv_pairs(v)
-                let mut found : Int64? = None
-                for pair in pairs {
-                  if pair.0 == fb {
-                    found = Some(
-                      @string.parse_int64(bytes_to_string(pair.1)) catch {
-                        _ => ts_base + j.to_int64()
-                      },
-                    )
-                  }
-                }
-                match found {
-                  Some(t) => t
-                  None => ts_base + j.to_int64()
-                }
-              }
-              None => ts_base + j.to_int64()
-            }
-            ignore(log.append(k, v, rec_ts))
-            j = j + 1
-          }
-          log.flush()
-          @backend_native.flush_meta(dir, log)
-          close_log(log)
-        })
-        i = chunk_end
-      }
-      total = total + lines.length()
+      total = total +
+        ingest_lines(
+          dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+        )
       pos = pos + consumed
       @backend_native.save_named_cursor(
         dir,
@@ -1793,6 +1762,294 @@ fn cmd_ingest(
     cursor_name +
     ")",
   )
+}
+
+///|
+/// Record timestamp for an ingested line: the `--ts-field` value when present
+/// and parsable, else the fallback (arrival order based).
+fn ingest_timestamp(
+  value : Bytes,
+  ts_field_bytes : Bytes?,
+  fallback : Int64,
+) -> Int64 {
+  match ts_field_bytes {
+    Some(fb) => {
+      let pairs = @core.parse_kv_pairs(value)
+      let mut found : Int64? = None
+      for pair in pairs {
+        if pair.0 == fb {
+          found = Some(
+            @string.parse_int64(bytes_to_string(pair.1)) catch {
+              _ => fallback
+            },
+          )
+        }
+      }
+      match found {
+        Some(t) => t
+        None => fallback
+      }
+    }
+    None => fallback
+  }
+}
+
+///|
+/// Append parsed lines to the log in batches of `batch_n`, flushing and
+/// persisting metadata per batch. Returns the number of records appended.
+fn ingest_lines(
+  dir : String,
+  lines : Array[Bytes],
+  format : String,
+  key_bytes : Bytes,
+  field_bytes : Bytes,
+  ts_field_bytes : Bytes?,
+  batch_n : Int32,
+) -> Int32 raise @io.IoError {
+  let ts_base = now_ms()
+  let mut written = 0
+  let mut i = 0
+  while i < lines.length() {
+    let chunk_end = if i + batch_n < lines.length() {
+      i + batch_n
+    } else {
+      lines.length()
+    }
+    run_locked(dir, true, () => {
+      let log = open_log(dir)
+      let mut j = i
+      while j < chunk_end {
+        let (k, v) = parse_ingest_line(lines[j], format, key_bytes, field_bytes)
+        ignore(
+          log.append(
+            k,
+            v,
+            ingest_timestamp(v, ts_field_bytes, ts_base + j.to_int64()),
+          ),
+        )
+        j = j + 1
+      }
+      log.flush()
+      @backend_native.flush_meta(dir, log)
+      close_log(log)
+    })
+    written = written + (chunk_end - i)
+    i = chunk_end
+  }
+  written
+}
+
+///|
+/// Subscribe to a FIFO (named pipe): block until a writer appears, ingest the
+/// complete lines it writes until it closes, then wait for the next writer.
+/// A partially written trailing line is held until the following chunk.
+fn cmd_ingest_fifo(
+  dir : String,
+  path : String,
+  format : String,
+  key_bytes : Bytes,
+  field_bytes : Bytes,
+  ts_field_bytes : Bytes?,
+  batch_n : Int32,
+) -> Unit raise @io.IoError {
+  let mut total = 0
+  while true {
+    let fd = @backend_native.open_read_blocking(path)
+    if fd < 0 {
+      raise @io.IoError::Syscall(fd)
+    }
+    let mut leftover = b""
+    let mut eof = false
+    while !eof {
+      let chunk = @backend_native.read_blocking(fd, 4096)
+      if chunk.length() == 0 {
+        eof = true
+      } else {
+        let data = leftover + chunk
+        let (lines, consumed) = split_complete_lines(data, false)
+        leftover = @core.slice(data, consumed.to_int(), data.length())
+        if lines.length() > 0 {
+          total = total +
+            ingest_lines(
+              dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+            )
+        }
+      }
+    }
+    @backend_native.close_fd(fd)
+    println("ingested " + total.to_string() + " records (fifo " + path + ")")
+  }
+}
+
+///|
+/// Index just past the header terminator (`\r\n\r\n`), or -1 when not yet seen.
+fn find_header_end(data : Bytes) -> Int32 {
+  let mut i = 0
+  while i + 3 < data.length() {
+    if data.at(i).to_int() == 13 &&
+      data.at(i + 1).to_int() == 10 &&
+      data.at(i + 2).to_int() == 13 &&
+      data.at(i + 3).to_int() == 10 {
+      return i + 4
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+/// Write one HTTP response with a JSON (or plain) body and close the
+/// connection (`Connection: close`).
+fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
+  let reason = if status == 200 {
+    "OK"
+  } else if status == 400 {
+    "Bad Request"
+  } else if status == 404 {
+    "Not Found"
+  } else {
+    "Error"
+  }
+  let body_bytes = @utf8.encode(body)
+  let head = "HTTP/1.1 " +
+    status.to_string() +
+    " " +
+    reason +
+    "\r\nContent-Type: application/json\r\nContent-Length: " +
+    body_bytes.length().to_string() +
+    "\r\nConnection: close\r\n\r\n"
+  ignore(@backend_native.conn_write(conn, @utf8.encode(head)))
+  ignore(@backend_native.conn_write(conn, body_bytes))
+}
+
+///|
+/// Handle one HTTP connection: read the head and body, route, respond.
+fn handle_http_connection(
+  dir : String,
+  conn : Int32,
+  format : String,
+  key_bytes : Bytes,
+  field_bytes : Bytes,
+  ts_field_bytes : Bytes?,
+) -> Unit raise @io.IoError {
+  let mut head = b""
+  let mut header_end = -1
+  let mut rounds = 0
+  while header_end < 0 && rounds < 16 {
+    let chunk = @backend_native.conn_read(conn, 4096)
+    if chunk.length() == 0 {
+      break
+    }
+    head = head + chunk
+    header_end = find_header_end(head)
+    rounds = rounds + 1
+  }
+  if header_end < 0 {
+    http_respond(conn, 400, "{\"error\":\"bad request\"}")
+    return
+  }
+  let request = match
+    @core.parse_http_request(@core.slice(head, 0, header_end)) {
+    Some(r) => r
+    None => {
+      http_respond(conn, 400, "{\"error\":\"bad request line\"}")
+      return
+    }
+  }
+  let mut body = @core.slice(head, header_end, head.length())
+  while body.length() < request.content_length && body.length() < 1_048_576 {
+    let chunk = @backend_native.conn_read(conn, 4096)
+    if chunk.length() == 0 {
+      break
+    }
+    body = body + chunk
+  }
+  let is_get = request.verb == b"GET"
+  let is_post = request.verb == b"POST"
+  if is_get && request.path == b"/health" {
+    http_respond(conn, 200, "{\"status\":\"ok\"}")
+  } else if is_get && request.path == b"/stats" {
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let payload = "{\"records\":" +
+        log.count().to_string() +
+        ",\"segments\":" +
+        log.segment_count().to_string() +
+        ",\"next_offset\":" +
+        log.next_offset().to_string() +
+        "}"
+      http_respond(conn, 200, payload)
+      close_log(log)
+    })
+  } else if is_post && (request.path == b"/" || request.path == b"/push") {
+    let (lines, _) = split_complete_lines(body, true)
+    if lines.length() > 10000 {
+      http_respond(conn, 400, "{\"error\":\"too many lines\"}")
+      return
+    }
+    let written = ingest_lines(
+      dir, lines, format, key_bytes, field_bytes, ts_field_bytes, 256,
+    )
+    http_respond(conn, 200, "{\"ingested\":" + written.to_string() + "}")
+  } else {
+    http_respond(conn, 404, "{\"error\":\"not found\"}")
+  }
+}
+
+///|
+/// Serve an HTTP push endpoint on 127.0.0.1:`port`: `POST /` (or `/push`) with
+/// a body of log lines ingests them (same `--format`/`--key-field`/`--ts-field`
+/// parsing as `ingest`), `GET /health` returns status, `GET /stats` returns
+/// record/segment counts. Connections are handled serially; run until
+/// interrupted.
+fn cmd_http(
+  dir : String,
+  port : String?,
+  format : String,
+  key : String,
+  key_field : String,
+  ts_field : String?,
+) -> Unit raise @io.IoError {
+  if format != "lines" && format != "kv" {
+    raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
+  }
+  let port_n = match port {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid port: " + s)
+      }
+    None => 8080
+  }
+  let listen_fd = @backend_native.tcp_listen(port_n)
+  if listen_fd < 0 {
+    raise @io.IoError::Invalid(
+      "cannot listen on 127.0.0.1:" +
+      port_n.to_string() +
+      " (code " +
+      listen_fd.to_string() +
+      ")",
+    )
+  }
+  println(
+    "moonlog http listening on http://127.0.0.1:" +
+    port_n.to_string() +
+    "  (POST / or /push, GET /health, GET /stats)",
+  )
+  let key_bytes = @utf8.encode(key)
+  let field_bytes = @utf8.encode(key_field)
+  let ts_field_bytes : Bytes? = match ts_field {
+    Some(f) => Some(@utf8.encode(f))
+    None => None
+  }
+  while true {
+    let conn = @backend_native.tcp_accept(listen_fd)
+    if conn >= 0 {
+      handle_http_connection(
+        dir, conn, format, key_bytes, field_bytes, ts_field_bytes,
+      )
+      @backend_native.close_fd(conn)
+    }
+  }
 }
 
 ///|
@@ -2830,6 +3087,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut follow = false
+      let mut fifo = false
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
@@ -2842,6 +3100,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         let a = args[i]
         if a == "--follow" {
           follow = true
+        } else if a == "--fifo" {
+          fifo = true
         } else if a == "--once" {
           follow = false
         } else if a == "--format" && i + 1 < args.length() {
@@ -2872,6 +3132,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         args[2],
         args[3],
         follow,
+        fifo,
         format,
         key,
         key_field,
@@ -2880,6 +3141,38 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         batch,
         interval,
       )
+    }
+  } else if cmd == "http" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut port : String? = (None : String?)
+      let mut format = "lines"
+      let mut key = "log"
+      let mut key_field = "key"
+      let mut ts_field : String? = (None : String?)
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--port" && i + 1 < args.length() {
+          port = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--format" && i + 1 < args.length() {
+          format = args[i + 1]
+          i = i + 1
+        } else if a == "--key" && i + 1 < args.length() {
+          key = args[i + 1]
+          i = i + 1
+        } else if a == "--key-field" && i + 1 < args.length() {
+          key_field = args[i + 1]
+          i = i + 1
+        } else if a == "--ts-field" && i + 1 < args.length() {
+          ts_field = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_http(args[2], port, format, key, key_field, ts_field)
     }
   } else if cmd == "search" {
     if args.length() < 4 {

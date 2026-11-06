@@ -18,6 +18,8 @@
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 static char *moonlog_c_path(moonbit_bytes_t path) {
   int32_t len = Moonbit_array_length(path);
@@ -364,4 +366,110 @@ int32_t moonlog_run_command(moonbit_bytes_t cmd) {
   int r = system(c);
   free(c);
   return r;
+}
+
+/*
+ * Minimal TCP endpoint for the HTTP push server: listen on loopback, accept
+ * one connection at a time, read/write raw bytes. All blocking.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_tcp_listen(int32_t port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons((uint16_t)port);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -2;
+  }
+  if (listen(fd, 16) != 0) {
+    close(fd);
+    return -3;
+  }
+  return fd;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_tcp_accept(int32_t listen_fd) {
+  int fd = accept(listen_fd, NULL, NULL);
+  return fd < 0 ? -1 : fd;
+}
+
+/* Read up to `max` bytes; an empty result means EOF or error. */
+MOONBIT_FFI_EXPORT
+moonbit_bytes_t moonlog_conn_read(int32_t fd, int32_t max) {
+  if (max <= 0) {
+    max = 4096;
+  }
+  moonbit_bytes_t buf = moonbit_make_bytes_raw(max);
+  ssize_t n = read(fd, buf, (size_t)max);
+  if (n <= 0) {
+    return moonbit_make_bytes_raw(0);
+  }
+  if ((int32_t)n != max) {
+    moonbit_bytes_t out = moonbit_make_bytes_raw((int32_t)n);
+    memcpy(out, buf, (size_t)n);
+    return out;
+  }
+  return buf;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_conn_write(int32_t fd, moonbit_bytes_t data) {
+  int32_t len = Moonbit_array_length(data);
+  ssize_t n = write(fd, data, (size_t)len);
+  return (int32_t)n;
+}
+
+/*
+ * FIFO support (lightweight message-queue subscription): create a named pipe,
+ * open it for reading (blocks until a writer appears), and read chunks until
+ * the writer closes.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_mkfifo(moonbit_bytes_t path, int32_t mode) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  int r = mkfifo(p, (mode_t)mode);
+  free(p);
+  return r < 0 ? -1 : 0;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_open_read_blocking(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  int fd = open(p, O_RDONLY);
+  free(p);
+  return fd;
+}
+
+/* Read one chunk from a blocking descriptor; empty means EOF. */
+MOONBIT_FFI_EXPORT
+moonbit_bytes_t moonlog_read_blocking(int32_t fd, int32_t max) {
+  if (max <= 0) {
+    max = 4096;
+  }
+  moonbit_bytes_t buf = moonbit_make_bytes_raw(max);
+  ssize_t n = read(fd, buf, (size_t)max);
+  if (n <= 0) {
+    return moonbit_make_bytes_raw(0);
+  }
+  if ((int32_t)n != max) {
+    moonbit_bytes_t out = moonbit_make_bytes_raw((int32_t)n);
+    memcpy(out, buf, (size_t)n);
+    return out;
+  }
+  return buf;
 }

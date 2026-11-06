@@ -69,6 +69,30 @@ extern "C" fn moonlog_remove_with_link(path : Bytes) -> Int32 = "moonlog_remove_
 extern "C" fn moonlog_run_command(cmd : Bytes) -> Int32 = "moonlog_run_command"
 
 ///|
+extern "C" fn moonlog_tcp_listen(port : Int32) -> Int32 = "moonlog_tcp_listen"
+
+///|
+extern "C" fn moonlog_tcp_accept(listen_fd : Int32) -> Int32 = "moonlog_tcp_accept"
+
+///|
+extern "C" fn moonlog_conn_read(fd : Int32, max : Int32) -> Bytes = "moonlog_conn_read"
+
+///|
+#borrow(data)
+extern "C" fn moonlog_conn_write(fd : Int32, data : Bytes) -> Int32 = "moonlog_conn_write"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_mkfifo(path : Bytes, mode : Int32) -> Int32 = "moonlog_mkfifo"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_open_read_blocking(path : Bytes) -> Int32 = "moonlog_open_read_blocking"
+
+///|
+extern "C" fn moonlog_read_blocking(fd : Int32, max : Int32) -> Bytes = "moonlog_read_blocking"
+
+///|
 /// Number of buffered bytes at which an append is flushed to the descriptor.
 const WRITE_BUFFER_LIMIT : Int32 = 65536
 
@@ -1171,6 +1195,57 @@ pub fn symlink(target : String, link_path : String) -> Bool {
 /// used for webhook-style notification delivery.
 pub fn run_command(cmd : String) -> Int32 {
   moonlog_run_command(@utf8.encode(cmd))
+}
+
+///|
+/// Listen on 127.0.0.1:`port` for HTTP pushes. Returns the socket fd, or a
+/// negative value when the port cannot be bound.
+pub fn tcp_listen(port : Int32) -> Int32 {
+  moonlog_tcp_listen(port)
+}
+
+///|
+/// Accept one pending connection (blocking). Returns the connection fd, or a
+/// negative value on error.
+pub fn tcp_accept(listen_fd : Int32) -> Int32 {
+  moonlog_tcp_accept(listen_fd)
+}
+
+///|
+/// Read up to `max` bytes from a connection; empty means EOF or error.
+pub fn conn_read(fd : Int32, max : Int32) -> Bytes {
+  moonlog_conn_read(fd, max)
+}
+
+///|
+/// Write `data` to a connection; returns the number of bytes written.
+pub fn conn_write(fd : Int32, data : Bytes) -> Int32 {
+  moonlog_conn_write(fd, data)
+}
+
+///|
+/// Close a raw descriptor (connection, listen socket, FIFO).
+pub fn close_fd(fd : Int32) -> Unit {
+  ignore(moonlog_close(fd))
+}
+
+///|
+/// Create a FIFO (named pipe) at `path`. Returns true on success.
+pub fn mkfifo(path : String, mode : Int32) -> Bool {
+  moonlog_mkfifo(@utf8.encode(path), mode) >= 0
+}
+
+///|
+/// Open `path` for reading, blocking until a writer appears (FIFO semantics);
+/// for regular files this opens immediately. Returns the fd or -1.
+pub fn open_read_blocking(path : String) -> Int32 {
+  moonlog_open_read_blocking(@utf8.encode(path))
+}
+
+///|
+/// Read one chunk from a blocking descriptor; empty means EOF (writer closed).
+pub fn read_blocking(fd : Int32, max : Int32) -> Bytes {
+  moonlog_read_blocking(fd, max)
 }
 
 ///|

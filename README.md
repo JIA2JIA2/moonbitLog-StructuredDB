@@ -16,6 +16,7 @@
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——备份副本比源端段文件新（源端自上次备份未被修改）即跳过，源端已删除的段自动清理，大目录备份成本降为 O(变更)。
 - **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
+- **多源接入**（1.1）：四类来源均可入库——**Agent 采集**（`ingest --follow` 本地文件 agent，断点续采/轮转）、**离线批量导入**（`ingest --once`）、**HTTP 推送**（`http` 服务：`POST /`/`/push` 逐行入库 + `/health`/`/stats`；SDK 直接调用 `Log::append`）、**消息队列订阅**（`ingest --fifo` 订阅命名管道，写者推送批次、跨写者持续采集；也兼容 `curl`/`kcat` 等外部桥接写入）。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -95,19 +96,27 @@ moonlog <command> <dir> [args...]
                                 （UTF-8 文本，与 export-jsonl 同构）；`--once`
                                 拉取一轮即退出；轮询间隔可用
                                 `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
-  ingest <dir> <file> [--follow] [--once] [--format lines|kv] [--key <name>]
-                      [--key-field <name>] [--from <bytes>] [--batch N]
-                      [--interval ms]
+  ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
+                      [--key <name>] [--key-field <name>] [--ts-field <name>]
+                      [--from <bytes>] [--batch N] [--interval ms]
                                 采集外部日志文件：每行解析为一条记录并写入
                                 （`lines` 默认，整行为 value、`--key` 为常量
                                 键；`kv` 解析空格分隔的 name=value 对，
                                 `--key-field` 指定的字段提升为记录键、其余
-                                字段重组为 value）；`--once` 导入到当前末尾
-                                即退出，`--follow` 持续跟踪追加（半行留待下
-                                轮、截断/轮转自动从零重采）；采集位点以命名
-                                游标 `ingest-<basename>` 持久化，重跑自动
-                                续采（`--from` 可覆盖），`--batch` 控制每批
-                                写入条数（默认 256）
+                                字段重组为 value，`--ts-field` 从字段取时间
+                                戳）；`--once` 导入到当前末尾即退出，
+                                `--follow` 持续跟踪追加（半行留待下轮、截断/
+                                轮转自动从零重采）；`--fifo` 改为订阅命名管道
+                                （写者推送批次，跨写者持续采集）；采集位点
+                                以命名游标 `ingest-<basename>` 持久化，重跑
+                                自动续采（`--from` 可覆盖），`--batch` 控制
+                                每批写入条数（默认 256）
+  http <dir> [--port N] [--format lines|kv] [--key <name>]
+            [--key-field <name>] [--ts-field <name>]
+                                在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
+                                或 `/push`（请求体为日志行，按上述格式解析
+                                入库）、`GET /health`、`GET /stats`；SDK
+                                接入直接调用库 API `Log::append`
   serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
                                 周期性执行维护（合并 + 冗余回收 + 可选过期折
                                 叠 + 压缩 + flush 元数据）；`--every` 或
@@ -448,6 +457,7 @@ u32 crc32          (仅覆盖 body)
 - M107 日志分析：`aggregate` 多维聚合（`--by key|value|kind|hour|prefix:N`、`--kv-field` 字段维度、`--match` 过滤、`--top`、`--json`）；`cluster` 错误聚类（core `normalize_log_template` 将数字/hex/引号串折叠为占位符后按模板计数）；`trend` 趋势直方图（core `format_utc` 的 UTC 分钟/小时/天标签 + 文本条）；顺带修复 `ensure_dir` 不支持父目录的缺陷（改为逐级递归创建，此前冒烟均手工 `mkdir -p` 而未暴露）
 - M108 告警监控：`alert` 阈值告警（UTC 窗口计数 vs `--threshold`，`--json` 事件）与 `baseline` 异常基线检测（窗口计数均值/标准差 z-score，`--sigma`/`--min-windows`）；多渠道通知分发（stdout + `--notify-file` JSONL 追加 + `--webhook` 经 `curl` POST，`shell_quote` 防注入、投递失败降级告警不中断，新增 `moonlog_run_command` stub）；配套为告警提供真实时间维度：`put --ts` 与 `ingest --ts-field`（kv 采集时从日志字段提取 timestamp）
 - M109 运维管理 RBAC：core 新增 `RbacRole`/`parse_rbac_line`/`rbac_allows`/`rbac_find`（Bytes 模型 + 单测），CLI 以 `<dir>/RBAC` 规则文件（`role=.. token=.. allow=cmds|*`）控制访问——文件存在时除 `rbac init`/`rbac check` 外所有命令需 `MOONLOG_TOKEN` 且角色允许，拒绝事件追加 `AUDIT.log`；`rbac init/add/list/remove/check` 管理命令（`list` 隐藏 token 尾部）；无 RBAC 文件保持开放向后兼容。TTL 清理（prune/compact-expired/retain_before/`--ttl`）与导出归档（export/export-jsonl/import/backup）此前已覆盖
+- M110 多源接入（1.1）：补齐四类采集来源——**HTTP 推送端点** `http`（127.0.0.1 监听，`POST /`/`/push` 按 `lines|kv` 格式逐行入库、`GET /health`、`GET /stats`；新增 TCP（listen/accept/read/write）C stub 与 core `parse_http_request` 及单测）；**消息队列订阅** `ingest --fifo`（命名管道订阅，写者推送批次、跨写者持续采集、半行跨 chunk 保留；新增 mkfifo/阻塞读 C stub）；Agent 采集（`ingest --follow`）与离线批量导入（`ingest --once`）此前已覆盖；SDK 接入即库 API `Log::append`。`ingest` 的入库流水线抽取为共享 `ingest_lines`/`ingest_timestamp`（HTTP 与 FIFO 复用）
 
 ## 许可
 
