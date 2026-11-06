@@ -140,6 +140,9 @@ struct IngestOptions {
   from_bytes : Int64?
   schema : Bool
   clock_skew_ms : Int64
+  mask : Bool
+  mask_extra : Array[Bytes]
+  meta_bytes : Bytes?
 }
 
 ///|
@@ -1919,6 +1922,23 @@ fn ingest_lines(
         } else {
           (raw_k, raw_v, None)
         }
+        // 2.4: mask sensitive content and append enrichment metadata before
+        // the value reaches the log, so nothing sensitive lands on disk and
+        // idempotent re-delivery sees the same (key, value).
+        let v_masked = if opts.mask {
+          @core.mask_sensitive(v, opts.mask_extra)
+        } else {
+          v
+        }
+        let v = match opts.meta_bytes {
+          Some(m) =>
+            if v_masked.length() == 0 {
+              m
+            } else {
+              v_masked + b" " + m
+            }
+          None => v_masked
+        }
         let keep = match opts.sampling {
           Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
           None => true
@@ -1954,6 +1974,74 @@ fn ingest_lines(
     i = chunk_end
   }
   (written, sampled_out)
+}
+
+///|
+/// Split a comma-separated CLI value into parts (empty trailing parts kept;
+/// callers filter as needed).
+fn split_comma(s : String) -> Array[String] {
+  let parts : Array[String] = []
+  let mut cur = StringBuilder()
+  for ch in s {
+    if ch == ',' {
+      parts.push(cur.to_string())
+      cur = StringBuilder()
+    } else {
+      cur.write_char(ch)
+    }
+  }
+  parts.push(cur.to_string())
+  parts
+}
+
+///|
+/// Encode the non-empty parts of a comma-separated list as Bytes entries.
+fn csv_to_bytes_list(s : String) -> Array[Bytes] {
+  let arr : Array[Bytes] = []
+  for part in split_comma(s) {
+    if part.length() > 0 {
+      arr.push(@utf8.encode(part))
+    }
+  }
+  arr
+}
+
+///|
+/// Encode comma-separated `k=v` pairs into a single `k1=v1 k2=v2` bytes
+/// sequence appended to every record value (2.4 field enrichment: env,
+/// version, region and other deployment metadata).
+fn parse_meta_pairs(s : String) -> Bytes raise @io.IoError {
+  let buf = @buffer.Buffer::Buffer()
+  let mut first = true
+  for part in split_comma(s) {
+    let kb = StringBuilder()
+    let vb = StringBuilder()
+    let mut side = 0
+    for ch in part {
+      if side == 0 {
+        if ch == '=' {
+          side = 1
+        } else {
+          kb.write_char(ch)
+        }
+      } else {
+        vb.write_char(ch)
+      }
+    }
+    if side != 1 || kb.to_string().length() == 0 {
+      raise @io.IoError::Invalid(
+        "invalid meta pair: " + part + " (expected k=v)",
+      )
+    }
+    if !first {
+      buf.write_bytes(b" ")
+    }
+    first = false
+    buf.write_bytes(@utf8.encode(kb.to_string()))
+    buf.write_bytes(b"=")
+    buf.write_bytes(@utf8.encode(vb.to_string()))
+  }
+  buf.to_bytes()
 }
 
 ///|
@@ -3729,6 +3817,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut idempotent = false
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
+      let mut mask = false
+      let mut mask_fields : String? = (None : String?)
+      let mut meta_str : String? = (None : String?)
       let mut from_str : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -3795,6 +3886,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
+        } else if a == "--mask" {
+          mask = true
+        } else if a == "--mask-fields" && i + 1 < args.length() {
+          mask_fields = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--meta" && i + 1 < args.length() {
+          meta_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -3843,6 +3942,15 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         from_bytes,
         schema,
         clock_skew_ms: skew_ms,
+        mask,
+        mask_extra: match mask_fields {
+          Some(s) => csv_to_bytes_list(s)
+          None => []
+        },
+        meta_bytes: match meta_str {
+          Some(s) => Some(parse_meta_pairs(s))
+          None => None
+        },
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -3863,6 +3971,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut idempotent = false
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
+      let mut mask = false
+      let mut mask_fields : String? = (None : String?)
+      let mut meta_str : String? = (None : String?)
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
       let mut sample_rate : String? = (None : String?)
@@ -3923,6 +4034,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
+        } else if a == "--mask" {
+          mask = true
+        } else if a == "--mask-fields" && i + 1 < args.length() {
+          mask_fields = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--meta" && i + 1 < args.length() {
+          meta_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -3962,6 +4081,15 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         from_bytes: None,
         schema,
         clock_skew_ms: skew_ms,
+        mask,
+        mask_extra: match mask_fields {
+          Some(s) => csv_to_bytes_list(s)
+          None => []
+        },
+        meta_bytes: match meta_str {
+          Some(s) => Some(parse_meta_pairs(s))
+          None => None
+        },
       }
       cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
     }

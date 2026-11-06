@@ -33,6 +33,8 @@ pub fn lz_compress(Bytes) -> Bytes
 
 pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError
 
+pub fn mask_sensitive(Bytes, Array[Bytes]) -> Bytes
+
 pub fn normalize_log_template(Bytes) -> Bytes
 
 pub fn normalize_ts(Bytes, Int64) -> Int64

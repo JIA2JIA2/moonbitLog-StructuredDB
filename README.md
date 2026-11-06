@@ -23,6 +23,7 @@
 - **源头采样限流**（1.5）：`ingest`/`http` 的采样管线（core `SamplingConfig` + `sampling_allows`，单测覆盖）——**按级别** `--min-level debug|info|warn|error|fatal`（kv `--level-field` 字段的严重度阈值，未知级别不参与过滤）、**按比例** `--sample-rate 0-100`（FNV-1a 确定性哈希，同内容判定恒定、与幂等重放一致）、**按规则** `--include`/`--exclude`（原始行子串，ASCII 忽略大小写）。采样在源头（入队/写入前）执行，`ingest` 输出 `(N sampled out)`、HTTP 202 响应含 `sampled_out`——实测 `--min-level warn` 丢 debug/info、`--sample-rate 50` 采样 99/200、`--sample-rate 0` 全丢。
 - **统一 Schema**（2.2）：`ingest`/`http` 的 `--schema` 将解析出的字段归一到**六大基础字段**——时间戳（`ts`/`@timestamp`/`timestamp`/`time`）、级别（`level`/`severity`）、服务名（`service`/`service_name`/`app`/`application`）、主机（`host`/`hostname`）、trace_id（`trace_id`/`traceId`/`trace`）、消息（`message`/`msg`；core `canonical_field` 别名映射，单测覆盖）：**服务名提升为记录键**、标准字段按固定顺序重组为 value（`level=… host=… trace_id=… message=…`）、时间戳取自解析值——不同服务的字段命名习惯入库后口径一致；**联合过滤查询** `query`（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND 组合 + `--since`/`--until` 时间窗 + `--limit`/`--json`；core `schema_matches` 单测覆盖）——如 `query --trace-id t9` 一次关联多个服务的同一链路；非 schema 记录仍可按 key/contains 过滤，混合目录可查。
 - **时间规范化**（2.3）：采集端时间值经 core `normalize_ts` 归一到 epoch 毫秒——纯数字按位数识别精度（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），其余按 ISO-8601 解析（`Z`/`±HH:MM`/`±HHMM` 时区、`T` 或空格分隔、小数秒截断到毫秒；core `parse_iso8601_ms` 正向 days-from-civil 与 `format_utc` 互逆，单测覆盖）——**跨时区（`+08:00`/`Z`/`-05:00`）同事件归一到同一时间戳**；`ingest`/`http` 增加 `--clock-skew <ms>` 补偿采集端时钟偏移；append-only 保留到达序，`query --sort-by-time` 按**事件时间**排序输出（tie 保持 offset 序）——实测三时区乱序到达后输出正确事件序，秒/毫秒/ISO 三种写法归一为同一值。展示层统一 UTC。
+- **脱敏与字段富化**（2.4）：`ingest`/`http` 的 `--mask` 在**写入前**对每条 value 做单遍扫描掩码（core `mask_sensitive`，无正则引擎、未命中字节逐个保真）——敏感字段名（`token`/`password`/`secret`/`api_key`/`authorization`/`session`/`cookie` 等内置词表 + `--mask-fields` 自定义，ASCII 忽略大小写）值段整体 `[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀双点）→ `[REDACTED]`；11 位手机号（1[3-9]）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`（UUID 段、纳秒时间戳不误伤）；`--meta env=prod,region=cn-north,version=x` 在写入前为每条记录追加部署元数据（环境/版本/地域富化）。掩码作用于幂等去重之前，重复投递判定一致。实测：手机号/证件号/令牌/长 hex 掩码后 `search` 零明文残留（kv、schema、lines、HTTP 四条路径）。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -109,7 +110,8 @@ moonlog <command> <dir> [args...]
                     [--interval ms] [--idempotent] [--min-level <level>]
                     [--level-field <name>] [--sample-rate 0-100]
                     [--include <text>] [--exclude <text>] [--schema]
-                    [--clock-skew <ms>]
+                    [--clock-skew <ms>] [--mask] [--mask-fields <csv>]
+                    [--meta <csv>]
                                 采集外部日志文件：每行按格式解析为字段并写入
                                 （`lines` 默认整行为 value；`kv` 解析空格分
                                 隔 name=value 对；`json` 解析顶层 JSON 对象
@@ -125,6 +127,11 @@ moonlog <command> <dir> [args...]
                                  `--clock-skew <ms>` 为全部记录时间戳加固定
                                  偏移（校正采集端时钟慢/快）；时间值自动识别
                                  秒/毫秒/微秒/纳秒与 ISO-8601 时区（2.3）；
+                                 `--mask` 写入前脱敏（敏感字段名/Bearer/JWT
+                                 →[REDACTED]，手机号/证件号保留前 3 后 4，
+                                 长 hex→[REDACTED]；`--mask-fields` 追加敏
+                                 感字段名）；`--meta k=v,k2=v2` 为每条记录
+                                 追加部署元数据（环境/版本/地域富化，2.4）；
                                 `--once` 导入到当前末尾即退出，`--follow` 持
                                 续跟踪追加（半行留待下轮、截断/轮转自动从零
                                 重采）；`--fifo` 改为订阅命名管道（写者推送
@@ -135,6 +142,7 @@ moonlog <command> <dir> [args...]
   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
             [--format lines|kv] [--key <name>] [--key-field <name>]
             [--ts-field <name>] [--schema] [--clock-skew <ms>]
+            [--mask] [--mask-fields <csv>] [--meta <csv>]
                                 在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
                                 或 `/push` 先进入**有界队列**（`--queue` 行
                                 数上限，默认 10000）并返回 202；队列满时返回
@@ -506,6 +514,7 @@ u32 crc32          (仅覆盖 body)
 - M115 结构化解析（2.1）：`--format json`（core `json_object_fields` 复用 `moonbitlang/core/json`，顶层对象字段展平、ParseError 由入库管线捕获）与 `--template "<ip> - <user>"`（core `parse_by_template`——字面 + `<name>` 占位符的**轻量 Grok 等价**，贪婪捕获到下一字面首现，不含正则引擎）；`--value-field` 指定字段作为 value（缺省整行）；`ingest_timestamp` 统一从解析字段提取时间戳（json/template/kv 三格式共用）。实测：JSON 行 key/value 字段提取、模板四字段提取、`--min-level warn` 组合采样全部准确
 - M116 统一 Schema（2.2）：core 新增 `canonical_field`/`SchemaFields`/`schema_from_fields`/`schema_value`/`schema_matches`（六槽位别名映射 + 4 个单测）；`ingest`/`http` 增加 `--schema`——解析字段按六大基础字段（时间戳/级别/服务名/主机/trace_id/消息，接受常用别名 `@timestamp`/`severity`/`service_name`/`app`/`hostname`/`traceId`/`msg` 等）归一，**服务名提升为记录键**、标准字段按固定顺序重组 value、时间戳取自解析值，异构服务入库口径一致（实测 `severity=… service_name=… traceId=… @timestamp=…` 与 `level=… service=… trace_id=… timestamp=…` 两种命名习惯归一为同一 shape）；新增 `query` 联合过滤命令（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND + `--since`/`--until` 时间窗 + `--limit`/`--json`，流式线性扫描），跨服务联查实测 `--trace-id t9` 命中 orders 与 inventory 两条异构来源记录；HTTP 推送经队列异步落库同样按 schema 归一（curl POST `severity=fatal service=gateway …` → `query --service gateway` 可查）。开发注记：初版 `SchemaFields` 以 mut 字段 + 循环赋值实现触发 native SIGABRT，重构为六个独立 first-match 查找后消除；定位中确认测试内 panic 断言在 native 以 SIGABRT 呈现（此前所谓工具链深坑，实为断言失败路径的表象）
 - M117 时间规范化（2.3）：core 新增 `normalize_ts`/`parse_iso8601_ms`（+3 单测）——纯数字按位数缩放（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），ISO-8601 解析 `Z`/`±HH:MM`/`±HHMM` 时区、`T`/空格分隔、小数秒截断毫秒（正向 days-from-civil 与 `format_utc` 的 days-to-civil 互逆，无日历库）；`ingest_timestamp` 与 schema 六字段的 ts 提取改走 `normalize_ts`（此前只认纯数字毫秒：秒级值错 1000 倍、ISO8601 直接回退到达序）；`ingest`/`http` 增加 `--clock-skew <ms>`（固定偏移补偿采集端时钟慢/快，作用于全部记录时间戳含到达序回退值）；`query` 增加 `--sort-by-time`（物化命中后按事件时间排序、tie 保 offset 序，处理乱序到达）。实测：`2026-11-06T20:00:00+08:00`/`12:00:00Z` 同事件归一为同一 1793966400000；四条三时区乱序到达 `--sort-by-time` 输出正确事件序；秒/毫秒/ISO 三写法同值；`--clock-skew 5000` 精确 +5s；trend 的 UTC 小时桶往返正确。开发注记：MoonBit 链式算术表达式中的裸数字字面量会被定型为 Int 向左传播（如 `(153 * mp + 2) / 5 + d - 1` 整条变 Int），days-from-civil 需对字面量逐个 `(: Int64)` 标注
+- M118 脱敏与字段富化（2.4）：core 新增 `mask_sensitive`（+3 单测）——单遍扫描逐字节保真、无正则引擎：敏感字段名值段（内置词表 password/passwd/pwd/secret/secret_key/token/api_key/apikey/access_key/authorization/auth/credential(s)/session/session_id/sessionid/cookie/private_key + `--mask-fields` 自定义，ASCII 忽略大小写、词边界判定）→ `name=[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀 + 双点 token run）→ `[REDACTED]`；11 位手机号（1[3-9] 开头、数字边界）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`，UUID 分段与 19 位纳秒时间戳不误伤；CLI `ingest`/`http` 增加 `--mask`/`--mask-fields <csv>`/`--meta <csv>`（`--meta k=v,k2=v2` 写入前为每条 value 追加部署元数据，k 缺 `=` 报错），掩码与富化在 schema 转换之后、幂等去重之前执行（重复投递判定一致；schema 模式下非规范敏感字段天然不落盘 + message 内模式掩码双保险）。实测：kv/schema/lines/HTTP 四条路径——`phone=138****5678`、`idcard=110***********777X`、`token=[REDACTED]`、`sha=[REDACTED]`、lines 整行 `139****5678 … Bearer [REDACTED]`，四项明文 `search` 全部 0 matches；`env=prod region=cn-north version=2.1.0` 富化落盘
 
 ## 许可
 
