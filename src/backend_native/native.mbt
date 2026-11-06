@@ -203,12 +203,32 @@ pub fn NativeFileLog::is_closed(self : NativeFileLog) -> Bool {
 ///|
 /// Create a directory (parent of log files). Returns true if created or it
 /// already existed.
+
+///|
+/// Create `path` and any missing parent directories ("a/b/c" creates "a" and
+/// "a/b" first). Returns true when the directory exists afterwards.
 pub fn ensure_dir(path : String) -> Bool {
+  if path.length() == 0 {
+    return false
+  }
   let bytes = @utf8.encode(path)
   if moonlog_exists(bytes) == 1 {
     return true
   }
-  moonlog_mkdir(bytes) == 0
+  let mut i = 1
+  while i <= path.length() {
+    if i == path.length() || path[i].to_int() == 47 {
+      let sub = path[0:i].to_owned()
+      if sub.length() > 0 {
+        let sb = @utf8.encode(sub)
+        if moonlog_exists(sb) == 0 {
+          ignore(moonlog_mkdir(sb))
+        }
+      }
+    }
+    i = i + 1
+  }
+  moonlog_exists(bytes) == 1
 }
 
 ///|

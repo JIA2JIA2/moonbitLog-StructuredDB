@@ -9,6 +9,7 @@ import {
   "JIA2JIA2/lsdb/src/backend_native",
   "moonbitlang/core/buffer",
   "moonbitlang/core/env",
+  "moonbitlang/core/hashmap",
   "moonbitlang/core/string",
   "moonbitlang/core/encoding/utf8",
 }

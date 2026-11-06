@@ -1915,3 +1915,15 @@ test "tier moves cold segments behind symlinks and reads still work" {
   clean_dir(dir)
   clean_dir(cold)
 }
+
+///|
+test "ensure_dir creates missing parent directories" {
+  let base = "/tmp/moonlog_ensure_nested"
+  let path = base + "/x/y/z"
+  assert_true(@backend_native.ensure_dir(path))
+  assert_true(@backend_native.file_exists(path))
+  assert_true(@backend_native.file_exists(base + "/x"))
+  assert_true(@backend_native.file_exists(base + "/x/y"))
+  // Idempotent.
+  assert_true(@backend_native.ensure_dir(path))
+}

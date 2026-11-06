@@ -45,6 +45,13 @@
 ///                                    and/or values
 ///   context <dir> <offset> [--before N] [--after N]
 ///                                    print the records around one offset
+///   aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
+///                    [--match <text>] [--top N] [--json]
+///                                    multi-dimensional count aggregation
+///   cluster <dir> [--match <text>] [--top N]
+///                                    error clustering by normalized template
+///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
+///                                    time-bucket histogram as text bars
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
@@ -90,7 +97,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1854,6 +1861,313 @@ fn cmd_context(
 }
 
 ///|
+/// Increment the count for a byte-keyed bucket.
+fn bump_bytes(counts : @hashmap.HashMap[Bytes, Int32], key : Bytes) -> Unit {
+  match counts.get(key) {
+    Some(c) => counts.set(key, c + 1)
+    None => counts.set(key, 1)
+  }
+}
+
+///|
+/// Increment the count for a string-keyed bucket.
+fn bump_string(counts : @hashmap.HashMap[String, Int32], key : String) -> Unit {
+  match counts.get(key) {
+    Some(c) => counts.set(key, c + 1)
+    None => counts.set(key, 1)
+  }
+}
+
+///|
+/// Sort `(bucket, count)` pairs by count descending and keep the top `top_n`.
+fn top_counts(
+  items : Array[(Bytes, Int32)],
+  top_n : Int32,
+) -> Array[(Bytes, Int32)] {
+  items.sort_by(fn(a, b) {
+    if a.1 > b.1 {
+      -1
+    } else if a.1 < b.1 {
+      1
+    } else {
+      0
+    }
+  })
+  let out : Array[(Bytes, Int32)] = []
+  let n = if items.length() < top_n { items.length() } else { top_n }
+  let mut i = 0
+  while i < n {
+    out.push(items[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Multi-dimensional aggregation: count records per bucket and print the top
+/// buckets. `--by` selects the dimension: `key` (default), `value`, `kind`,
+/// `hour` (UTC hour label) or `prefix:<N>` (first N key bytes). `--kv-field
+/// <name>` instead buckets by the `name=value` field inside the value
+/// (records without it bucket as `<missing>`). `--match <text>` limits to
+/// records containing the text (ASCII case-insensitive, key or value).
+/// `--json` emits the buckets as JSON.
+fn cmd_aggregate(
+  dir : String,
+  by : String,
+  kv_field : String?,
+  match_text : String?,
+  top : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  let top_n = match top {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid top count: " + s)
+      }
+    None => 20
+  }
+  let is_prefix = by.has_prefix("prefix:")
+  let prefix_n = if is_prefix {
+    @string.parse_int(by[7:by.length()].to_owned()) catch {
+      _ => raise @io.IoError::Invalid("invalid prefix dimension: " + by)
+    }
+  } else {
+    0
+  }
+  if by != "key" && by != "value" && by != "kind" && by != "hour" && !is_prefix {
+    raise @io.IoError::Invalid(
+      "invalid dimension: " + by + " (key|value|kind|hour|prefix:N)",
+    )
+  }
+  let needle : Bytes? = match match_text {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let field : Bytes? = match kv_field {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      let pass = match needle {
+        Some(n) =>
+          match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
+        None => true
+      }
+      if pass {
+        let bucket : Bytes = match field {
+          Some(f) => {
+            let pairs = @core.parse_kv_pairs(rec.value)
+            let mut found : Bytes? = None
+            for pair in pairs {
+              if pair.0 == f {
+                found = Some(pair.1)
+              }
+            }
+            match found {
+              Some(v) => v
+              None => b"<missing>"
+            }
+          }
+          None =>
+            if by == "value" {
+              rec.value
+            } else if by == "kind" {
+              if rec.is_delete() {
+                b"delete"
+              } else {
+                b"put"
+              }
+            } else if by == "hour" {
+              @utf8.encode(@core.format_utc(rec.timestamp, "hour"))
+            } else if is_prefix {
+              let len = if prefix_n < rec.key.length() {
+                prefix_n
+              } else {
+                rec.key.length()
+              }
+              @core.slice(rec.key, 0, len)
+            } else {
+              rec.key
+            }
+        }
+        bump_bytes(counts, bucket)
+      }
+      true
+    })
+    let items : Array[(Bytes, Int32)] = []
+    for k in counts.keys() {
+      match counts.get(k) {
+        Some(c) => items.push((k, c))
+        None => ()
+      }
+    }
+    let shown = top_counts(items, top_n)
+    if json {
+      let by_label = match kv_field {
+        Some(f) => "kv:" + f
+        None => by
+      }
+      let mut s = "{\"by\":\"" + by_label + "\",\"buckets\":["
+      let mut first = true
+      for item in shown {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"bucket\":\"" +
+          json_escape_str(bytes_to_string(item.0)) +
+          "\",\"count\":" +
+          item.1.to_string() +
+          "}"
+      }
+      s = s + "],\"total_buckets\":" + counts.length().to_string() + "}"
+      println(s)
+    } else {
+      println("count  bucket")
+      for item in shown {
+        println(item.1.to_string() + "  " + bytes_to_string(item.0))
+      }
+      println("(" + counts.length().to_string() + " buckets)")
+    }
+    close_log(log)
+  })
+}
+
+///|
+/// Error clustering: normalize each matching line into a template (digit
+/// runs, hex and quoted spans replaced) and count templates, so variable
+/// content collapses into message shapes. `--match` (default "error") selects
+/// lines (ASCII case-insensitive, key or value; an empty string matches
+/// everything). `--top N` prints the N most frequent templates (default 20).
+fn cmd_cluster(
+  dir : String,
+  match_text : String?,
+  top : String?,
+) -> Unit raise @io.IoError {
+  let top_n = match top {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid top count: " + s)
+      }
+    None => 20
+  }
+  let needle = @utf8.encode(
+    match match_text {
+      Some(s) => s
+      None => "error"
+    },
+  )
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if match_needle(rec.key, needle, true) ||
+        match_needle(rec.value, needle, true) {
+        bump_bytes(counts, @core.normalize_log_template(rec.value))
+      }
+      true
+    })
+    let items : Array[(Bytes, Int32)] = []
+    for k in counts.keys() {
+      match counts.get(k) {
+        Some(c) => items.push((k, c))
+        None => ()
+      }
+    }
+    let shown = top_counts(items, top_n)
+    println("count  template")
+    for item in shown {
+      println(item.1.to_string() + "  " + bytes_to_string(item.0))
+    }
+    println("(" + counts.length().to_string() + " templates)")
+    close_log(log)
+  })
+}
+
+///|
+/// Trend histogram: count records per time bucket and print a text bar chart
+/// in chronological order. `--bucket minute|hour|day` (default hour) selects
+/// UTC granularity; `--match <text>` filters records (ASCII case-insensitive,
+/// key or value); `--width N` sets the longest bar width (default 40).
+fn cmd_trend(
+  dir : String,
+  bucket : String,
+  match_text : String?,
+  width : String?,
+) -> Unit raise @io.IoError {
+  if bucket != "minute" && bucket != "hour" && bucket != "day" {
+    raise @io.IoError::Invalid(
+      "invalid bucket: " + bucket + " (minute|hour|day)",
+    )
+  }
+  let bar_width = match width {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid width: " + s)
+      }
+    None => 40
+  }
+  let needle : Bytes? = match match_text {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      let pass = match needle {
+        Some(n) =>
+          match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
+        None => true
+      }
+      if pass {
+        bump_string(counts, @core.format_utc(rec.timestamp, bucket))
+      }
+      true
+    })
+    let labels : Array[String] = []
+    for k in counts.keys() {
+      labels.push(k)
+    }
+    labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+    let mut max_count : Int32 = 0
+    for label in labels {
+      match counts.get(label) {
+        Some(c) => if c > max_count { max_count = c }
+        None => ()
+      }
+    }
+    for label in labels {
+      match counts.get(label) {
+        Some(c) => {
+          let bars = if max_count > 0 { c * bar_width / max_count } else { 0 }
+          let bar = StringBuilder()
+          let mut i = 0
+          while i < bars {
+            bar.write_string("█")
+            i = i + 1
+          }
+          println(label + "  " + bar.to_string() + " " + c.to_string())
+        }
+        None => ()
+      }
+    }
+    println(
+      "(max " +
+      max_count.to_string() +
+      ", " +
+      labels.length().to_string() +
+      " buckets)",
+    )
+    close_log(log)
+  })
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -2086,6 +2400,81 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_context(args[2], args[3], before, after)
+    }
+  } else if cmd == "aggregate" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut by = "key"
+      let mut kv_field : String? = (None : String?)
+      let mut match_text : String? = (None : String?)
+      let mut top : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a == "--by" && i + 1 < args.length() {
+          by = args[i + 1]
+          i = i + 1
+        } else if a == "--kv-field" && i + 1 < args.length() {
+          kv_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--match" && i + 1 < args.length() {
+          match_text = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--top" && i + 1 < args.length() {
+          top = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_aggregate(args[2], by, kv_field, match_text, top, json)
+    }
+  } else if cmd == "cluster" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut match_text : String? = (None : String?)
+      let mut top : String? = (None : String?)
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--match" && i + 1 < args.length() {
+          match_text = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--top" && i + 1 < args.length() {
+          top = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_cluster(args[2], match_text, top)
+    }
+  } else if cmd == "trend" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut bucket = "hour"
+      let mut match_text : String? = (None : String?)
+      let mut width : String? = (None : String?)
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--bucket" && i + 1 < args.length() {
+          bucket = args[i + 1]
+          i = i + 1
+        } else if a == "--match" && i + 1 < args.length() {
+          match_text = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--width" && i + 1 < args.length() {
+          width = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_trend(args[2], bucket, match_text, width)
     }
   } else if cmd == "serve" {
     if args.length() < 4 {

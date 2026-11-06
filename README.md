@@ -18,6 +18,7 @@
 - **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
+- **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -153,6 +154,19 @@ search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 context <dir> <offset> [--before N] [--after N]
                               上下文检索：打印目标 offset 前后各 N 条（默认
                               3/3，自动 clamp 到日志边界并跨段）
+aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
+                 [--match <text>] [--top N] [--json]
+                              多维聚合统计：按 key/value/kind/UTC 小时/键前
+                              缀 N 字节计数，`--kv-field` 按 value 内的
+                              name=value 字段聚合，`--match` 过滤记录，
+                              输出前 N 桶（`--json` 结构化）
+cluster <dir> [--match <text>] [--top N]
+                              错误自动聚类：把匹配行归一化为模板（数字/
+                              十六进制/引号串替换为占位符）后按模板计数，
+                              变量内容折叠为消息形态（默认匹配 "error"）
+trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
+                              趋势可视化：按 UTC 时间桶计数并以文本直方图
+                              输出（按时间序，`--width` 控制最长条宽）
 version                       打印 moonlog 版本号（与 moon.mod 同步）
 ```
 
@@ -412,6 +426,7 @@ u32 crc32          (仅覆盖 body)
 - M104 日志采集：CLI `ingest` 从外部日志文件批量导入（`--once`）或持续跟踪（`--follow`，半行留待下轮、截断/轮转自动重采）；`lines`/`kv` 两种解析（字段提取与格式化：`--key-field` 提升为记录键、其余字段重组为值，`--key` 常量标签）；采集位点以命名游标 `ingest-<basename>` 持久化实现断点续采；核心解析器 `parse_kv_pairs` 随 core 包提供并有单测
 - M105 热温冷分层存储：`tier_log_dir` 与 CLI `tier`——已 roll 段先原地压缩（温层），较旧的段复制进 cold 目录并以 symlink **原子替换**主路径（冷层），活跃段恒热；新增 symlink/lstat/readlink stub，`remove_segment_files` 联动清理冷副本；读/校验/备份/修复经链接透明，命令幂等并支持 `--dry-run` 计划
 - M106 日志检索：全文检索 CLI `search`（流式线性扫描 key/value 子串，`--field`/`--ignore-case`/`--limit`/`--from`/`--to`，无倒排索引、成本 O(records)，文档注明定位）与上下文关联检索 `context`（按 offset 打印前后 N 条，自动 clamp 边界并跨段）；新增 core 子串匹配器 `bytes_contains`/`bytes_contains_ci` 并有单测
+- M107 日志分析：`aggregate` 多维聚合（`--by key|value|kind|hour|prefix:N`、`--kv-field` 字段维度、`--match` 过滤、`--top`、`--json`）；`cluster` 错误聚类（core `normalize_log_template` 将数字/hex/引号串折叠为占位符后按模板计数）；`trend` 趋势直方图（core `format_utc` 的 UTC 分钟/小时/天标签 + 文本条）；顺带修复 `ensure_dir` 不支持父目录的缺陷（改为逐级递归创建，此前冒烟均手工 `mkdir -p` 而未暴露）
 
 ## 许可
 
