@@ -14,7 +14,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 1
+const INV_VERSION : UInt32 = 2
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -163,6 +163,52 @@ pub fn[W, R] Segment::inv_field_postings(
 }
 
 ///|
+/// Write a LEB128 varint (3.3 columnar compression): postings are stored as
+/// deltas of the strictly increasing record indices, so most deltas fit in
+/// one byte instead of a fixed 4-byte word.
+fn inv_write_varint(buf : @buffer.Buffer, v : Int32) -> Unit {
+  let mut x = v.reinterpret_as_uint()
+  while x >= (0x80 : UInt32) {
+    buf.write_byte(
+      ((x & (0x7F : UInt32)) | (0x80 : UInt32)).reinterpret_as_int().to_byte(),
+    )
+    x = x >> 7
+  }
+  buf.write_byte(x.reinterpret_as_int().to_byte())
+}
+
+///|
+/// Read a LEB128 varint written by `inv_write_varint`; `Truncated` when the
+/// bytes run past `end` or the value exceeds 5 bytes.
+fn inv_read_varint(
+  data : Bytes,
+  pos : Int32,
+  end : Int32,
+) -> (Int32, Int32) raise @core.MetaError {
+  let mut x : UInt32 = 0
+  let mut shift : Int32 = 0
+  let mut p = pos
+  let mut go = true
+  while go {
+    if p >= end {
+      raise @core.MetaError::Truncated(p)
+    }
+    let b = data.at(p).to_int()
+    x = x | ((b & 0x7F).reinterpret_as_uint() << shift)
+    p = p + 1
+    if b < 0x80 {
+      go = false
+    } else {
+      shift = shift + 7
+      if shift > 28 {
+        raise @core.MetaError::Truncated(p)
+      }
+    }
+  }
+  (x.reinterpret_as_int(), p)
+}
+
+///|
 fn inv_encode_table(
   body : @buffer.Buffer,
   map : @hashmap.HashMap[Bytes, Array[Int32]],
@@ -172,8 +218,13 @@ fn inv_encode_table(
     body.write_uint_le(k.length().reinterpret_as_uint())
     body.write_bytes(k)
     body.write_uint_le(arr.length().reinterpret_as_uint())
+    // Columnar compression (3.3): postings are strictly increasing record
+    // indices — store the deltas as varints (1-2 bytes vs a fixed 4-byte
+    // word), shrinking the sidecar and the IO it costs on load.
+    let mut prev : Int32 = 0
     for idx in arr {
-      body.write_uint_le(idx.reinterpret_as_uint())
+      inv_write_varint(body, idx - prev)
+      prev = idx
     }
   })
 }
@@ -209,28 +260,38 @@ fn inv_decode_table(
       raise @core.MetaError::Truncated(p)
     }
     // Entry layout (matching inv_encode_table): klen, key bytes, posting
-    // count, postings.
+    // count, then the postings as varint deltas of the strictly increasing
+    // record indices (3.3 columnar compression, sidecar format version 2).
     let klen = meta_u32(data, p).reinterpret_as_int()
     if klen < 0 {
       raise @core.MetaError::Truncated(p)
     }
-    let n = meta_u32(data, p + 4 + klen).reinterpret_as_int()
+    let pcount_at = p + 4 + klen
+    if pcount_at + 4 > body_end {
+      raise @core.MetaError::Truncated(p)
+    }
+    let n = meta_u32(data, pcount_at).reinterpret_as_int()
     if n < 0 || n > INV_MAX_POSTINGS {
       raise @core.MetaError::Truncated(p)
     }
     let kstart = p + 4
-    if kstart + klen + 4 + n * 4 > body_end {
+    if kstart + klen > body_end {
       raise @core.MetaError::Truncated(p)
     }
     let key = @core.slice(data, kstart, kstart + klen)
     let arr : Array[Int32] = []
+    let mut cur : Int32 = 0
+    let mut dp = pcount_at + 4
     let mut j = 0
     while j < n {
-      arr.push(meta_u32(data, kstart + klen + 4 + j * 4).reinterpret_as_int())
+      let (d, np) = inv_read_varint(data, dp, body_end)
+      cur = cur + d
+      arr.push(cur)
+      dp = np
       j = j + 1
     }
     map.set(key, arr)
-    p = kstart + klen + 4 + n * 4
+    p = dp
     i = i + 1
   }
   (p, map)
@@ -247,7 +308,9 @@ pub fn decode_inv_index(data : Bytes) -> InvIndex raise @core.MetaError {
     raise @core.MetaError::BadMagic
   }
   let version = meta_u32(data, 4)
-  if version < 1 || version > INV_VERSION {
+  // Exact version: v1 had uncompressed postings, silently reading it as v2
+  // would yield garbage — reject and let the caller rebuild instead.
+  if version != INV_VERSION {
     raise @core.MetaError::BadVersion(version)
   }
   let body_end = total - 4

@@ -112,3 +112,36 @@ test "inv sidecar roundtrip preserves both tables" {
   }
   assert_true(raised)
 }
+
+///|
+test "inv sidecar uses columnar varint postings (3.3)" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  // 500 records sharing one field → dense columns with 500 postings each.
+  for i = 0; i < 500; i = i + 1 {
+    ignore(
+      seg.append(b"svc", b"level=info", i.to_int64()) catch {
+        _ => panic()
+      },
+    )
+  }
+  seg.build_inv_index()
+  let ix = match seg.inv_index {
+    Some(ix) => ix
+    None => panic()
+  }
+  let raw = ix.encode()
+  // A fixed 4-byte-per-posting layout (v1) would need ~30k bytes for these
+  // tables; the varint deltas (all 1) shrink it to ~7.6k. Assert well under
+  // half of the fixed-layout estimate so the compression is actually proven.
+  assert_true(raw.length() < 15000)
+  // Semantics unchanged after decode.
+  let decoded = @segment.decode_inv_index(raw) catch { _ => panic() }
+  assert_eq(decoded.fields.get(b"level=info"), ix.fields.get(b"level=info"))
+  assert_eq(decoded.terms.get(b"level"), ix.terms.get(b"level"))
+  assert_eq(decoded.terms.get(b"info"), ix.terms.get(b"info"))
+}
