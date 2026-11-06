@@ -49,6 +49,8 @@ pub fn parse_kv_pairs(Bytes) -> Array[(Bytes, Bytes)]
 
 pub fn parse_rbac_line(Bytes) -> RbacRole?
 
+pub fn parse_ttl_policy(Bytes) -> TtlPolicy?
+
 pub fn rbac_allows(RbacRole, Bytes) -> Bool
 
 pub fn rbac_find(Array[RbacRole], Bytes) -> RbacRole?
@@ -70,6 +72,10 @@ pub fn schema_value(SchemaFields) -> Bytes
 pub fn shell_quote(String) -> String
 
 pub fn slice(Bytes, Int32, Int32) -> Bytes
+
+pub fn ttl_days_of(TtlPolicy, Bytes, Bytes?) -> Int64
+
+pub fn ttl_record_level(Bytes) -> Bytes?
 
 // Errors
 pub(all) suberror DecodeError {
@@ -137,6 +143,11 @@ pub(all) struct SchemaFields {
   host : Bytes?
   trace_id : Bytes?
   message : Bytes?
+}
+
+pub(all) struct TtlPolicy {
+  default_days : Int64
+  rules : Array[(Bytes, Bytes, Int64)]
 }
 
 // Type aliases

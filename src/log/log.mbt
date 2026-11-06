@@ -578,6 +578,62 @@ pub fn[W : @io.LogWriter, R] Log::delete(
 }
 
 ///|
+/// Differentiated-TTL expiry (3.4): evaluate every record's effective
+/// retention days from the policy (the service scope matches the record key,
+/// the level scope matches the parsed `level` field; the stricter one wins
+/// when both hit, the default otherwise) and drop segments in which **every**
+/// record has expired. Segments with any live record are kept as a whole —
+/// reclamation granularity is the segment, so pair with `--partition day`
+/// to cluster same-day/same-service data into reclaimable runs. With
+/// `apply=false` (dry-run) nothing is dropped and only the plan is counted.
+/// Returns (dropped_segments, expired_records_seen).
+pub fn[W, R : @io.LogReader] Log::expire_by_policy(
+  self : Log[W, R],
+  now : Int64,
+  policy : @core.TtlPolicy,
+  apply~ : Bool = true,
+  on_drop~ : (@segment.Segment[W, R]) -> Unit,
+) -> (Int32, Int32) raise @io.IoError {
+  let keep : Array[@segment.Segment[W, R]] = []
+  let mut dropped : Int32 = 0
+  let mut expired_seen : Int32 = 0
+  let n = self.segments.length()
+  for i = 0; i < n; i = i + 1 {
+    let seg = self.segments[i]
+    if seg.record_count == 0 || self.segment_guarded(seg) {
+      keep.push(seg)
+    } else {
+      let mut all_expired = true
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        let days = @core.ttl_days_of(
+          policy,
+          rec.key,
+          @core.ttl_record_level(rec.value),
+        )
+        if rec.timestamp + days * (86400000 : Int64) > now {
+          all_expired = false
+        } else {
+          expired_seen = expired_seen + 1
+        }
+      })
+      if all_expired {
+        dropped = dropped + 1
+        if apply {
+          on_drop(seg)
+        } else {
+          keep.push(seg)
+        }
+      } else {
+        keep.push(seg)
+      }
+    }
+  }
+  self.segments = keep
+  self.index_cache = None
+  (dropped, expired_seen)
+}
+
+///|
 /// Retention: drop every rolled-over segment that lies entirely before
 /// `offset`, invoking `on_drop` (e.g. to delete its backing file) for each.
 /// The active (last) segment is never dropped. Returns the number dropped.

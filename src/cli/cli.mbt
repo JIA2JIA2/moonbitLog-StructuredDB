@@ -26,6 +26,9 @@
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
 ///   prune-superseded <dir>           drop segments fully superseded by later records
+///   ttl-expire <dir> [--dry-run]     differentiated-TTL expiry per <dir>/TTL
+///                                    (default/service/level rules); applied
+///                                    runs append to TTL_AUDIT.log
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   maintain <dir> <max-segments> [ttl]
 ///                                    merge + prune-superseded + compact-expired
@@ -153,7 +156,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -969,6 +972,90 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
 
 ///|
 /// Drop segments whose last record is older than `ttl` ms relative to now.
+
+///|
+/// Append a TTL expiry event to `<dir>/TTL_AUDIT.log` (JSONL), so retention
+/// actions stay auditable beyond the one-line command output.
+fn append_ttl_audit(
+  dir : String,
+  policy_text : String,
+  dropped : Int32,
+  expired : Int32,
+) -> Unit {
+  let path = dir + "/TTL_AUDIT.log"
+  let existing = @backend_native.read_file(path)
+  let line = "{\"ts\":" +
+    now_ms().to_string() +
+    ",\"event\":\"ttl_expire\"" +
+    ",\"segments_dropped\":" +
+    dropped.to_string() +
+    ",\"records_expired\":" +
+    expired.to_string() +
+    ",\"policy\":\"" +
+    json_escape_str(policy_text) +
+    "\"}\n"
+  ignore(
+    @backend_native.write_file(path, existing + @utf8.encode(line)) catch {
+      _ => ()
+    },
+  )
+}
+
+///|
+/// Policy-driven TTL expiry (3.4): read `<dir>/TTL` — `default <days>`,
+/// `service <name> <days>` and `level <level> <days>` lines ('#' comments
+/// allowed) — evaluate every record (service matches the key, level the
+/// parsed level field; the stricter one wins, default otherwise) and drop
+/// segments whose records have all expired. `--dry-run` prints the plan
+/// without touching data; every applied run appends a JSONL event to
+/// `<dir>/TTL_AUDIT.log` so cleanup stays auditable.
+fn cmd_ttl_expire(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
+  let ppath = dir + "/TTL"
+  if !@backend_native.file_exists(ppath) {
+    println("no TTL policy file (" + ppath + ") — nothing to do")
+    return
+  }
+  let raw = @backend_native.read_file(ppath)
+  let policy = match @core.parse_ttl_policy(raw) {
+    Some(p) => p
+    None => raise @io.IoError::Invalid("invalid TTL policy file: " + ppath)
+  }
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let (dropped, expired) = log.expire_by_policy(
+      now_ms(),
+      policy,
+      apply=!dry_run,
+      on_drop=seg => {
+        @backend_native.remove_segment_files(dir, seg.base_offset)
+        seg.writer.close()
+      },
+    )
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+    if dry_run {
+      println(
+        "dry-run: would drop " +
+        dropped.to_string() +
+        " segment(s), " +
+        expired.to_string() +
+        " record(s) expired",
+      )
+    } else {
+      append_ttl_audit(dir, @utf8.decode_lossy(raw), dropped, expired)
+      println(
+        "dropped " +
+        dropped.to_string() +
+        " segment(s), " +
+        expired.to_string() +
+        " record(s) expired (audited)",
+      )
+    }
+  })
+}
+
+///|
+/// Drop segments whose last record is older than now-ttl.
 fn cmd_prune_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
   let ttl_ms = @string.parse_int64(ttl) catch {
     _ => raise @io.IoError::Invalid("invalid ttl: " + ttl)
@@ -1056,6 +1143,22 @@ fn run_maintenance(
       None => -1
     }
     let packed = @backend_native.compress_rolled_segments(dir, log)
+    // Automatic differentiated-TTL expiry when a policy file exists (3.4):
+    // every serve/maintain pass re-evaluates retention and audits the run.
+    let ttl_path = dir + "/TTL"
+    if @backend_native.file_exists(ttl_path) {
+      let raw_policy = @backend_native.read_file(ttl_path)
+      match @core.parse_ttl_policy(raw_policy) {
+        Some(policy) => {
+          let (td, te) = log.expire_by_policy(now_ms(), policy, on_drop=seg => {
+            @backend_native.remove_segment_files(dir, seg.base_offset)
+            seg.writer.close()
+          })
+          append_ttl_audit(dir, @utf8.decode_lossy(raw_policy), td, te)
+        }
+        None => ()
+      }
+    }
     // Build the inverted/field-column sidecars so indexed queries load them
     // instead of rebuilding from data (3.2). Idempotent.
     for seg in log.segments {
@@ -4856,6 +4959,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_prune_superseded(args[2], args.length() > 3 && args[3] == "dry-run")
+    }
+  } else if cmd == "ttl-expire" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut dry = false
+      let mut i = 3
+      while i < args.length() {
+        if args[i] == "--dry-run" {
+          dry = true
+        }
+        i = i + 1
+      }
+      cmd_ttl_expire(args[2], dry)
     }
   } else if cmd == "merge" {
     if args.length() < 4 {
