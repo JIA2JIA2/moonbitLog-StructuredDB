@@ -4745,6 +4745,291 @@ fn cmd_alert(
 }
 
 ///|
+/// Sliding-window threshold watch (5.3): continuously pull new records and
+/// evaluate the trailing `--window-sec S` window every `--every <ms>` (default
+/// 1000). Two metric shapes: count mode (`--match <text> --threshold N` —
+/// matching records in the window) and metric mode (`--metric <field>
+/// --metric-threshold <v>` — average of the numeric field over the window).
+/// A firing/resolved state machine keeps the alarm quiet: entering the
+/// violation emits one ALERT notification, staying violated emits nothing,
+/// falling back emits one RESOLVED — no alert storms. `--level-min`/
+/// `--service` narrow the records (same semantics as query); notifications
+/// reuse the three channels of `alert` (`--notify-file`/`--webhook`).
+/// `--once` performs a single pull+evaluate pass (for scripts and tests).
+fn cmd_watch(
+  dir : String,
+  match_text : String,
+  threshold : String,
+  window_sec : String,
+  metric : String?,
+  metric_threshold : String?,
+  level_min : String?,
+  service : String?,
+  every_ms : String?,
+  notify_file : String?,
+  webhook : String?,
+  json : Bool,
+  once : Bool,
+) -> Unit raise @io.IoError {
+  let threshold_n = @string.parse_int(threshold) catch {
+    _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
+  }
+  let win_ms = (@string.parse_int64(window_sec) catch {
+      _ => raise @io.IoError::Invalid("invalid window-sec: " + window_sec)
+    }) *
+    (1000 : Int64)
+  if win_ms <= 0 {
+    raise @io.IoError::Invalid("window-sec must be positive")
+  }
+  let match_b : Bytes? = Some(@utf8.encode(match_text))
+  let metric_b : Bytes? = match metric {
+    Some(m) => Some(@utf8.encode(m))
+    None => None
+  }
+  let metric_thr : Double? = match metric_threshold {
+    Some(v) =>
+      Some(
+        @string.parse_double(v) catch {
+          _ => raise @io.IoError::Invalid("invalid metric-threshold: " + v)
+        },
+      )
+    None => None
+  }
+  match (metric_b, metric_thr) {
+    (Some(_), None) =>
+      raise @io.IoError::Invalid("--metric requires --metric-threshold")
+    (None, Some(_)) =>
+      raise @io.IoError::Invalid("--metric-threshold requires --metric")
+    _ => ()
+  }
+  let min_rank : Int32? = match level_min {
+    Some(l) => {
+      let r = @core.level_rank(@utf8.encode(l))
+      if r < 0 {
+        raise @io.IoError::Invalid("invalid level: " + l)
+      }
+      Some(r)
+    }
+    None => None
+  }
+  let service_b : Bytes? = match service {
+    Some(sv) => Some(@utf8.encode(sv))
+    None => None
+  }
+  let every = match every_ms {
+    Some(v) =>
+      @string.parse_int(v) catch {
+        _ => raise @io.IoError::Invalid("invalid every: " + v)
+      }
+    None => 1000
+  }
+  let metric_mode = metric_b is Some(_)
+  let win_s = (win_ms / (1000 : Int64)).to_string()
+  let mut from : UInt64 = (0 : UInt64)
+  let mut buf : Array[@core.Record] = []
+  let mut firing = false
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    // `--once` evaluates the data already present (from 0); the resident
+    // watch starts from the current tail (performance).
+    from = if once { (0 : UInt64) } else { log.next_offset() }
+    close_log(log)
+  })
+  let mut go = true
+  while go {
+    // Pull new records into the window buffer.
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let next = log.next_offset()
+      if next > from {
+        let recs = log.scan_range(from, next)
+        for rec in recs {
+          buf.push(rec)
+        }
+        from = next
+      }
+      close_log(log)
+    })
+    // Slide the window: drop records older than the trailing bound.
+    let now = now_ms()
+    let keep_from = now - win_ms
+    let fresh : Array[@core.Record] = []
+    for rec in buf {
+      if rec.timestamp >= keep_from {
+        fresh.push(rec)
+      }
+    }
+    buf = fresh
+    // Evaluate the predicate over the window.
+    let mut count = 0
+    let mut sum : Double = 0.0
+    let mut samples = 0
+    for rec in buf {
+      let mut pass = true
+      match service_b {
+        Some(sb) => if rec.key != sb { pass = false }
+        None => ()
+      }
+      if pass {
+        match min_rank {
+          Some(r) => {
+            let mut lv : Bytes? = None
+            for pair in @core.parse_kv_pairs(rec.value) {
+              if pair.0 == b"level" {
+                lv = Some(pair.1)
+              }
+            }
+            let lr = match lv {
+              Some(l) => @core.level_rank(l)
+              None => -1
+            }
+            // Range filter requires a known level (same as query).
+            if lr < 0 || lr < r {
+              pass = false
+            }
+          }
+          None => ()
+        }
+      }
+      if pass {
+        match match_b {
+          Some(nb) =>
+            if !match_needle(rec.key, nb, true) &&
+              !match_needle(rec.value, nb, true) {
+              pass = false
+            }
+          None => ()
+        }
+      }
+      if pass {
+        count = count + 1
+        match metric_b {
+          Some(mf) =>
+            for pair in @core.parse_kv_pairs(rec.value) {
+              if pair.0 == mf {
+                let d_opt = Some(
+                  @string.parse_double(@utf8.decode_lossy(pair.1)),
+                ) catch {
+                  _ => None
+                }
+                match d_opt {
+                  Some(d) => {
+                    sum = sum + d
+                    samples = samples + 1
+                  }
+                  None => ()
+                }
+              }
+            }
+          None => ()
+        }
+      }
+    }
+    // Violation check: count mode or metric-average mode.
+    let metric_thr_v : Double = match metric_thr {
+      Some(v) => v
+      None => 0.0
+    }
+    let violated : Bool = match metric_b {
+      Some(_) => samples > 0 && sum / samples.to_double() > metric_thr_v
+      None => count > threshold_n
+    }
+    let cur_value : String = match metric_b {
+      Some(_) => {
+        let avg = if samples > 0 { sum / samples.to_double() } else { 0.0 }
+        avg.to_string()
+      }
+      None => count.to_string()
+    }
+    let kind_str = if metric_mode { "metric" } else { "threshold" }
+    let thr_str = match metric_thr {
+      Some(v) => v.to_string()
+      None => threshold_n.to_string()
+    }
+    // firing/resolved state machine — one notification per transition.
+    if violated && !firing {
+      firing = true
+      let event = "{\"kind\":\"" +
+        kind_str +
+        "\",\"state\":\"firing\",\"value\":" +
+        cur_value +
+        ",\"threshold\":" +
+        thr_str +
+        ",\"window_sec\":" +
+        win_s +
+        ",\"ts\":" +
+        now.to_string() +
+        "}"
+      if json {
+        println(event)
+      } else if metric_mode {
+        println(
+          "ALERT firing avg(" +
+          bytes_to_string(
+            match metric_b {
+              Some(m) => m
+              None => b""
+            },
+          ) +
+          ")=" +
+          cur_value +
+          " over window " +
+          win_s +
+          "s",
+        )
+      } else {
+        println(
+          "ALERT firing count=" + cur_value + " over window " + win_s + "s",
+        )
+      }
+      dispatch_notification(event, notify_file, webhook)
+    } else if !violated && firing {
+      firing = false
+      let event = "{\"kind\":\"" +
+        kind_str +
+        "\",\"state\":\"resolved\",\"value\":" +
+        cur_value +
+        ",\"threshold\":" +
+        thr_str +
+        ",\"window_sec\":" +
+        win_s +
+        ",\"ts\":" +
+        now.to_string() +
+        "}"
+      if json {
+        println(event)
+      } else {
+        println("RESOLVED value=" + cur_value)
+      }
+      dispatch_notification(event, notify_file, webhook)
+    }
+    if once {
+      go = false
+    } else {
+      @backend_native.sleep_ms(every)
+    }
+  }
+  println(
+    "(watch ended, window " +
+    win_s +
+    "s, buffered " +
+    buf.length().to_string() +
+    " records)",
+  )
+}
+
+///   watch <dir> <match-text> --threshold N [--window-sec S] [--every ms]
+///            [--metric <field> --metric-threshold <v>] [--level-min <lv>]
+///            [--service <svc>] [--notify-file <f>] [--webhook <url>]
+///            [--json] [--once]
+///                                    sliding-window threshold watch (5.3):
+///                                    re-evaluates the trailing window every
+///                                    cycle; count or metric-average modes;
+///                                    firing/resolved state machine emits one
+///                                    notification per transition (no alert
+///                                    storms)
+
+///|
 /// Baseline anomaly detection: count records matching `--match` per UTC
 /// window, compute the mean and standard deviation of the window counts, and
 /// flag windows whose z-score exceeds `--sigma` (default 3) — provided at
@@ -6009,6 +6294,81 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         Some(t) =>
           cmd_alert(args[2], args[3], t, window, notify_file, webhook, json)
         None => raise @io.IoError::Invalid("alert requires --threshold")
+      }
+    }
+  } else if cmd == "watch" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut threshold : String? = (None : String?)
+      let mut window_sec : String? = (None : String?)
+      let mut metric : String? = (None : String?)
+      let mut metric_threshold : String? = (None : String?)
+      let mut level_min : String? = (None : String?)
+      let mut service : String? = (None : String?)
+      let mut every_ms : String? = (None : String?)
+      let mut notify_file : String? = (None : String?)
+      let mut webhook : String? = (None : String?)
+      let mut json = false
+      let mut once = false
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--threshold" && i + 1 < args.length() {
+          threshold = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--window-sec" && i + 1 < args.length() {
+          window_sec = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--metric" && i + 1 < args.length() {
+          metric = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--metric-threshold" && i + 1 < args.length() {
+          metric_threshold = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--level-min" && i + 1 < args.length() {
+          level_min = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--every" && i + 1 < args.length() {
+          every_ms = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--notify-file" && i + 1 < args.length() {
+          notify_file = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--webhook" && i + 1 < args.length() {
+          webhook = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        } else if a == "--once" {
+          once = true
+        }
+        i = i + 1
+      }
+      match threshold {
+        Some(t) =>
+          cmd_watch(
+            args[2],
+            args[3],
+            t,
+            match window_sec {
+              Some(w) => w
+              None => "5"
+            },
+            metric,
+            metric_threshold,
+            level_min,
+            service,
+            every_ms,
+            notify_file,
+            webhook,
+            json,
+            once,
+          )
+        None => raise @io.IoError::Invalid("watch requires --threshold")
       }
     }
   } else if cmd == "baseline" {
