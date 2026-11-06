@@ -3181,7 +3181,13 @@ fn cmd_search(
 /// (schema ingest stores the service name as the key) or a parsed service
 /// field; `--level`, `--host` and `--trace-id` match parsed fields;
 /// `--contains` matches the raw value as an ASCII case-insensitive substring;
-/// `--since`/`--until` bound the record timestamp (epoch ms, inclusive);
+/// `--level-min`/`--level-max` filter by severity rank (debug<info<warn<
+/// error<fatal; a range filter requires a known level — unknown levels are
+/// excluded); `--since`/`--until` bound
+/// the record timestamp (epoch ms, inclusive). Pushdown (4.2): time bounds
+/// skip whole segments via `min_ts`/`max_ts` without decoding, and with
+/// `--indexed` the equality/range conditions expand to field-column postings
+/// preselection before the full AND refinement.
 /// `--limit` stops early. With `--sort-by-time`, matches are collected and
 /// printed ordered by event time (ties keep offset order) instead of the
 /// arrival (offset) order — the standard answer to out-of-order delivery.
@@ -3198,6 +3204,8 @@ fn cmd_query(
   service : String?,
   host : String?,
   trace_id : String?,
+  level_min : String?,
+  level_max : String?,
   contains : String?,
   since : String?,
   until : String?,
@@ -3244,6 +3252,26 @@ fn cmd_query(
       )
     None => None
   }
+  let min_rank : Int32? = match level_min {
+    Some(s) => {
+      let r = @core.level_rank(@utf8.encode(s))
+      if r < 0 {
+        raise @io.IoError::Invalid("invalid level: " + s)
+      }
+      Some(r)
+    }
+    None => None
+  }
+  let max_rank : Int32? = match level_max {
+    Some(s) => {
+      let r = @core.level_rank(@utf8.encode(s))
+      if r < 0 {
+        raise @io.IoError::Invalid("invalid level: " + s)
+      }
+      Some(r)
+    }
+    None => None
+  }
   let max_hits = match limit {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -3251,20 +3279,63 @@ fn cmd_query(
       }
     None => -1
   }
-  // --indexed: the first given equality filter preselects candidates through
+  // --indexed: the most selective given condition (equality or a level rank
+  // range expanded over the five known levels) preselects candidates through
   // the per-segment field-column index; the full AND refinement still runs.
-  let idx_sel : (Bytes, Bytes, Bool)? = if indexed {
-    match level_b {
-      Some(l) => Some((b"level", l, false))
+  let has_level_cond = match level_b {
+    Some(_) => true
+    None =>
+      match min_rank {
+        Some(_) => true
+        None =>
+          match max_rank {
+            Some(_) => true
+            None => false
+          }
+      }
+  }
+  let level_values : Array[Bytes]? = if has_level_cond {
+    let vals : Array[Bytes] = []
+    let lo_r : Int32 = match min_rank {
+      Some(r) => r
+      None => 0
+    }
+    let hi_r : Int32 = match max_rank {
+      Some(r) => r
+      None => 4
+    }
+    let table : Array[(Int32, Bytes)] = [
+      (0, b"debug"),
+      (1, b"info"),
+      (2, b"warn"),
+      (3, b"error"),
+      (4, b"fatal"),
+    ]
+    for pair in table {
+      let (r, v) = pair
+      if r >= lo_r && r <= hi_r {
+        match level_b {
+          Some(l) => if l == v { vals.push(v) }
+          None => vals.push(v)
+        }
+      }
+    }
+    Some(vals)
+  } else {
+    None
+  }
+  let idx_sel : (Bytes, Array[Bytes], Bool)? = if indexed {
+    match level_values {
+      Some(vals) => Some((b"level", vals, false))
       None =>
         match service_b {
-          Some(s) => Some((b"service", s, true))
+          Some(s) => Some((b"service", [s], true))
           None =>
             match host_b {
-              Some(h) => Some((b"host", h, false))
+              Some(h) => Some((b"host", [h], false))
               None =>
                 match trace_b {
-                  Some(t) => Some((b"trace_id", t, false))
+                  Some(t) => Some((b"trace_id", [t], false))
                   None => None
                 }
             }
@@ -3274,7 +3345,7 @@ fn cmd_query(
     None
   }
   match idx_sel {
-    Some((fname, fval, also_key)) => {
+    Some((fname, fvals, also_key)) => {
       run_locked(dir, false, () => {
         let log = open_log(dir)
         let mut hits = 0
@@ -3283,17 +3354,32 @@ fn cmd_query(
           if stop {
             break
           }
+          // Pushdown (4.2): skip segments disjoint from the time bounds.
+          if seg.record_count > 0 {
+            match since_ts {
+              Some(t) => if seg.max_ts < t { continue }
+              None => ()
+            }
+            match until_ts {
+              Some(t) => if seg.min_ts > t { continue }
+              None => ()
+            }
+          }
           seg.ensure_inv_index()
           let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([],
           )
-          for i2 in seg.inv_field_postings(fname, fval) {
-            let off = seg.base_offset + i2.to_uint64()
-            seen.set(off, true)
-          }
-          if also_key {
-            for i2 in seg.inv_field_postings(b"__key__", fval) {
+          for v in fvals {
+            for i2 in seg.inv_field_postings(fname, v) {
               let off = seg.base_offset + i2.to_uint64()
               seen.set(off, true)
+            }
+          }
+          if also_key {
+            for v in fvals {
+              for i2 in seg.inv_field_postings(b"__key__", v) {
+                let off = seg.base_offset + i2.to_uint64()
+                seen.set(off, true)
+              }
             }
           }
           let cands : Array[UInt64] = []
@@ -3329,16 +3415,52 @@ fn cmd_query(
                 }
                 if hit {
                   let fields = @core.parse_kv_pairs(r.value)
-                  hit = @core.schema_matches(
-                    fields,
-                    r.key,
-                    r.value,
-                    level_b,
-                    service_b,
-                    host_b,
-                    trace_b,
-                    contains_b,
-                  )
+                  let mut lv : Bytes? = None
+                  for pair in fields {
+                    if pair.0 == b"level" {
+                      lv = Some(pair.1)
+                    }
+                  }
+                  let lr = match lv {
+                    Some(l) => @core.level_rank(l)
+                    None => -1
+                  }
+                  let ranged = match min_rank {
+                    Some(_) => true
+                    None =>
+                      match max_rank {
+                        Some(_) => true
+                        None => false
+                      }
+                  }
+                  if ranged {
+                    // Consistent with the linear path: a range filter
+                    // requires a known level.
+                    if lr < 0 {
+                      hit = false
+                    } else {
+                      match min_rank {
+                        Some(rk) => if lr < rk { hit = false }
+                        None => ()
+                      }
+                      match max_rank {
+                        Some(rk) => if lr > rk { hit = false }
+                        None => ()
+                      }
+                    }
+                  }
+                  if hit {
+                    hit = @core.schema_matches(
+                      fields,
+                      r.key,
+                      r.value,
+                      level_b,
+                      service_b,
+                      host_b,
+                      trace_b,
+                      contains_b,
+                    )
+                  }
                 }
                 if hit {
                   if json {
@@ -3364,41 +3486,100 @@ fn cmd_query(
     let log = open_log(dir)
     let mut hits = 0
     let collected : Array[@core.Record] = []
-    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      let mut hit = true
-      match since_ts {
-        Some(t) => if rec.timestamp < t { hit = false }
-        None => ()
+    let mut stop = false
+    for seg in log.segments {
+      if stop {
+        break
       }
-      match until_ts {
-        Some(t) => if rec.timestamp > t { hit = false }
-        None => ()
-      }
-      if hit {
-        let fields = @core.parse_kv_pairs(rec.value)
-        hit = @core.schema_matches(
-          fields,
-          rec.key,
-          rec.value,
-          level_b,
-          service_b,
-          host_b,
-          trace_b,
-          contains_b,
-        )
-      }
-      if hit {
-        if sort_by_time {
-          collected.push(rec)
-        } else if json {
-          print_json_record(rec)
-        } else {
-          print_record(rec)
+      // Pushdown (4.2): skip segments whose time range is disjoint from the
+      // [since, until] bounds (segment-granularity skipping via min_ts/max_ts).
+      if seg.record_count > 0 {
+        match since_ts {
+          Some(t) => if seg.max_ts < t { continue }
+          None => ()
         }
-        hits = hits + 1
+        match until_ts {
+          Some(t) => if seg.min_ts > t { continue }
+          None => ()
+        }
       }
-      max_hits < 0 || hits < max_hits
-    })
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        if stop {
+          return
+        }
+        let mut hit = true
+        match since_ts {
+          Some(t) => if rec.timestamp < t { hit = false }
+          None => ()
+        }
+        match until_ts {
+          Some(t) => if rec.timestamp > t { hit = false }
+          None => ()
+        }
+        if hit {
+          let fields = @core.parse_kv_pairs(rec.value)
+          let mut lv : Bytes? = None
+          for pair in fields {
+            if pair.0 == b"level" {
+              lv = Some(pair.1)
+            }
+          }
+          let lr = match lv {
+            Some(l) => @core.level_rank(l)
+            None => -1
+          }
+          let ranged = match min_rank {
+            Some(_) => true
+            None =>
+              match max_rank {
+                Some(_) => true
+                None => false
+              }
+          }
+          if ranged {
+            // A range filter requires a known level: unknown levels are
+            // excluded (consistent with the field-column pushdown).
+            if lr < 0 {
+              hit = false
+            } else {
+              match min_rank {
+                Some(rk) => if lr < rk { hit = false }
+                None => ()
+              }
+              match max_rank {
+                Some(rk) => if lr > rk { hit = false }
+                None => ()
+              }
+            }
+          }
+          if hit {
+            hit = @core.schema_matches(
+              fields,
+              rec.key,
+              rec.value,
+              level_b,
+              service_b,
+              host_b,
+              trace_b,
+              contains_b,
+            )
+          }
+        }
+        if hit {
+          if sort_by_time {
+            collected.push(rec)
+          } else if json {
+            print_json_record(rec)
+          } else {
+            print_record(rec)
+          }
+          hits = hits + 1
+          if max_hits >= 0 && hits >= max_hits {
+            stop = true
+          }
+        }
+      })
+    }
     if sort_by_time {
       collected
       .mut_view()
@@ -4940,6 +5121,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut service : String? = (None : String?)
       let mut host : String? = (None : String?)
       let mut trace_id : String? = (None : String?)
+      let mut level_min : String? = (None : String?)
+      let mut level_max : String? = (None : String?)
       let mut contains : String? = (None : String?)
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
@@ -4961,6 +5144,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--trace-id" && i + 1 < args.length() {
           trace_id = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--level-min" && i + 1 < args.length() {
+          level_min = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--level-max" && i + 1 < args.length() {
+          level_max = Some(args[i + 1])
           i = i + 1
         } else if a == "--contains" && i + 1 < args.length() {
           contains = Some(args[i + 1])
@@ -4989,6 +5178,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         service,
         host,
         trace_id,
+        level_min,
+        level_max,
         contains,
         since,
         until,

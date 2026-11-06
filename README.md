@@ -31,6 +31,7 @@
 - **生命周期 TTL**（3.4）：`<dir>/TTL` 策略文件——`default <days>` / `service <name> <days>` / `level <level> <days>`（`#` 注释、畸形行**整文件拒绝**）：对每条记录，service 匹配记录键（项目）、level 匹配解析的 level 字段，双命中取更严、无命中用 default（default 缺省且无命中 = 永不过期，days=0 即刻过期）；`ttl-expire [--dry-run]` 评估并**整段回收记录全部到期的段**（段级粒度——混合段等全部到期后回收，配 `--partition day` 让同日/同服务数据聚段；dry-run 只打印计划零副作用），应用运行将清理动作追加 `<dir>/TTL_AUDIT.log` JSONL 审计（ts/segments_dropped/records_expired/policy 原文）；`maintain`/`serve` 管线在策略文件存在时**自动执行**并逐轮审计。实测：service/level/default 三维差异化清理（到期段删除、混合段保留且过期计数入审计）、dry-run 零副作用、畸形策略拒绝、maintain 自动审计追加。
 - **副本与高可用**（3.5）：`replicate <src> <dst> [--follow]` 把源日志**增量镜像**为完整副本目录（同 `backup` 引擎：mtime 增量 skip、源端删除传播、sidecar/manifest 恒重拷；副本 offset/游标语义完整保留，可直接读写）——`--follow` 按周期（默认 200ms，`MOONLOG_REPLICATE_INTERVAL`）持续同步；**源目录消失时该轮明确失败而不重建空源**（防 follow 误清副本上的 failover 数据）。高可用语义（**单写者模型**，无自动仲裁）：failover = 客户端把读写切到副本目录（主不可达期间副本 scan/put/search 全部正常），并停掉指向旧主的 replicate 进程；rebalance = 原主恢复后反向 `replicate` 增量追赶（以新主为准，双向收敛）。实测：单轮全量同步、follow 增量追赶、主目录移除后副本读/写/检索正常、反向追赶后主副本逐记录一致。定位：目录级副本 + 手动/脚本化切换，不构成分布式共识（无 leader 选举/自动故障检测）。
 - **全文检索：通配符与中文**（4.1）：`search --wildcard`——`*` 匹配任意字节序列、`?` 精确匹配单字节（字节级：中文一字 3 个 UTF-8 字节，可用 `查询??????错误` 类模式或 `*` 跨汉字）、其余字符字面匹配（`--ignore-case` 折叠 ASCII）；**子串语义**（模式包裹 `*` 后做 greedy 回溯匹配，无正则引擎）；与 `--inverted` 互斥（词级倒排 vs 通配子串）。**中文关键词**由线性子串路径天然命中（UTF-8 字节级精确匹配，无需分词——"数据库"精确命中含该词的记录，短语同理），倒排索引面向 ASCII 词（CJK 不产 token，既有定位）。实测：中文关键词（`数据库`/`连接失败`）与英文关键词（线性+倒排回归）均命中；通配符 `data*se`/`*TIMEOUT`（+ignore-case）/`查询*错误`/`查询??????错误` 全语义正确；`--wildcard --inverted` 明确报错。
+- **结构化过滤：范围与下推**（4.2）：`query` 新增 `--level-min`/`--level-max`——按严重度有序范围过滤（core `level_rank` 五级 debug<info<warn<error<fatal，与 `--level` 精确可 AND 组合；**范围过滤要求已知 level，未知级别被排除**——与字段列下推语义一致）；**条件下推到存储层**：①时间界 `--since`/`--until` 经段级 `min_ts`/`max_ts` **跳过不相交段**（不解码段数据，线性与 indexed 路径均生效）；②`--indexed` 的下推从单等值扩展为**值列表**——level 范围展开为五级枚举中满足区间的值的字段列 postings 并集（矛盾区间得空候选集即零结果），service/host/trace_id 等值同样走列表形态。实测：`--level-min warn` linear/indexed 一致（3 条）、`--level-min warn --level-max error` 一致（2 条，fatal 排除）、`--level-min warn --service payments --since/--until` 多维组合一致（2 条）、时间窗只覆盖单桶时另一桶被跳过、`--level bogus` 报错。
 - **热温冷分层与归档**（3.6）：分层本体由 `tier` 承载（热=活跃段、温=已 roll 段 LZSS 压缩、冷=旧段迁独立 cold-dir + symlink 原子替换，M105）——cold-dir 可指向任意更廉价存储路径/设备，**跨层查询对用户完全透明**（scan/search/query/aggregate/fsck/backup/prune 经链接无感）；新增 `archive <dir> <file> [--list] [--extract --into <dir>]`——把目录数据文件（MANIFEST + 段 + sidecar）打包为**单一自包含归档文件**（`MLAR` 容器：file 表 + 内容 + 尾部 CRC32），单文件 PUT 即可上传任意对象存储（S3/OSS/OBS），`--extract` 解包到空目录后即可直接打开查询（跨层数据完整）；归档应针对**主目录**（symlink 穿透读取冷段数据），cold-dir 只含段本体不可独立恢复。实测：三桶 90 条 → tier 后热层少 2 段（温层 compressed=true、1 段迁冷）且 scan/aggregate/query 对冷段数据全部正常（透明）；归档 10 文件 9085B → 解包恢复副本 scan 90 条、冷段数据可查；CRC 破坏拒绝。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -246,17 +247,22 @@ search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
                               `--ignore-case` 在该模式下忽略；`--limit`
                               提前停止，`--from`/`--to` 限定 offset 区间
 query <dir> [--level <lv>] [--service <svc>] [--host <h>]
-              [--trace-id <id>] [--contains <text>] [--since <ts>]
-              [--until <ts>] [--limit N] [--indexed] [--sort-by-time]
-              [--json]
+              [--trace-id <id>] [--level-min <lv>] [--level-max <lv>]
+              [--contains <text>] [--since <ts>] [--until <ts>]
+              [--limit N] [--indexed] [--sort-by-time] [--json]
                               统一 Schema 联合过滤：全部给定条件按 AND 匹配
                               （`--service` 匹配记录键或解析的服务字段；
-                              `--contains` 大小写不敏感子串匹配 value；
+                              `--level-min`/`--level-max` 按严重度排序过
+                              滤（debug<info<warn<error<fatal，双界取区
+                              间；范围过滤要求已知 level——未知级别被排
+                              除）；`--contains` 大小写不敏感子串匹配 value；
                               `--since`/`--until` 限定记录时间戳区间，
                               epoch ms 含端点；`--limit` 提前停止）；
-                              `--indexed` 用第一个等值过滤经字段列索引
-                              预筛（sidecar lazy 构建，maintain 预建）
-                              再全条件精滤，无等值过滤时退回线性；
+                              **条件下推**（4.2）：时间界经段级 `min_ts`/
+                              `max_ts` 跳过不相交段（不解码），`--indexed`
+                              把等值或级别范围（展开为五级枚举并集）经字
+                              段列索引预筛（sidecar lazy 构建，maintain
+                              预建）再全条件精滤，无条件退回线性；
                               `--sort-by-time` 按事件时间排序输出（同刻
                               保持 offset 序）；`--json` 以单行 JSONL
                               输出；无 schema 的旧记录仍可按 key/
@@ -572,6 +578,7 @@ u32 crc32          (仅覆盖 body)
 - M123 副本与高可用（3.5）：CLI 新增 `replicate <src> <dst> [--follow]`（`replicate_pass` = flush 源 + `backup_log_dir` 增量镜像——副本目录始终是 offset/游标语义完整的可用日志；`--follow` 周期同步（`MOONLOG_REPLICATE_INTERVAL` 默认 200ms），**源目录消失时该轮明确失败（`source unavailable`）而不经 ensure_dir 重建空源**——该缺陷若不修，follow 轮会在主短暂消失后把副本裁剪到空态摧毁 failover 数据；源锁被占/不可达仅 WARN 重试、状态翻转才输出）；单写者高可用语义（failover = 切目录到副本 + 停旧 replicate 进程；rebalance = 反向 replicate 增量追赶）。实测：单轮全量 50 条、follow 增量 70 条、主目录移除后副本 scan/put/search 全部正常（down_k offset 50）、反向 replicate 后主 51 条且 `get 50` 正确、正向再同步双向收敛 51=51。开发注记：MoonBit 不支持 `let f = fn() -> T raise E { }` 类型化匿名 fn 表达式（Parse error ×13）——用顶层命名函数替代；沙箱 root 下 chmod 000 模拟宕机无效（root 绕过 DAC），须用 mv 目录模拟；SIGTERM kill 丢 stdout 缓冲导致 follow 的 WARN 无法从重定向文件观测（功能正常，观测局限）；backup_log_dir 的"dst 中源端不存在的段删除"清理在源短暂消失时是数据安全风险——replicate_pass 的存在性检查是防线
 - M124 热温冷分层与归档（3.6）：分层本体由 `tier` 承载（M105 已验收），本子项补**对象存储归档**等价物——CLI 新增 `archive <dir> <file> [--list] [--extract --into <dir>]`（`archive_pack`/`archive_entries`：`MLAR` 容器 magic+version+file 表+内容+尾部 CRC32，纯 CLI 文件操作零依赖，不集成对象存储 SDK——单文件 PUT 即可上传 S3/OSS/OBS）；归档应针对**主目录**（symlink 穿透读取冷段数据、MANIFEST+sidecar 齐全、解包后可直接打开），cold-dir 只含段本体不可独立恢复（README 注明）。实测：三桶 90 条 → `tier --warm 1` 后热层少 2 段（温层 compressed=true、1 段迁 cold-dir）且 **scan 90/aggregate 90/query 冷段数据全部正常（跨层透明复测）**；`archive` 打包 10 文件 9085B → `--list` 列出 → `--extract` 解包恢复副本 scan 90 条、`query --contains seq=61` 冷段命中；CRC 破坏（dd 改字节）→ `crc mismatch` 拒绝。开发注记：MoonBit 无 `Int.reinterpret_as_uint64`（用 `to_uint64()`）；UInt64 无 `to_int`——归档内容长度用 u32（现实段文件远小于 2GB）；**同轮并行编辑同一文件互相踩踏**（第一处落盘刷新 mtime 后其余被守卫拦截，FSM 却报成功——M118 守卫问题的新变体），同文件多处修改应串行或用 sed；`archive_entries` 的 raise 统一为 CLI 层 `IoError::Invalid`（MetaError 是 segment/core 包类型，跨包错误类型不兼容）
 - M125 全文检索通配符与中文验证（4.1）：core 新增 `wildcard_contains`（子串语义通配匹配——`*` 任意序列/`?` 单字节/字面字符 ASCII 折叠，greedy 双指针带回溯的经典算法、模式包裹 `*` 实现子串语义，无正则引擎；UTF-8 字节级参与故中文模式字面可用，+2 单测含中文模式）与 `search --wildcard`（线性路径的匹配器替换，按 `--field` 选择 key/value/both；与 `--inverted` 互斥报错）。验收"中文与英文关键词均可命中"：中文由线性子串路径天然精确命中（冒烟 `数据库`/`连接失败`），英文线性+倒排双路径回归；通配符冒烟 `data*se`/`*TIMEOUT`+ignore-case/`查询*错误`/`查询??????错误`（字节级 `?` 的中文演示）与互斥报错全部正确。开发注记：wc_match 初版循环未先判 pattern 耗尽导致 pattern.at(p) 越界 abort（经典通配算法的 pattern-exhausted 分支须走 `*` 回溯）；子串包裹下 `?` 的精确单字节不可用 contains 否定（尾星兜底吸收）——精确性用 `err??r` 类模式断言；**python 多替换脚本对同文件原子应用**是规避并行 edit 踩踏的可靠手段（fmt 重排过的锚文本须先 cat 实际行再写替换对）
+- M126 结构化过滤范围与下推（4.2）：`query` 新增 `--level-min`/`--level-max`（core 既有 `level_rank` 五级有序；范围过滤激活时要求已知 level——未知级别被排除，与字段列下推语义一致，冒烟曾暴露 linear 保留/indexed 排除的不一致后统一）；**条件下推到存储层**——①时间界下推：`query` 两条路径（线性重构为段循环、indexed 段循环）先按 `seg.min_ts`/`seg.max_ts` 判与 [since, until] 不相交则整段跳过（不解码）；②等值/范围下推：`idx_sel` 从单 `(field, value)` 扩展为 `(field, values[], also_key)`——level 范围展开为五级枚举区间内值的字段列 postings **并集**（矛盾区间空集即零结果），service/host/trace_id 等值转列表形态，全条件 AND 精滤不变。实测：`--level-min warn` linear/indexed 一致 3 条、`--level-min warn --level-max error` 一致 2 条（fatal 排除）、多维组合（level-min+service+time 窗口）一致 2 条、时间窗只覆盖单桶时另一桶数据不出现（下推跳段）、`--level bogus` 报错、宽窗口回归（修正冒烟脚本的时钟偏移——两次运行的 NOW-3d 不同导致窗口错位，非代码问题）。开发注记：`--indexed` 的 level 范围下推在数据含未知 level（verbose）时与线性路径语义不一致曾暴露（展开枚举不含未知值），统一为"范围过滤要求已知 level"；冒烟时间窗口要用宽界或数据实际 ts（时钟随运行推进）
 
 ## 许可
 
