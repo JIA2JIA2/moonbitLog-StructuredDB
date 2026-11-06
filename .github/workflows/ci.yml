@@ -79,6 +79,7 @@ jobs:
               "bench native sequential scan": 5.0,
               "bench range scan": 50.0,
               "bench segment recover": 30.0,
+              "bench append batch bulk write": 20.0,
           }
           text = open("bench_results.txt", encoding="utf-8").read()
           failed = []

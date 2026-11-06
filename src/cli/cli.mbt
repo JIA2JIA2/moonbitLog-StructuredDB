@@ -45,6 +45,10 @@
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
 ///                                    or /push ingests lines, GET /health,
 ///                                    GET /stats); SDK calls use Log::append
+///   bench-write <dir> <count> [--batch N] [--sync always|batch|never]
+///                [--prefix <p>]
+///                                    bulk-write benchmark: report throughput,
+///                                    then reopen and verify no record was lost
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off]
 ///                                    full-text search (linear scan) over keys
@@ -115,7 +119,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -2927,6 +2931,135 @@ fn cmd_rbac(
 }
 
 ///|
+/// Fixed 128-byte payload used by the write benchmark.
+fn make_bench_value() -> Bytes {
+  let chunk = b"0123456789abcdef0123456789abcdef"
+  let mut v : Bytes = b""
+  while v.length() < 128 {
+    v = v + chunk
+  }
+  @core.slice(v, 0, 128)
+}
+
+///|
+/// Bulk-write benchmark: append `count` records in batches of `--batch`
+/// (default 1000) under the given `--sync` policy, report throughput, then
+/// reopen the directory and verify that every record survived (exact count,
+/// contiguous offsets, clean fast fsck). Use an empty directory — the
+/// verification expects exactly `count` records.
+fn cmd_bench_write(
+  dir : String,
+  count_str : String,
+  batch_str : String?,
+  sync_str : String?,
+  prefix : String,
+) -> Unit raise @io.IoError {
+  let total = @string.parse_int64(count_str) catch {
+    _ => raise @io.IoError::Invalid("invalid count: " + count_str)
+  }
+  let batch_n : Int64 = match batch_str {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid batch: " + s)
+      }
+    None => 1000
+  }
+  if total <= (0 : Int64) || batch_n <= (0 : Int64) {
+    raise @io.IoError::Invalid("count and batch must be positive")
+  }
+  let sync = match sync_str {
+    Some("always") => @log.SyncPolicy::Always
+    Some("never") => @log.SyncPolicy::Never
+    Some("batch") => @log.SyncPolicy::Batch
+    Some(other) =>
+      raise @io.IoError::Invalid(
+        "invalid sync: " + other + " (always|batch|never)",
+      )
+    None => @log.SyncPolicy::Batch
+  }
+  let sync_label = if sync is @log.SyncPolicy::Always {
+    "always"
+  } else if sync is @log.SyncPolicy::Never {
+    "never"
+  } else {
+    "batch"
+  }
+  let value = make_bench_value()
+  let run_start = now_ms()
+  run_locked(dir, true, () => {
+    let log = @backend_native.open_log_dir(dir, ROLL_SIZE, sync~)
+    let ts = now_ms()
+    let mut written : Int64 = 0
+    while written < total {
+      let n = if total - written < batch_n { total - written } else { batch_n }
+      let records : Array[(Bytes, Bytes, Int64)] = []
+      let mut i : Int64 = 0
+      while i < n {
+        let idx = written + i
+        records.push((@utf8.encode(prefix + idx.to_string()), value, ts + idx))
+        i = i + 1
+      }
+      ignore(log.append_batch(records))
+      written = written + n
+    }
+    log.flush()
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+  })
+  let elapsed = now_ms() - run_start
+  let qps = if elapsed > (0 : Int64) {
+    total * 1000 / elapsed
+  } else {
+    total * 1000
+  }
+  println(
+    "wrote " +
+    total.to_string() +
+    " records in " +
+    elapsed.to_string() +
+    " ms (" +
+    qps.to_string() +
+    " records/s), batch " +
+    batch_n.to_string() +
+    ", sync " +
+    sync_label,
+  )
+  // Two-phase check: the writer closed the directory; reopening here proves
+  // the batch persisted with no loss.
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let recs = log.scan() catch { _ => panic() }
+    let count = recs.length().to_int64()
+    let mut continuous = count == total
+    let mut i = 0
+    while i < recs.length() {
+      if recs[i].offset != i.to_uint64() {
+        continuous = false
+      }
+      i = i + 1
+    }
+    let report = log.verify_fast()
+    let ok = continuous &&
+      report.first_bad_offset is None &&
+      report.first_bad_checksum is None
+    println(
+      "verify: records " +
+      count.to_string() +
+      " (expected " +
+      total.to_string() +
+      "), continuous " +
+      continuous.to_string() +
+      ", " +
+      (if ok { "ok (no loss)" } else { "FAILED" }),
+    )
+    close_log(log)
+    if !ok {
+      raise @io.IoError::Invalid("bench-write verification failed")
+    }
+  })
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -3173,6 +3306,30 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_http(args[2], port, format, key, key_field, ts_field)
+    }
+  } else if cmd == "bench-write" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut batch : String? = (None : String?)
+      let mut sync : String? = (None : String?)
+      let mut prefix = "bench:"
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--batch" && i + 1 < args.length() {
+          batch = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--sync" && i + 1 < args.length() {
+          sync = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--prefix" && i + 1 < args.length() {
+          prefix = args[i + 1]
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_bench_write(args[2], args[3], batch, sync, prefix)
     }
   } else if cmd == "search" {
     if args.length() < 4 {
