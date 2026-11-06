@@ -29,6 +29,13 @@
 ///   ttl-expire <dir> [--dry-run]     differentiated-TTL expiry per <dir>/TTL
 ///                                    (default/service/level rules); applied
 ///                                    runs append to TTL_AUDIT.log
+///   replicate <src> <dst> [--follow]
+///                                    incrementally mirror the source log into
+///                                    a complete replica directory (--follow
+///                                    repeats on an interval and only warns
+///                                    while the source is down); failover =
+///                                    point readers/writers at the replica,
+///                                    rebalance = replicate back
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   maintain <dir> <max-segments> [ttl]
 ///                                    merge + prune-superseded + compact-expired
@@ -156,7 +163,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1789,6 +1796,76 @@ fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
     print_verify(report)
     close_log(log)
   })
+}
+
+///|
+/// Poll interval for `replicate --follow`, overridable with
+/// `MOONLOG_REPLICATE_INTERVAL`.
+fn replicate_interval_ms() -> Int32 {
+  match @env.get_env_var("MOONLOG_REPLICATE_INTERVAL") {
+    Some(v) => @string.parse_int(v) catch { _ => 200 }
+    None => 200
+  }
+}
+
+///|
+/// One replicate pass: flush the source's data and metadata, then
+/// incrementally mirror it into `dst`. Returns the number of segments copied.
+/// A missing source fails the pass **without** recreating it — `ensure_dir`
+/// would otherwise silently rebuild an empty primary and the following
+/// backup pass would then prune the replica down to that empty state,
+/// destroying the failover copy.
+fn replicate_pass(src : String, dst : String) -> Int32 raise @io.IoError {
+  if !@backend_native.file_exists(src) {
+    raise @io.IoError::Invalid("source unavailable: " + src)
+  }
+  run_locked(src, true, () => {
+    let log = open_log(src)
+    log.flush()
+    @backend_native.flush_meta(src, log)
+    close_log(log)
+    @backend_native.backup_log_dir(src, dst)
+  })
+}
+
+///|
+/// Continuous replica sync (3.5): one pass flushes the source's data and
+/// metadata, then incrementally mirrors every changed segment, sidecar and
+/// manifest into `dst` — the same engine as `backup`, so `dst` is always a
+/// complete, fully usable log with preserved offsets and cursors. With
+/// `--follow` the pass repeats on an interval (default 200ms,
+/// `MOONLOG_REPLICATE_INTERVAL`); an unreachable, locked or corrupt source
+/// only logs a WARN and retries, leaving the replica readable and writable
+/// while the primary is down. Failover is directory-level: point reads and
+/// writes at the replica (single-writer by convention — no automatic
+/// arbitration), and rebalance by running `replicate` back from the promoted
+/// replica once the old primary returns.
+fn cmd_replicate(
+  src : String,
+  dst : String,
+  follow : Bool,
+) -> Unit raise @io.IoError {
+  if follow {
+    let mut was_ok = true
+    while true {
+      let n = replicate_pass(src, dst) catch { _ => -1 }
+      if n < 0 {
+        if was_ok {
+          println("WARN replicate: source unavailable, retrying")
+          was_ok = false
+        }
+      } else {
+        if n > 0 || !was_ok {
+          println("synced " + n.to_string() + " segment(s) to " + dst)
+        }
+        was_ok = true
+      }
+      @backend_native.sleep_ms(replicate_interval_ms())
+    }
+  } else {
+    let n = replicate_pass(src, dst)
+    println("synced " + n.to_string() + " segment(s) to " + dst)
+  }
 }
 
 ///|
@@ -4973,6 +5050,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_ttl_expire(args[2], dry)
+    }
+  } else if cmd == "replicate" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut follow = false
+      let mut i = 4
+      while i < args.length() {
+        if args[i] == "--follow" {
+          follow = true
+        }
+        i = i + 1
+      }
+      cmd_replicate(args[2], args[3], follow)
     }
   } else if cmd == "merge" {
     if args.length() < 4 {
