@@ -19,6 +19,7 @@
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
+- **告警监控**：**阈值告警** `alert`（按 UTC 窗口计数对比阈值）；**异常基线检测** `baseline`（窗口计数的均值/标准差 z-score，超 sigma 标记异常）；**多渠道通知分发**（stdout / `--notify-file` JSONL 追加 / `--webhook` 经 curl POST 且失败降级不中断）。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -167,6 +168,17 @@ cluster <dir> [--match <text>] [--top N]
 trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
                               趋势可视化：按 UTC 时间桶计数并以文本直方图
                               输出（按时间序，`--width` 控制最长条宽）
+alert <dir> <match> --threshold N [--window minute|hour|day]
+                [--notify-file <path>] [--webhook <url>] [--json]
+                              阈值告警：按 UTC 窗口统计匹配记录数，超过阈值
+                              的窗口告警（`--json` 输出事件；`--notify-file`
+                              追加 JSONL 通知；`--webhook` 经 curl POST，
+                              失败仅告警不中断）
+baseline <dir> [--match <text>] [--window minute|hour|day] [--sigma N]
+               [--min-windows N] [--notify-file <path>] [--webhook <url>]
+                              异常基线检测：按窗口计数计算均值/标准差，
+                              |z-score| > sigma（默认 3）且窗口数达标即标记
+                              异常，可走文件/webhook 通知
 version                       打印 moonlog 版本号（与 moon.mod 同步）
 ```
 
@@ -427,6 +439,7 @@ u32 crc32          (仅覆盖 body)
 - M105 热温冷分层存储：`tier_log_dir` 与 CLI `tier`——已 roll 段先原地压缩（温层），较旧的段复制进 cold 目录并以 symlink **原子替换**主路径（冷层），活跃段恒热；新增 symlink/lstat/readlink stub，`remove_segment_files` 联动清理冷副本；读/校验/备份/修复经链接透明，命令幂等并支持 `--dry-run` 计划
 - M106 日志检索：全文检索 CLI `search`（流式线性扫描 key/value 子串，`--field`/`--ignore-case`/`--limit`/`--from`/`--to`，无倒排索引、成本 O(records)，文档注明定位）与上下文关联检索 `context`（按 offset 打印前后 N 条，自动 clamp 边界并跨段）；新增 core 子串匹配器 `bytes_contains`/`bytes_contains_ci` 并有单测
 - M107 日志分析：`aggregate` 多维聚合（`--by key|value|kind|hour|prefix:N`、`--kv-field` 字段维度、`--match` 过滤、`--top`、`--json`）；`cluster` 错误聚类（core `normalize_log_template` 将数字/hex/引号串折叠为占位符后按模板计数）；`trend` 趋势直方图（core `format_utc` 的 UTC 分钟/小时/天标签 + 文本条）；顺带修复 `ensure_dir` 不支持父目录的缺陷（改为逐级递归创建，此前冒烟均手工 `mkdir -p` 而未暴露）
+- M108 告警监控：`alert` 阈值告警（UTC 窗口计数 vs `--threshold`，`--json` 事件）与 `baseline` 异常基线检测（窗口计数均值/标准差 z-score，`--sigma`/`--min-windows`）；多渠道通知分发（stdout + `--notify-file` JSONL 追加 + `--webhook` 经 `curl` POST，`shell_quote` 防注入、投递失败降级告警不中断，新增 `moonlog_run_command` stub）；配套为告警提供真实时间维度：`put --ts` 与 `ingest --ts-field`（kv 采集时从日志字段提取 timestamp）
 
 ## 许可
 

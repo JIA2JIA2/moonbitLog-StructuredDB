@@ -65,6 +65,10 @@ extern "C" fn moonlog_is_symlink(path : Bytes) -> Int32 = "moonlog_is_symlink"
 extern "C" fn moonlog_remove_with_link(path : Bytes) -> Int32 = "moonlog_remove_with_link"
 
 ///|
+#borrow(cmd)
+extern "C" fn moonlog_run_command(cmd : Bytes) -> Int32 = "moonlog_run_command"
+
+///|
 /// Number of buffered bytes at which an append is flushed to the descriptor.
 const WRITE_BUFFER_LIMIT : Int32 = 65536
 
@@ -1159,6 +1163,14 @@ pub fn is_symlink(path : String) -> Bool {
 /// success.
 pub fn symlink(target : String, link_path : String) -> Bool {
   moonlog_symlink(@utf8.encode(target), @utf8.encode(link_path)) >= 0
+}
+
+///|
+/// Run a shell command and return its exit status (0 on success). The caller
+/// must shell-quote any user-provided arguments (see `@core.shell_quote`);
+/// used for webhook-style notification delivery.
+pub fn run_command(cmd : String) -> Int32 {
+  moonlog_run_command(@utf8.encode(cmd))
 }
 
 ///|

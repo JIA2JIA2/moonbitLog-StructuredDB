@@ -103,3 +103,21 @@ fn split_kv_segment(seg : Bytes) -> (Bytes, Bytes)? {
   }
   None
 }
+
+///|
+/// Quote `s` as a single POSIX shell argument: the value is wrapped in single
+/// quotes and every embedded single quote becomes `'\''`. Safe for building
+/// `curl`-style command lines from user-provided URLs and payloads.
+pub fn shell_quote(s : String) -> String {
+  let sb = StringBuilder()
+  sb.write_string("'")
+  for ch in s {
+    if ch.to_int() == 39 {
+      sb.write_string("'\\''")
+    } else {
+      sb.write_char(ch)
+    }
+  }
+  sb.write_string("'")
+  sb.to_string()
+}

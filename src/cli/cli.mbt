@@ -52,6 +52,13 @@
 ///                                    error clustering by normalized template
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
 ///                                    time-bucket histogram as text bars
+///   alert <dir> <match> --threshold N [--window minute|hour|day]
+///                   [--notify-file <path>] [--webhook <url>] [--json]
+///                                    threshold alerting per UTC window
+///   baseline <dir> [--match <text>] [--window minute|hour|day] [--sigma N]
+///                    [--min-windows N] [--notify-file <path>] [--webhook <url>]
+///                                    baseline anomaly detection (mean/stddev
+///                                    z-score per window)
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
@@ -97,7 +104,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|alert|baseline|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -299,10 +306,18 @@ fn cmd_put(
   dir : String,
   key : String,
   value : String,
+  ts : String?,
 ) -> Unit raise @io.IoError {
+  let timestamp = match ts {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid timestamp: " + s)
+      }
+    None => now_ms()
+  }
   run_locked(dir, true, () => {
     let log = open_log(dir)
-    let off = log.append(@utf8.encode(key), @utf8.encode(value), now_ms())
+    let off = log.append(@utf8.encode(key), @utf8.encode(value), timestamp)
     println("offset " + off.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
@@ -1656,6 +1671,7 @@ fn cmd_ingest(
   format : String,
   key : String,
   key_field : String,
+  ts_field : String?,
   from : String?,
   batch : String?,
   interval : String?,
@@ -1679,6 +1695,10 @@ fn cmd_ingest(
   }
   let key_bytes = @utf8.encode(key)
   let field_bytes = @utf8.encode(key_field)
+  let ts_field_bytes : Bytes? = match ts_field {
+    Some(f) => Some(@utf8.encode(f))
+    None => None
+  }
   let cursor_name = "ingest-" + path_basename(file)
   let mut pos : Int64 = match from {
     Some(s) =>
@@ -1716,7 +1736,27 @@ fn cmd_ingest(
               key_bytes,
               field_bytes,
             )
-            ignore(log.append(k, v, ts_base + j.to_int64()))
+            let rec_ts = match ts_field_bytes {
+              Some(fb) => {
+                let pairs = @core.parse_kv_pairs(v)
+                let mut found : Int64? = None
+                for pair in pairs {
+                  if pair.0 == fb {
+                    found = Some(
+                      @string.parse_int64(bytes_to_string(pair.1)) catch {
+                        _ => ts_base + j.to_int64()
+                      },
+                    )
+                  }
+                }
+                match found {
+                  Some(t) => t
+                  None => ts_base + j.to_int64()
+                }
+              }
+              None => ts_base + j.to_int64()
+            }
+            ignore(log.append(k, v, rec_ts))
             j = j + 1
           }
           log.flush()
@@ -2168,6 +2208,276 @@ fn cmd_trend(
 }
 
 ///|
+/// Newton's method square root (no math library dependency).
+fn sqrt_double(x : Double) -> Double {
+  if x <= 0.0 {
+    return 0.0
+  }
+  let mut r = x
+  let mut i = 0
+  while i < 32 {
+    r = 0.5 * (r + x / r)
+    i = i + 1
+  }
+  r
+}
+
+///|
+fn abs_double(v : Double) -> Double {
+  if v < 0.0 {
+    -v
+  } else {
+    v
+  }
+}
+
+///|
+/// Deliver an alert event to the configured external channels: append it as a
+/// JSON line to `--notify-file` and/or POST it to `--webhook` via curl. The
+/// caller prints the human-readable line itself.
+fn dispatch_notification(
+  event_json : String,
+  notify_file : String?,
+  webhook : String?,
+) -> Unit raise @io.IoError {
+  match notify_file {
+    Some(path) => {
+      let existing = @backend_native.read_file(path)
+      @backend_native.write_file(
+        path,
+        existing + @utf8.encode(event_json + "\n"),
+      )
+    }
+    None => ()
+  }
+  match webhook {
+    Some(url) => {
+      let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+        @core.shell_quote(event_json) +
+        " " +
+        @core.shell_quote(url)
+      let rc = @backend_native.run_command(cmd)
+      if rc != 0 {
+        println(
+          "warning: webhook delivery failed (exit " + rc.to_string() + ")",
+        )
+      }
+    }
+    None => ()
+  }
+}
+
+///|
+/// Threshold alerting: count records matching `--match` per UTC window and
+/// alert on every window whose count exceeds `--threshold`. Alerts print to
+/// stdout and may additionally be delivered to `--notify-file` (JSON lines)
+/// and `--webhook` (curl POST). `--json` prints the alert events as JSON.
+fn cmd_alert(
+  dir : String,
+  match_text : String,
+  threshold : String,
+  window : String,
+  notify_file : String?,
+  webhook : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  if window != "minute" && window != "hour" && window != "day" {
+    raise @io.IoError::Invalid(
+      "invalid window: " + window + " (minute|hour|day)",
+    )
+  }
+  let threshold_n = @string.parse_int(threshold) catch {
+    _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
+  }
+  let needle = @utf8.encode(match_text)
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if match_needle(rec.key, needle, true) ||
+        match_needle(rec.value, needle, true) {
+        bump_string(counts, @core.format_utc(rec.timestamp, window))
+      }
+      true
+    })
+    let labels : Array[String] = []
+    for k in counts.keys() {
+      labels.push(k)
+    }
+    labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+    let mut alerts = 0
+    for label in labels {
+      let c = match counts.get(label) {
+        Some(c) => c
+        None => 0
+      }
+      if c > threshold_n {
+        alerts = alerts + 1
+        let event = "{\"kind\":\"threshold\",\"window\":\"" +
+          label +
+          "\",\"count\":" +
+          c.to_string() +
+          ",\"threshold\":" +
+          threshold_n.to_string() +
+          "}"
+        if json {
+          println(event)
+        } else {
+          println(
+            "ALERT " +
+            label +
+            " count=" +
+            c.to_string() +
+            " threshold=" +
+            threshold_n.to_string(),
+          )
+        }
+        dispatch_notification(event, notify_file, webhook)
+      }
+    }
+    println(
+      "(windows " +
+      labels.length().to_string() +
+      ", alerts " +
+      alerts.to_string() +
+      ")",
+    )
+    close_log(log)
+  })
+}
+
+///|
+/// Baseline anomaly detection: count records matching `--match` per UTC
+/// window, compute the mean and standard deviation of the window counts, and
+/// flag windows whose z-score exceeds `--sigma` (default 3) — provided at
+/// least `--min-windows` (default 3) windows exist. Flagged windows print to
+/// stdout and may be delivered to `--notify-file` (JSON lines).
+fn cmd_baseline(
+  dir : String,
+  match_text : String?,
+  window : String,
+  sigma : String?,
+  min_windows : String?,
+  notify_file : String?,
+  webhook : String?,
+) -> Unit raise @io.IoError {
+  if window != "minute" && window != "hour" && window != "day" {
+    raise @io.IoError::Invalid(
+      "invalid window: " + window + " (minute|hour|day)",
+    )
+  }
+  let sigma_i = match sigma {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid sigma: " + s)
+      }
+    None => 3
+  }
+  let sigma_v = sigma_i.to_double()
+  let min_n = match min_windows {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid min-windows: " + s)
+      }
+    None => 3
+  }
+  let needle : Bytes? = match match_text {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      let pass = match needle {
+        Some(n) =>
+          match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
+        None => true
+      }
+      if pass {
+        bump_string(counts, @core.format_utc(rec.timestamp, window))
+      }
+      true
+    })
+    let labels : Array[String] = []
+    for k in counts.keys() {
+      labels.push(k)
+    }
+    labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+    if labels.length() < min_n {
+      println(
+        "(insufficient windows: " +
+        labels.length().to_string() +
+        " < " +
+        min_n.to_string() +
+        ")",
+      )
+    } else {
+      let n = labels.length()
+      let mut sum = 0.0
+      for label in labels {
+        match counts.get(label) {
+          Some(c) => sum = sum + c.to_double()
+          None => ()
+        }
+      }
+      let mean = sum / n.to_double()
+      let mut var_sum = 0.0
+      for label in labels {
+        match counts.get(label) {
+          Some(c) => {
+            let d = c.to_double() - mean
+            var_sum = var_sum + d * d
+          }
+          None => ()
+        }
+      }
+      let stddev = sqrt_double(var_sum / n.to_double())
+      let mut anomalies = 0
+      for label in labels {
+        let c = match counts.get(label) {
+          Some(c) => c
+          None => 0
+        }
+        let z = if stddev > 0.0 { (c.to_double() - mean) / stddev } else { 0.0 }
+        let abnormal = abs_double(z) > sigma_v
+        if abnormal {
+          anomalies = anomalies + 1
+          let event = "{\"kind\":\"baseline\",\"window\":\"" +
+            label +
+            "\",\"count\":" +
+            c.to_string() +
+            ",\"z\":" +
+            z.to_string() +
+            "}"
+          dispatch_notification(event, notify_file, webhook)
+        }
+        println(
+          label +
+          "  count=" +
+          c.to_string() +
+          "  mean=" +
+          mean.to_string() +
+          "  sd=" +
+          stddev.to_string() +
+          "  z=" +
+          z.to_string() +
+          (if abnormal { "  ANOMALY" } else { "" }),
+        )
+      }
+      println(
+        "(windows " +
+        n.to_string() +
+        ", anomalies " +
+        anomalies.to_string() +
+        ")",
+      )
+    }
+    close_log(log)
+  })
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -2186,7 +2496,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 5 {
       println(USAGE)
     } else {
-      cmd_put(args[2], args[3], args[4])
+      let mut ts : String? = (None : String?)
+      let mut i = 5
+      while i < args.length() {
+        if args[i] == "--ts" && i + 1 < args.length() {
+          ts = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_put(args[2], args[3], args[4], ts)
     }
   } else if cmd == "put-if" {
     if args.length() < 6 {
@@ -2307,6 +2626,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
+      let mut ts_field : String? = (None : String?)
       let mut from : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -2335,6 +2655,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--interval" && i + 1 < args.length() {
           interval = Some(args[i + 1])
           i = i + 1
+        } else if a == "--ts-field" && i + 1 < args.length() {
+          ts_field = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -2345,6 +2668,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         format,
         key,
         key_field,
+        ts_field,
         from,
         batch,
         interval,
@@ -2475,6 +2799,85 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_trend(args[2], bucket, match_text, width)
+    }
+  } else if cmd == "alert" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut threshold : String? = (None : String?)
+      let mut window = "hour"
+      let mut notify_file : String? = (None : String?)
+      let mut webhook : String? = (None : String?)
+      let mut json = false
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a == "--threshold" && i + 1 < args.length() {
+          threshold = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--window" && i + 1 < args.length() {
+          window = args[i + 1]
+          i = i + 1
+        } else if a == "--notify-file" && i + 1 < args.length() {
+          notify_file = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--webhook" && i + 1 < args.length() {
+          webhook = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      match threshold {
+        Some(t) =>
+          cmd_alert(args[2], args[3], t, window, notify_file, webhook, json)
+        None => raise @io.IoError::Invalid("alert requires --threshold")
+      }
+    }
+  } else if cmd == "baseline" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut match_text : String? = (None : String?)
+      let mut window = "hour"
+      let mut sigma : String? = (None : String?)
+      let mut min_windows : String? = (None : String?)
+      let mut notify_file : String? = (None : String?)
+      let mut webhook : String? = (None : String?)
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--match" && i + 1 < args.length() {
+          match_text = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--window" && i + 1 < args.length() {
+          window = args[i + 1]
+          i = i + 1
+        } else if a == "--sigma" && i + 1 < args.length() {
+          sigma = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--min-windows" && i + 1 < args.length() {
+          min_windows = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--notify-file" && i + 1 < args.length() {
+          notify_file = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--webhook" && i + 1 < args.length() {
+          webhook = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_baseline(
+        args[2],
+        match_text,
+        window,
+        sigma,
+        min_windows,
+        notify_file,
+        webhook,
+      )
     }
   } else if cmd == "serve" {
     if args.length() < 4 {

@@ -349,3 +349,19 @@ int32_t moonlog_remove_with_link(moonbit_bytes_t path) {
   free(p);
   return r;
 }
+
+/*
+ * Run a shell command (used for webhook-style notification delivery). The
+ * command string must already be shell-quoted by the caller; returns the
+ * process exit status (0 on success).
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_run_command(moonbit_bytes_t cmd) {
+  char *c = moonlog_c_path(cmd);
+  if (c == NULL) {
+    return -1;
+  }
+  int r = system(c);
+  free(c);
+  return r;
+}

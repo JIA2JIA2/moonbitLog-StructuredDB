@@ -40,3 +40,10 @@ test "bytes_contains_ci folds ASCII case" {
   assert_true(!@core.bytes_contains_ci(b"hello", b"world"))
   assert_true(@core.bytes_contains_ci(b"x", b""))
 }
+
+///|
+test "shell_quote wraps and escapes single quotes" {
+  assert_eq(@core.shell_quote("plain"), "'plain'")
+  assert_eq(@core.shell_quote("a'b"), "'a'\\''b'")
+  assert_eq(@core.shell_quote(""), "''")
+}
