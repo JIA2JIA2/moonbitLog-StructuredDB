@@ -80,6 +80,25 @@ pub fn flush_stdout() -> Unit {
 }
 
 ///|
+/// Try to acquire one query-concurrency slot (4.6): non-blocking exclusive
+/// flock on `<dir>/QLOCK.<i>` (the base `moonlog_flock` is already
+/// LOCK_NB). Returns the held fd, or -1 when the slot is busy; the caller
+/// releases by closing the fd (CLI processes release all slots on exit).
+pub fn try_query_slot(dir : String, idx : Int32) -> Int32 {
+  let path = dir + "/QLOCK." + idx.to_string()
+  let fd = moonlog_open_rw(@utf8.encode(path))
+  if fd < 0 {
+    return -1
+  }
+  let r = moonlog_flock(fd, 1)
+  if r < 0 {
+    ignore(moonlog_close(fd))
+    return -1
+  }
+  fd
+}
+
+///|
 extern "C" fn moonlog_tcp_listen(port : Int32) -> Int32 = "moonlog_tcp_listen"
 
 ///|

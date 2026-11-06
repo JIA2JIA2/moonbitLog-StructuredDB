@@ -3260,6 +3260,123 @@ fn cmd_search(
 }
 
 ///|
+/// Query timeout (4.6): a query whose per-segment guard notices the elapsed
+/// time over this bound aborts with a diagnostic. Default 30s, 0 disables;
+/// override with `MOONLOG_QUERY_TIMEOUT_MS` or per-query `--timeout`.
+fn query_timeout_ms() -> Int64 {
+  match @env.get_env_var("MOONLOG_QUERY_TIMEOUT_MS") {
+    Some(v) => @string.parse_int64(v) catch { _ => 30_000_000L / 1000L }
+    None => 30000L
+  }
+}
+
+///|
+/// Max concurrent queries per directory (4.6): enforced with flock slots on
+/// `<dir>/QLOCK.<i>`; a query that cannot get a slot within the lock timeout
+/// is rejected. Default 4; override with `MOONLOG_MAX_CONCURRENT_QUERIES`.
+fn max_concurrent_queries() -> Int32 {
+  match @env.get_env_var("MOONLOG_MAX_CONCURRENT_QUERIES") {
+    Some(v) => @string.parse_int(v) catch { _ => 4 }
+    None => 4
+  }
+}
+
+///|
+/// Scan budget (4.6): a query whose pushed-down scan set exceeds this many
+/// bytes aborts before doing the work. Default 512MB, 0 disables; override
+/// with `MOONLOG_MAX_SCAN_BYTES`.
+fn max_scan_bytes() -> Int64 {
+  match @env.get_env_var("MOONLOG_MAX_SCAN_BYTES") {
+    Some(v) => @string.parse_int64(v) catch { _ => 536870912 }
+    None => 536870912
+  }
+}
+
+///|
+/// Acquire one query-concurrency slot (4.6), retrying on a small interval
+/// for up to the lock timeout before rejecting the query. The slot is held
+/// until the process exits (CLI queries are short-lived).
+fn acquire_query_slot(dir : String) -> Unit raise @io.IoError {
+  let max = max_concurrent_queries()
+  let deadline = now_ms() + lock_timeout_ms().to_int64()
+  let mut idx : Int32 = 0
+  while true {
+    let fd = @backend_native.try_query_slot(dir, idx)
+    if fd >= 0 {
+      // Held on purpose for the rest of this process; no explicit release.
+      return
+    }
+    idx = idx + 1
+    if idx >= max {
+      if now_ms() >= deadline {
+        raise @io.IoError::Invalid(
+          "too many concurrent queries (limit " +
+          max.to_string() +
+          "); wait for one to finish or raise MOONLOG_MAX_CONCURRENT_QUERIES",
+        )
+      }
+      idx = 0
+      @backend_native.sleep_ms(20)
+    }
+  }
+}
+
+///|
+/// Per-query guard (4.6): accumulates the pushed-down scan set and aborts
+/// the query when the timeout or the scan budget is exceeded — one runaway
+/// query cannot hold the store.
+struct QueryGuard {
+  t0 : Int64
+  timeout : Int64
+  budget : Int64
+  mut scanned : Int64
+  mut segs : Int32
+}
+
+///|
+/// Account one segment (or 0 bytes for an in-segment sampling tick) and
+/// return the violation message when the timeout or scan budget is exceeded
+/// (0 disables either). Non-raising so record-level callbacks can call it.
+fn QueryGuard::check_soft(self : QueryGuard, seg_size : Int64) -> String? {
+  self.segs = self.segs + 1
+  self.scanned = self.scanned + seg_size
+  let elapsed = now_ms() - self.t0
+  if self.timeout > 0 && elapsed > self.timeout {
+    return Some(
+      "query timeout after " +
+      elapsed.to_string() +
+      " ms (" +
+      self.segs.to_string() +
+      " segments, " +
+      self.scanned.to_string() +
+      " bytes scanned); narrow the time range or raise MOONLOG_QUERY_TIMEOUT_MS",
+    )
+  }
+  if self.budget > 0 && self.scanned > self.budget {
+    return Some(
+      "scan budget exceeded: " +
+      self.scanned.to_string() +
+      " bytes > " +
+      self.budget.to_string() +
+      " (narrow the time range or raise MOONLOG_MAX_SCAN_BYTES)",
+    )
+  }
+  None
+}
+
+///|
+/// Account one segment and raise on violation (for non-callback contexts).
+fn QueryGuard::check(
+  self : QueryGuard,
+  seg_size : Int64,
+) -> Unit raise @io.IoError {
+  match self.check_soft(seg_size) {
+    Some(m) => raise @io.IoError::Invalid(m)
+    None => ()
+  }
+}
+
+///|
 /// Default query time window (4.3): scans without an explicit `--since` are
 /// scoped to the last this-many milliseconds (24h), so a forgotten time
 /// bound cannot trigger an unbounded scan. Override with
@@ -3314,6 +3431,7 @@ fn cmd_query(
   sort_by_time : Bool,
   json : Bool,
   require_time : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   let level_b : Bytes? = match level {
     Some(s) => Some(@utf8.encode(s))
@@ -3359,6 +3477,22 @@ fn cmd_query(
         )
         Some(now_ms() - win)
       }
+  }
+  // 4.6 query guard: concurrency slot, per-segment timeout and scan budget.
+  acquire_query_slot(dir)
+  let timeout_val : Int64 = match timeout {
+    Some(t) =>
+      @string.parse_int64(t) catch {
+        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
+      }
+    None => query_timeout_ms()
+  }
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: timeout_val,
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
   }
   let until_ts : Int64? = match until {
     Some(s) =>
@@ -3467,8 +3601,12 @@ fn cmd_query(
         let log = open_log(dir)
         let mut hits = 0
         let mut stop = false
+        let mut abort_msg : String? = None
         for seg in log.segments {
           if stop {
+            break
+          }
+          if abort_msg is Some(_) {
             break
           }
           // Pushdown (4.2): skip segments disjoint from the time bounds.
@@ -3482,6 +3620,7 @@ fn cmd_query(
               None => ()
             }
           }
+          qg.check(seg.size)
           seg.ensure_inv_index()
           let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([],
           )
@@ -3513,7 +3652,19 @@ fn cmd_query(
               0
             }
           })
+          let mut seen_cands : Int32 = 0
           for off in cands {
+            seen_cands = seen_cands + 1
+            // Record-granularity timeout sampling (4.6).
+            if seen_cands % 512 == 0 {
+              match qg.check_soft(0) {
+                Some(m) => abort_msg = Some(m)
+                None => ()
+              }
+            }
+            if abort_msg is Some(_) {
+              break
+            }
             if max_hits >= 0 && hits >= max_hits {
               stop = true
               break
@@ -3592,6 +3743,10 @@ fn cmd_query(
             }
           }
         }
+        match abort_msg {
+          Some(m) => raise @io.IoError::Invalid(m)
+          None => ()
+        }
         println("(" + hits.to_string() + " matches) (indexed)")
         close_log(log)
       })
@@ -3604,8 +3759,12 @@ fn cmd_query(
     let mut hits = 0
     let collected : Array[@core.Record] = []
     let mut stop = false
+    let mut abort_msg : String? = None
     for seg in log.segments {
       if stop {
+        break
+      }
+      if abort_msg is Some(_) {
         break
       }
       // Pushdown (4.2): skip segments whose time range is disjoint from the
@@ -3620,8 +3779,19 @@ fn cmd_query(
           None => ()
         }
       }
+      qg.check(seg.size)
+      let mut seen_in_seg : Int32 = 0
       seg.for_each(seg.base_offset, seg.next_offset, rec => {
-        if stop {
+        seen_in_seg = seen_in_seg + 1
+        // Record-granularity timeout sampling (4.6): segment-level checks
+        // alone miss a runaway scan inside one huge segment.
+        if seen_in_seg % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => abort_msg = Some(m)
+            None => ()
+          }
+        }
+        if stop || abort_msg is Some(_) {
           return
         }
         let mut hit = true
@@ -3696,6 +3866,10 @@ fn cmd_query(
           }
         }
       })
+    }
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
     }
     if sort_by_time {
       collected
@@ -5373,6 +5547,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut sort_by_time = false
       let mut json = false
       let mut require_time = false
+      let mut timeout : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -5412,6 +5587,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           sort_by_time = true
         } else if a == "--require-time" {
           require_time = true
+        } else if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
         } else if a == "--json" {
           json = true
         }
@@ -5433,6 +5611,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         sort_by_time,
         json,
         require_time,
+        timeout,
       )
     }
   } else if cmd == "context" {
