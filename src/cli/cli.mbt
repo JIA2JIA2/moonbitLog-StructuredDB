@@ -4416,6 +4416,7 @@ fn cmd_cluster(
   dir : String,
   match_text : String?,
   top : String?,
+  stacks : Bool,
 ) -> Unit raise @io.IoError {
   let top_n = match top {
     Some(s) =>
@@ -4430,6 +4431,74 @@ fn cmd_cluster(
       None => "error"
     },
   )
+  if stacks {
+    // Stack-aware clustering (5.2): a stack-frame line (Java "at ...",
+    // Python "File ...", "Caused by: ...") is merged into the cluster of the
+    // nearest preceding non-frame record (its exception header), so the same
+    // exception raised with different ids/line numbers collapses into one
+    // cluster with a frame count. Orphan frames (no preceding header) fall
+    // back to their own template clusters.
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+      let frames : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+      let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
+      let mut current : Bytes? = None
+      log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+        let pass = match_needle(rec.key, needle, true) ||
+          match_needle(rec.value, needle, true)
+        if pass {
+          if @core.is_stack_frame(rec.value) {
+            match current {
+              Some(k) => bump_bytes(frames, k)
+              None =>
+                bump_bytes(counts, @core.normalize_log_template(rec.value))
+            }
+          } else {
+            let tpl = @core.normalize_log_template(rec.value)
+            bump_bytes(counts, tpl)
+            current = Some(tpl)
+            match samples.get(tpl) {
+              None => samples.set(tpl, rec.value)
+              Some(_) => ()
+            }
+          }
+        }
+        true
+      })
+      let items : Array[(Bytes, Int32)] = []
+      for k in counts.keys() {
+        match counts.get(k) {
+          Some(c) => items.push((k, c))
+          None => ()
+        }
+      }
+      let shown = top_counts(items, top_n)
+      println("count  frames  template  | sample")
+      for item in shown {
+        let fr = match frames.get(item.0) {
+          Some(f) => f
+          None => 0
+        }
+        let sample = match samples.get(item.0) {
+          Some(sv) => bytes_to_string(sv)
+          None => ""
+        }
+        println(
+          item.1.to_string() +
+          "  " +
+          fr.to_string() +
+          "  " +
+          bytes_to_string(item.0) +
+          "  | " +
+          sample,
+        )
+      }
+      println("(" + counts.length().to_string() + " clusters)")
+      close_log(log)
+    })
+    return
+  }
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
@@ -5866,6 +5935,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut match_text : String? = (None : String?)
       let mut top : String? = (None : String?)
+      let mut stacks = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -5875,10 +5945,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--top" && i + 1 < args.length() {
           top = Some(args[i + 1])
           i = i + 1
+        } else if a == "--stacks" {
+          stacks = true
         }
         i = i + 1
       }
-      cmd_cluster(args[2], match_text, top)
+      cmd_cluster(args[2], match_text, top, stacks)
     }
   } else if cmd == "trend" {
     if args.length() < 3 {

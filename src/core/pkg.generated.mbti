@@ -25,6 +25,8 @@ pub fn fnv1a_hash(Bytes) -> UInt32
 
 pub fn format_utc(Int64, String) -> String
 
+pub fn is_stack_frame(Bytes) -> Bool
+
 pub fn json_object_fields(Bytes) -> Array[(Bytes, Bytes)] raise @json.ParseError
 
 pub fn level_rank(Bytes) -> Int32
