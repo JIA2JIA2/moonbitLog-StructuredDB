@@ -36,6 +36,11 @@
 ///                                    while the source is down); failover =
 ///                                    point readers/writers at the replica,
 ///                                    rebalance = replicate back
+///   archive <dir> <file> [--list] [--extract --into <dir>]
+///                                    pack a log directory into a single
+///                                    self-contained archive file (CRC32) for
+///                                    object-storage upload; list or extract
+///                                    and restore its contents
 ///   merge <dir> <max-segments>       merge contiguous rolled segments
 ///   maintain <dir> <max-segments> [ttl]
 ///                                    merge + prune-superseded + compact-expired
@@ -163,7 +168,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1602,6 +1607,173 @@ fn cmd_tier(
       println("tiered " + moved.to_string() + " segments cold into " + cold_dir)
     })
   }
+}
+
+///|
+const ARCHIVE_MAGIC : UInt32 = 0x4D4C4152
+
+///|
+fn archive_u32(data : Bytes, pos : Int32) -> UInt32 {
+  data.at(pos).to_uint() |
+  (data.at(pos + 1).to_uint() << 8) |
+  (data.at(pos + 2).to_uint() << 16) |
+  (data.at(pos + 3).to_uint() << 24)
+}
+
+///|
+/// Log data files worth archiving: the manifest, segment files and every
+/// sidecar (.index/.keys/.inv).
+fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
+  let out : Array[String] = []
+  for name in @backend_native.list_dir(dir) {
+    if name == "MANIFEST" ||
+      name.has_suffix(".log") ||
+      name.has_suffix(".log.index") ||
+      name.has_suffix(".log.keys") ||
+      name.has_suffix(".log.inv") {
+      out.push(name)
+    }
+  }
+  out
+}
+
+///|
+/// Pack `dir`'s log data files (MANIFEST, segments, sidecars) into the single
+/// archive `file` — magic, version, file table, contents, trailing CRC32 — a
+/// self-contained artifact that one PUT can place into any object store (3.6).
+/// Returns the number of files packed.
+fn archive_pack(dir : String, file : String) -> Int32 raise @io.IoError {
+  let names = archive_file_names(dir)
+  if names.length() == 0 {
+    raise @io.IoError::Invalid("no log data files in " + dir)
+  }
+  let body = @buffer.Buffer::Buffer()
+  body.write_uint_le(ARCHIVE_MAGIC)
+  body.write_uint_le((1 : UInt32))
+  body.write_uint_le(names.length().reinterpret_as_uint())
+  for name in names {
+    let content = @backend_native.read_file(dir + "/" + name)
+    let nb = @utf8.encode(name)
+    body.write_uint_le(nb.length().reinterpret_as_uint())
+    body.write_bytes(nb)
+    body.write_uint_le(content.length().reinterpret_as_uint())
+    body.write_bytes(content)
+  }
+  let bytes = body.to_bytes()
+  let out = @buffer.Buffer::Buffer()
+  out.write_bytes(bytes)
+  out.write_uint_le(@core.crc32(bytes))
+  @backend_native.write_file(file, out.to_bytes())
+  names.length()
+}
+
+///|
+/// Parse and validate an archive produced by `archive_pack`: magic, version
+/// and the trailing CRC32; returns (name, content) pairs in order. Malformed
+/// archives raise `IoError::Invalid` (the CLI-level error type).
+fn archive_entries(data : Bytes) -> Array[(String, Bytes)] raise @io.IoError {
+  let bad = fn(why : String) -> @io.IoError {
+    @io.IoError::Invalid("invalid archive file: " + why)
+  }
+  let total = data.length()
+  if total < 20 {
+    raise bad("truncated")
+  }
+  if archive_u32(data, 0) != ARCHIVE_MAGIC {
+    raise bad("bad magic")
+  }
+  if archive_u32(data, 4) != (1 : UInt32) {
+    raise bad("bad version")
+  }
+  let body_end = total - 4
+  let expected = archive_u32(data, body_end)
+  let actual = @core.crc32_range(data, 0, body_end)
+  if expected != actual {
+    raise bad("crc mismatch")
+  }
+  let count = archive_u32(data, 8).reinterpret_as_int()
+  let out : Array[(String, Bytes)] = []
+  let mut pos = 12
+  let mut i = 0
+  while i < count {
+    // Entry layout (matching archive_pack): name_len u32, name bytes,
+    // content_len u32, content bytes.
+    if pos + 4 > body_end {
+      raise bad("truncated entry header")
+    }
+    let name_len = archive_u32(data, pos).reinterpret_as_int()
+    if name_len < 0 {
+      raise bad("bad name length")
+    }
+    let name_start = pos + 4
+    let len_at = name_start + name_len
+    if len_at + 4 > body_end {
+      raise bad("truncated entry header")
+    }
+    let content_len = archive_u32(data, len_at).reinterpret_as_int()
+    let content_start = len_at + 4
+    if content_len < 0 || content_start + content_len > body_end {
+      raise bad("truncated entry")
+    }
+    let name = bytes_to_string(
+      @core.slice(data, name_start, name_start + name_len),
+    )
+    out.push(
+      (name, @core.slice(data, content_start, content_start + content_len)),
+    )
+    pos = content_start + content_len
+    i = i + 1
+  }
+  if pos != body_end {
+    raise bad("trailing garbage")
+  }
+  out
+}
+
+///|
+/// Object-storage archive for tiered logs (3.6): pack a directory's log data
+/// files into a single self-contained file (CRC32 checked) that one PUT can
+/// upload to any object store. `--list` prints the contents; `--extract
+/// --into <dir>` restores them into a directory (validated).
+fn cmd_archive(
+  dir : String,
+  file : String,
+  list : Bool,
+  extract : Bool,
+  into : String?,
+) -> Unit raise @io.IoError {
+  if list {
+    let entries = archive_entries(@backend_native.read_file(file))
+    for pair in entries {
+      println(pair.0 + "  " + pair.1.length().to_string() + " bytes")
+    }
+    println("(" + entries.length().to_string() + " files)")
+    return
+  }
+  if extract {
+    let dst = match into {
+      Some(d) => d
+      None => raise @io.IoError::Invalid("--extract requires --into <dir>")
+    }
+    ignore(@backend_native.ensure_dir(dst))
+    let entries = archive_entries(@backend_native.read_file(file))
+    for pair in entries {
+      @backend_native.write_file(dst + "/" + pair.0, pair.1)
+      println("extracted " + pair.0)
+    }
+    return
+  }
+  let n = archive_pack(dir, file)
+  let size = @backend_native.file_size(file)
+  println(
+    "archived " +
+    n.to_string() +
+    " file(s) to " +
+    file +
+    " (" +
+    size.to_string() +
+    " bytes)",
+  )
 }
 
 ///|
@@ -5064,6 +5236,28 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_replicate(args[2], args[3], follow)
+    }
+  } else if cmd == "archive" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut list = false
+      let mut extract = false
+      let mut into : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--list" {
+          list = true
+        } else if a == "--extract" {
+          extract = true
+        } else if a == "--into" && i + 1 < args.length() {
+          into = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_archive(args[2], args[3], list, extract, into)
     }
   } else if cmd == "merge" {
     if args.length() < 4 {
