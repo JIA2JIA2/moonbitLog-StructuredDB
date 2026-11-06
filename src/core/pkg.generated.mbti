@@ -18,7 +18,11 @@ pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
 
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
 
+pub fn fnv1a_hash(Bytes) -> UInt32
+
 pub fn format_utc(Int64, String) -> String
+
+pub fn level_rank(Bytes) -> Int32
 
 pub fn lz_compress(Bytes) -> Bytes
 
@@ -39,6 +43,10 @@ pub fn rbac_find(Array[RbacRole], Bytes) -> RbacRole?
 pub fn rle_compress(Bytes) -> Bytes
 
 pub fn rle_decompress(Bytes, Int64) -> Bytes raise MetaError
+
+pub fn sample_passes(Bytes, Int32) -> Bool
+
+pub fn sampling_allows(Bytes, Bytes, SamplingConfig) -> Bool
 
 pub fn shell_quote(String) -> String
 
@@ -94,6 +102,14 @@ pub fn RecordKind::not_equal(Self, Self) -> Bool
 pub fn RecordKind::to_repr(Self) -> @debug.Repr
 pub impl Eq for RecordKind
 pub impl @debug.Debug for RecordKind
+
+pub(all) struct SamplingConfig {
+  min_level : Int32
+  level_field : Bytes
+  sample_rate : Int32
+  include_text : Bytes
+  exclude_text : Bytes
+}
 
 // Type aliases
 

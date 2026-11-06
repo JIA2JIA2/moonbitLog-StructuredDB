@@ -1713,6 +1713,7 @@ fn cmd_ingest(
   key_field : String,
   ts_field : String?,
   idempotent : Bool,
+  sampling : @core.SamplingConfig?,
   from : String?,
   batch : String?,
   interval : String?,
@@ -1743,6 +1744,7 @@ fn cmd_ingest(
   if fifo {
     cmd_ingest_fifo(
       dir, file, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
+      sampling,
     )
     return
   }
@@ -1757,6 +1759,7 @@ fn cmd_ingest(
   }
   let mut total = 0
   let mut duplicates = 0
+  let mut sampled_out = 0
   let mut go = true
   while go {
     let size = @backend_native.file_size(file)
@@ -1766,10 +1769,12 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let written = ingest_lines(
+      let (written, sampled) = ingest_lines(
         dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
+        sampling,
       )
-      duplicates = duplicates + (lines.length() - written)
+      duplicates = duplicates + (lines.length() - written - sampled)
+      sampled_out = sampled_out + sampled
       total = total + written
       pos = pos + consumed
       @backend_native.save_named_cursor(
@@ -1789,11 +1794,17 @@ fn cmd_ingest(
   } else {
     ""
   }
+  let sampled_note = if sampled_out > 0 {
+    " (" + sampled_out.to_string() + " sampled out)"
+  } else {
+    ""
+  }
   println(
     "ingested " +
     total.to_string() +
     " records" +
     dup_note +
+    sampled_note +
     " (position " +
     pos.to_string() +
     ", cursor " +
@@ -1836,7 +1847,10 @@ fn ingest_timestamp(
 /// Append parsed lines to the log in batches of `batch_n`, flushing and
 /// persisting metadata per batch. With `idempotent`, a line whose (key, value)
 /// matches the key's latest live record is recognized as a duplicate delivery
-/// and skipped. Returns the number of records actually appended.
+/// and skipped. With a sampling config, lines are filtered at the source
+/// (severity, include/exclude rules, deterministic rate). Returns `(written,
+/// sampled_out)` — the number of records actually appended and how many the
+/// sampler dropped.
 fn ingest_lines(
   dir : String,
   lines : Array[Bytes],
@@ -1846,9 +1860,11 @@ fn ingest_lines(
   ts_field_bytes : Bytes?,
   batch_n : Int32,
   idempotent : Bool,
-) -> Int32 raise @io.IoError {
+  sampling : @core.SamplingConfig?,
+) -> (Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
+  let mut sampled_out = 0
   let mut i = 0
   while i < lines.length() {
     let chunk_end = if i + batch_n < lines.length() {
@@ -1857,20 +1873,33 @@ fn ingest_lines(
       lines.length()
     }
     let mut chunk_written = 0
+    let mut chunk_sampled = 0
     run_locked(dir, true, () => {
       let log = open_log(dir)
       let mut j = i
       while j < chunk_end {
         let (k, v) = parse_ingest_line(lines[j], format, key_bytes, field_bytes)
-        let rec_ts = ingest_timestamp(v, ts_field_bytes, ts_base + j.to_int64())
-        if idempotent {
-          let (added, _) = log.append_idempotent(k, v, rec_ts)
-          if added {
+        let keep = match sampling {
+          Some(cfg) => @core.sampling_allows(lines[j], v, cfg)
+          None => true
+        }
+        if keep {
+          let rec_ts = ingest_timestamp(
+            v,
+            ts_field_bytes,
+            ts_base + j.to_int64(),
+          )
+          if idempotent {
+            let (added, _) = log.append_idempotent(k, v, rec_ts)
+            if added {
+              chunk_written = chunk_written + 1
+            }
+          } else {
+            ignore(log.append(k, v, rec_ts))
             chunk_written = chunk_written + 1
           }
         } else {
-          ignore(log.append(k, v, rec_ts))
-          chunk_written = chunk_written + 1
+          chunk_sampled = chunk_sampled + 1
         }
         j = j + 1
       }
@@ -1879,9 +1908,104 @@ fn ingest_lines(
       close_log(log)
     })
     written = written + chunk_written
+    sampled_out = sampled_out + chunk_sampled
     i = chunk_end
   }
-  written
+  (written, sampled_out)
+}
+
+///|
+/// Parse the sampling options shared by `ingest` and `http`: `--min-level`,
+/// `--level-field`, `--sample-rate`, `--include`, `--exclude`. Returns None
+/// when no sampling knob was given (the zero-overhead path).
+fn parse_sampling_config(
+  min_level_str : String?,
+  level_field_str : String?,
+  sample_rate_str : String?,
+  include_str : String?,
+  exclude_str : String?,
+) -> @core.SamplingConfig? raise @io.IoError {
+  let min_level = match min_level_str {
+    Some(s) =>
+      match s {
+        "debug" => 0
+        "info" => 1
+        "warn" => 2
+        "warning" => 2
+        "error" => 3
+        "fatal" => 4
+        _ =>
+          raise @io.IoError::Invalid(
+            "invalid level: " + s + " (debug|info|warn|error|fatal)",
+          )
+      }
+    None => -1
+  }
+  let rate = match sample_rate_str {
+    Some(s) => {
+      let r = @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid sample rate: " + s)
+      }
+      if r < 0 || r > 100 {
+        raise @io.IoError::Invalid("sample rate must be 0-100")
+      }
+      r
+    }
+    None => 100
+  }
+  let include_bytes = match include_str {
+    Some(s) => @utf8.encode(s)
+    None => b""
+  }
+  let exclude_bytes = match exclude_str {
+    Some(s) => @utf8.encode(s)
+    None => b""
+  }
+  let level_field = @utf8.encode(
+    match level_field_str {
+      Some(f) => f
+      None => "level"
+    },
+  )
+  if min_level < 0 &&
+    rate >= 100 &&
+    include_bytes.length() == 0 &&
+    exclude_bytes.length() == 0 {
+    return None
+  }
+  Some({
+    min_level,
+    level_field,
+    sample_rate: rate,
+    include_text: include_bytes,
+    exclude_text: exclude_bytes,
+  })
+}
+
+///|
+/// Apply the sampling pipeline to raw lines before they enter the HTTP queue.
+/// Returns the kept lines and how many were sampled out.
+fn sampling_filter_lines(
+  lines : Array[Bytes],
+  format : String,
+  sampling : @core.SamplingConfig?,
+) -> (Array[Bytes], Int32) {
+  match sampling {
+    None => (lines, 0)
+    Some(cfg) => {
+      let kept : Array[Bytes] = []
+      let mut dropped = 0
+      for line in lines {
+        let value = parse_ingest_line(line, format, b"", b"").1
+        if @core.sampling_allows(line, value, cfg) {
+          kept.push(line)
+        } else {
+          dropped = dropped + 1
+        }
+      }
+      (kept, dropped)
+    }
+  }
 }
 
 ///|
@@ -1897,6 +2021,7 @@ fn cmd_ingest_fifo(
   ts_field_bytes : Bytes?,
   batch_n : Int32,
   idempotent : Bool,
+  sampling : @core.SamplingConfig?,
 ) -> Unit raise @io.IoError {
   let mut total = 0
   while true {
@@ -1915,11 +2040,11 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          total = total +
-            ingest_lines(
-              dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
-              idempotent,
-            )
+          let (written, _) = ingest_lines(
+            dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+            idempotent, sampling,
+          )
+          total = total + written
         }
       }
     }
@@ -1991,6 +2116,8 @@ struct HttpQueue {
   alert_threshold : Int32
   mut alerts : Int32
   idempotent : Bool
+  sampling : @core.SamplingConfig?
+  format : String
 }
 
 ///|
@@ -2039,6 +2166,7 @@ fn http_queue_drain(
       ts_field_bytes,
       take,
       q.idempotent,
+      None,
     ),
   )
   if q.head > 4096 && q.head * 2 > q.lines.length() {
@@ -2131,12 +2259,17 @@ fn handle_http_connection(
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
     }
-    if http_queue_enqueue(q, lines) {
+    // Source-side sampling runs before the queue, so the capacity below counts
+    // only lines that will actually be written.
+    let (kept, sampled_out) = sampling_filter_lines(lines, q.format, q.sampling)
+    if http_queue_enqueue(q, kept) {
       http_respond(
         conn,
         202,
         "{\"accepted\":" +
-        lines.length().to_string() +
+        kept.length().to_string() +
+        ",\"sampled_out\":" +
+        sampled_out.to_string() +
         ",\"pending\":" +
         q.pending.to_string() +
         "}",
@@ -2174,6 +2307,7 @@ fn cmd_http(
   key_field : String,
   ts_field : String?,
   idempotent : Bool,
+  sampling : @core.SamplingConfig?,
 ) -> Unit raise @io.IoError {
   if format != "lines" && format != "kv" {
     raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
@@ -2247,6 +2381,8 @@ fn cmd_http(
     alert_threshold: backlog_alert_n,
     alerts: 0,
     idempotent,
+    sampling,
+    format,
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
@@ -3451,6 +3587,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut from : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
+      let mut min_level : String? = (None : String?)
+      let mut level_field : String? = (None : String?)
+      let mut sample_rate : String? = (None : String?)
+      let mut include_str : String? = (None : String?)
+      let mut exclude_str : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -3483,9 +3624,27 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
+        } else if a == "--min-level" && i + 1 < args.length() {
+          min_level = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--level-field" && i + 1 < args.length() {
+          level_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--sample-rate" && i + 1 < args.length() {
+          sample_rate = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--include" && i + 1 < args.length() {
+          include_str = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--exclude" && i + 1 < args.length() {
+          exclude_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
+      let sampling = parse_sampling_config(
+        min_level, level_field, sample_rate, include_str, exclude_str,
+      )
       cmd_ingest(
         args[2],
         args[3],
@@ -3496,6 +3655,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         key_field,
         ts_field,
         idempotent,
+        sampling,
         from,
         batch,
         interval,
@@ -3514,6 +3674,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut key_field = "key"
       let mut ts_field : String? = (None : String?)
       let mut idempotent = false
+      let mut min_level : String? = (None : String?)
+      let mut level_field : String? = (None : String?)
+      let mut sample_rate : String? = (None : String?)
+      let mut include_str : String? = (None : String?)
+      let mut exclude_str : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -3543,9 +3708,27 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
+        } else if a == "--min-level" && i + 1 < args.length() {
+          min_level = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--level-field" && i + 1 < args.length() {
+          level_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--sample-rate" && i + 1 < args.length() {
+          sample_rate = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--include" && i + 1 < args.length() {
+          include_str = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--exclude" && i + 1 < args.length() {
+          exclude_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
+      let sampling = parse_sampling_config(
+        min_level, level_field, sample_rate, include_str, exclude_str,
+      )
       cmd_http(
         args[2],
         port,
@@ -3557,6 +3740,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         key_field,
         ts_field,
         idempotent,
+        sampling,
       )
     }
   } else if cmd == "bench-write" {
