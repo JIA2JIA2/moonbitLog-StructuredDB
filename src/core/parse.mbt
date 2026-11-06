@@ -22,6 +22,76 @@ pub fn parse_kv_pairs(line : Bytes) -> Array[(Bytes, Bytes)] {
 }
 
 ///|
+/// Whether `hay` contains `needle` as a byte substring; an empty needle
+/// always matches. Linear search — intended for log-line sized inputs.
+pub fn bytes_contains(hay : Bytes, needle : Bytes) -> Bool {
+  let n = needle.length()
+  if n == 0 {
+    return true
+  }
+  let h = hay.length()
+  if n > h {
+    return false
+  }
+  let mut i = 0
+  while i + n <= h {
+    let mut j = 0
+    let mut ok = true
+    while j < n && ok {
+      if hay.at(i + j).to_int() != needle.at(j).to_int() {
+        ok = false
+      }
+      j = j + 1
+    }
+    if ok {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// ASCII case-insensitive variant of `bytes_contains`: bytes in `A-Z`/`a-z`
+/// compare case-insensitively, everything else byte-exactly.
+pub fn bytes_contains_ci(hay : Bytes, needle : Bytes) -> Bool {
+  let n = needle.length()
+  if n == 0 {
+    return true
+  }
+  let h = hay.length()
+  if n > h {
+    return false
+  }
+  let mut i = 0
+  while i + n <= h {
+    let mut j = 0
+    let mut ok = true
+    while j < n && ok {
+      if lower_ascii(hay.at(i + j).to_int()) !=
+        lower_ascii(needle.at(j).to_int()) {
+        ok = false
+      }
+      j = j + 1
+    }
+    if ok {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn lower_ascii(b : Int32) -> Int32 {
+  if b >= 65 && b <= 90 {
+    b + 32
+  } else {
+    b
+  }
+}
+
+///|
 /// Split one `name=value` segment; returns None when the segment has no `=`.
 fn split_kv_segment(seg : Bytes) -> (Bytes, Bytes)? {
   let mut i = 0

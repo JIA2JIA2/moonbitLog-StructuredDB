@@ -39,6 +39,12 @@
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
 ///                                    cursor
+///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
+///                       [--from off] [--to off]
+///                                    full-text search (linear scan) over keys
+///                                    and/or values
+///   context <dir> <offset> [--before N] [--after N]
+///                                    print the records around one offset
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
@@ -84,7 +90,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1738,6 +1744,116 @@ fn cmd_ingest(
 }
 
 ///|
+/// Match `needle` inside `hay`, optionally folding ASCII case.
+fn match_needle(hay : Bytes, needle : Bytes, ignore_case : Bool) -> Bool {
+  if ignore_case {
+    @core.bytes_contains_ci(hay, needle)
+  } else {
+    @core.bytes_contains(hay, needle)
+  }
+}
+
+///|
+/// Full-text search: stream records in offset order and print those whose key
+/// and/or value contains `text`. This is a linear scan (no inverted index), so
+/// it costs O(records) per query — fine for log-sized directories; `--field`
+/// selects `both` (default), `key` or `value`; `--ignore-case` folds ASCII
+/// case; `--limit` stops early; `--from`/`--to` bound the offset range.
+fn cmd_search(
+  dir : String,
+  text : String,
+  field : String,
+  ignore_case : Bool,
+  limit : String?,
+  from : String?,
+  to : String?,
+) -> Unit raise @io.IoError {
+  if field != "both" && field != "key" && field != "value" {
+    raise @io.IoError::Invalid("invalid field: " + field + " (both|key|value)")
+  }
+  let needle = @utf8.encode(text)
+  let max_hits = match limit {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid limit: " + s)
+      }
+    None => -1
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let lo = match from {
+      Some(s) => parse_offset(s)
+      None => (0 : UInt64)
+    }
+    let hi = match to {
+      Some(s) => parse_offset(s)
+      None => log.next_offset()
+    }
+    let mut hits = 0
+    log.for_each_while(lo, hi, rec => {
+      let hit = if field == "key" {
+        match_needle(rec.key, needle, ignore_case)
+      } else if field == "value" {
+        match_needle(rec.value, needle, ignore_case)
+      } else {
+        match_needle(rec.key, needle, ignore_case) ||
+        match_needle(rec.value, needle, ignore_case)
+      }
+      if hit {
+        print_record(rec)
+        hits = hits + 1
+      }
+      max_hits < 0 || hits < max_hits
+    })
+    println("(" + hits.to_string() + " matches)")
+    close_log(log)
+  })
+}
+
+///|
+/// Print the records around `offset`: up to `--before N` (default 3) before
+/// and `--after N` (default 3) after it, clamped to the log bounds. The
+/// target record itself is included (crossing segment boundaries as needed).
+fn cmd_context(
+  dir : String,
+  offset : String,
+  before : String?,
+  after : String?,
+) -> Unit raise @io.IoError {
+  let target = parse_offset(offset)
+  let b = match before {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid before: " + s)
+      }
+    None => 3
+  }
+  let a = match after {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid after: " + s)
+      }
+    None => 3
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let next = log.next_offset()
+    let bu = b.to_uint64()
+    let au = (a + 1).to_uint64()
+    let lo = if target > bu { target - bu } else { (0 : UInt64) }
+    let hi = if target + au < next { target + au } else { next }
+    let mut count = 0
+    log.for_each_while(lo, hi, rec => {
+      print_record(rec)
+      count = count + 1
+      true
+    })
+    println("(" + count.to_string() + " records)")
+    close_log(log)
+  })
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -1919,6 +2035,57 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         batch,
         interval,
       )
+    }
+  } else if cmd == "search" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut field = "both"
+      let mut ignore_case = false
+      let mut limit : String? = (None : String?)
+      let mut from : String? = (None : String?)
+      let mut to : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--ignore-case" {
+          ignore_case = true
+        } else if a == "--field" && i + 1 < args.length() {
+          field = args[i + 1]
+          i = i + 1
+        } else if a == "--limit" && i + 1 < args.length() {
+          limit = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--from" && i + 1 < args.length() {
+          from = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--to" && i + 1 < args.length() {
+          to = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_search(args[2], args[3], field, ignore_case, limit, from, to)
+    }
+  } else if cmd == "context" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut before : String? = (None : String?)
+      let mut after : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--before" && i + 1 < args.length() {
+          before = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--after" && i + 1 < args.length() {
+          after = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_context(args[2], args[3], before, after)
     }
   } else if cmd == "serve" {
     if args.length() < 4 {
