@@ -106,7 +106,7 @@ type CliLog = @log.Log[
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const MOONLOG_VERSION : String = "0.1.1"
+const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
 const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
