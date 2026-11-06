@@ -3176,6 +3176,18 @@ fn cmd_search(
 }
 
 ///|
+/// Default query time window (4.3): scans without an explicit `--since` are
+/// scoped to the last this-many milliseconds (24h), so a forgotten time
+/// bound cannot trigger an unbounded scan. Override with
+/// `MOONLOG_QUERY_WINDOW_MS`.
+fn query_window_ms() -> Int64 {
+  match @env.get_env_var("MOONLOG_QUERY_WINDOW_MS") {
+    Some(v) => @string.parse_int64(v) catch { _ => 86_400_000 }
+    None => 86_400_000
+  }
+}
+
+///|
 /// Unified-schema query: stream records in offset order and keep those that
 /// match every given condition (AND). `--service` matches the record key
 /// (schema ingest stores the service name as the key) or a parsed service
@@ -3188,6 +3200,10 @@ fn cmd_search(
 /// skip whole segments via `min_ts`/`max_ts` without decoding, and with
 /// `--indexed` the equality/range conditions expand to field-column postings
 /// preselection before the full AND refinement.
+/// Forced time range (4.3): a query without an explicit `--since` degrades to
+/// the default window (last 24h, `MOONLOG_QUERY_WINDOW_MS`) instead of
+/// scanning unbounded; with `--require-time` such a query is rejected
+/// outright. `--since 0` is an explicit full scan and bypasses both.
 /// `--limit` stops early. With `--sort-by-time`, matches are collected and
 /// printed ordered by event time (ties keep offset order) instead of the
 /// arrival (offset) order — the standard answer to out-of-order delivery.
@@ -3213,6 +3229,7 @@ fn cmd_query(
   indexed : Bool,
   sort_by_time : Bool,
   json : Bool,
+  require_time : Bool,
 ) -> Unit raise @io.IoError {
   let level_b : Bytes? = match level {
     Some(s) => Some(@utf8.encode(s))
@@ -3234,6 +3251,9 @@ fn cmd_query(
     Some(s) => Some(@utf8.encode(s))
     None => None
   }
+  // 4.3 forced time range: no unbounded scans. Without an explicit `--since`
+  // the query degrades to the default window, or (with `--require-time`) is
+  // rejected. `--since 0` is explicit and scans everything.
   let since_ts : Int64? = match since {
     Some(s) =>
       Some(
@@ -3241,7 +3261,20 @@ fn cmd_query(
           _ => raise @io.IoError::Invalid("invalid since: " + s)
         },
       )
-    None => None
+    None =>
+      if require_time {
+        raise @io.IoError::Invalid(
+          "query requires --since (unbounded scans are disabled by --require-time); pass --since 0 to scan everything explicitly",
+        )
+      } else {
+        let win = query_window_ms()
+        println(
+          "INFO query scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+        Some(now_ms() - win)
+      }
   }
   let until_ts : Int64? = match until {
     Some(s) =>
@@ -5130,6 +5163,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut indexed = false
       let mut sort_by_time = false
       let mut json = false
+      let mut require_time = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -5167,6 +5201,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           indexed = true
         } else if a == "--sort-by-time" {
           sort_by_time = true
+        } else if a == "--require-time" {
+          require_time = true
         } else if a == "--json" {
           json = true
         }
@@ -5187,6 +5223,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         indexed,
         sort_by_time,
         json,
+        require_time,
       )
     }
   } else if cmd == "context" {
