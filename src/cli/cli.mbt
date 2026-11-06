@@ -3042,7 +3042,10 @@ fn match_needle(hay : Bytes, needle : Bytes, ignore_case : Bool) -> Bool {
 /// scan. `--field`
 /// selects `both` (default), `key` or `value` (ignored with `--inverted`);
 /// `--ignore-case` folds ASCII
-/// case; `--limit` stops early; `--from`/`--to` bound the offset range.
+/// case; `--limit` stops early; `--from`/`--to` bound the offset range;
+/// `--wildcard` switches the linear path to wildcard semantics: `*` matches
+/// any byte sequence, `?` exactly one byte (byte-level — CJK patterns work
+/// with one `?` per UTF-8 byte); mutually exclusive with `--inverted`.
 fn cmd_search(
   dir : String,
   text : String,
@@ -3052,7 +3055,13 @@ fn cmd_search(
   from : String?,
   to : String?,
   inverted : Bool,
+  wildcard : Bool,
 ) -> Unit raise @io.IoError {
+  if inverted && wildcard {
+    raise @io.IoError::Invalid(
+      "--wildcard and --inverted are mutually exclusive",
+    )
+  }
   if field != "both" && field != "key" && field != "value" {
     raise @io.IoError::Invalid("invalid field: " + field + " (both|key|value)")
   }
@@ -3138,7 +3147,16 @@ fn cmd_search(
     }
     let mut hits = 0
     log.for_each_while(lo, hi, rec => {
-      let hit = if field == "key" {
+      let hit = if wildcard {
+        if field == "key" {
+          @core.wildcard_contains(rec.key, needle, ignore_case)
+        } else if field == "value" {
+          @core.wildcard_contains(rec.value, needle, ignore_case)
+        } else {
+          @core.wildcard_contains(rec.key, needle, ignore_case) ||
+          @core.wildcard_contains(rec.value, needle, ignore_case)
+        }
+      } else if field == "key" {
         match_needle(rec.key, needle, ignore_case)
       } else if field == "value" {
         match_needle(rec.value, needle, ignore_case)
@@ -4874,6 +4892,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut field = "both"
       let mut ignore_case = false
       let mut inverted = false
+      let mut wildcard = false
       let mut limit : String? = (None : String?)
       let mut from : String? = (None : String?)
       let mut to : String? = (None : String?)
@@ -4884,6 +4903,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           ignore_case = true
         } else if a == "--inverted" {
           inverted = true
+        } else if a == "--wildcard" {
+          wildcard = true
         } else if a == "--field" && i + 1 < args.length() {
           field = args[i + 1]
           i = i + 1
@@ -4908,6 +4929,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         from,
         to,
         inverted,
+        wildcard,
       )
     }
   } else if cmd == "query" {

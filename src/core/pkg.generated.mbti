@@ -77,6 +77,8 @@ pub fn ttl_days_of(TtlPolicy, Bytes, Bytes?) -> Int64
 
 pub fn ttl_record_level(Bytes) -> Bytes?
 
+pub fn wildcard_contains(Bytes, Bytes, Bool) -> Bool
+
 // Errors
 pub(all) suberror DecodeError {
   Truncated(Int32)
