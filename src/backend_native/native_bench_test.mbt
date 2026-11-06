@@ -48,6 +48,110 @@ test "bench native sequential scan" (it : @bench.T) {
 }
 
 ///|
+/// Compare the two filter paths of 3.2 on the same 2000-record log (10%
+/// `level=error`): the linear path parses every record, the indexed path
+/// reads the field-column postings only.
+test "bench linear field filter" (it : @bench.T) {
+  let dir = "/tmp/moonlog_native_bench_inv_lin"
+  ignore(@backend_native.ensure_dir(dir))
+  bench_clean(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  for i = 0; i < 2000; i = i + 1 {
+    let v = if i % 10 == 0 {
+      b"level=error msg=boom"
+    } else {
+      b"level=info msg=ok"
+    }
+    ignore(log.append(b"svc", v, i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  it.bench(fn() {
+    let recs = reopened.scan() catch { _ => panic() }
+    let mut n : Int32 = 0
+    for r in recs {
+      for pair in @core.parse_kv_pairs(r.value) {
+        if pair.0 == b"level" && pair.1 == b"error" {
+          n = n + 1
+        }
+      }
+    }
+    it.keep(n)
+  })
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  bench_clean(dir)
+}
+
+///|
+test "bench inverted field lookup" (it : @bench.T) {
+  let dir = "/tmp/moonlog_native_bench_inv_idx"
+  ignore(@backend_native.ensure_dir(dir))
+  bench_clean(dir)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  for i = 0; i < 2000; i = i + 1 {
+    let v = if i % 10 == 0 {
+      b"level=error msg=boom"
+    } else {
+      b"level=info msg=ok"
+    }
+    ignore(log.append(b"svc", v, i.to_int64()) catch { _ => panic() })
+  }
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  let reopened : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @backend_native.open_log_dir(dir, (1_000_000 : Int64)) catch {
+    _ => panic()
+  }
+  // Lazy build (as the first indexed query would trigger), then warm reads.
+  for seg in reopened.segments {
+    seg.ensure_inv_index() catch {
+      _ => panic()
+    }
+  }
+  it.bench(fn() {
+    let mut n : Int32 = 0
+    for seg in reopened.segments {
+      for _idx in seg.inv_field_postings(b"level", b"error") {
+        n = n + 1
+      }
+    }
+    it.keep(n)
+  })
+  for seg in reopened.segments {
+    seg.writer.close()
+  }
+  bench_clean(dir)
+}
+
+///|
 test "bench append batch bulk write" (it : @bench.T) {
   let dir = "/tmp/moonlog_native_bench_batch"
   ignore(@backend_native.ensure_dir(dir))

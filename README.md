@@ -26,6 +26,7 @@
 - **脱敏与字段富化**（2.4）：`ingest`/`http` 的 `--mask` 在**写入前**对每条 value 做单遍扫描掩码（core `mask_sensitive`，无正则引擎、未命中字节逐个保真）——敏感字段名（`token`/`password`/`secret`/`api_key`/`authorization`/`session`/`cookie` 等内置词表 + `--mask-fields` 自定义，ASCII 忽略大小写）值段整体 `[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀双点）→ `[REDACTED]`；11 位手机号（1[3-9]）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`（UUID 段、纳秒时间戳不误伤）；`--meta env=prod,region=cn-north,version=x` 在写入前为每条记录追加部署元数据（环境/版本/地域富化）。掩码作用于幂等去重之前，重复投递判定一致。实测：手机号/证件号/令牌/长 hex 掩码后 `search` 零明文残留（kv、schema、lines、HTTP 四条路径）。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **按时间分区**（3.1）：`put`/`ingest`/`http` 的 `--partition day|hour` 开启时间分区——append 路径在记录的时间桶（core `time_bucket`，epoch 对齐）与活跃段桶不同时**自动滚动创建新段**，同桶数据聚成段运行（迟到数据开自己的段）；单段大小仍受 `roll_size` 控制，分区+段两层大小可控；`partitions` 命令按 `--unit day|hour` 展示分区视图（每分区段数/记录数/字节/UTC span，可选 JSON）；过期清理沿用整段回收（`prune-before`/`prune-expired`）——分区对齐时即整分区淘汰，清理只触碰被回收的段文件，读者（共享锁）永不被阻塞。实测：put/ingest 跨天自动切段、schema+partition 组合按归一后事件时间分桶、prune 与并发读者互不阻塞。
+- **倒排 + 列式索引**（3.2）：段级 `InvIndex`（segment 包）双 posting 列表——**词倒排**（key/value 的 ASCII 词 token，小写折叠，`tokenize` 词法；单 token ≤32 字节、每记录 token 数有上限）与**字段列**（`name=value` 精确对 + `__key__=<key>`），lazy 构建（首次索引查询触发）并持久化为 `<base>.log.inv` sidecar（CRC 校验；`maintain`/`serve` 管线顺带全量构建，sidecar 缺失/损坏时自动重建）；`search --inverted` 词级全文匹配（**词命中语义，不同于线性子串**）、`query --indexed` 用第一个等值过滤（level/service/host/trace_id）经字段列预筛后全条件 AND 精滤（service 经记录 key 并集）。基准对比（2000 条、10% 命中）：线性全扫 2.69ms vs 列索引查询 167ns——关键词与字段组合查询均秒级返回；线性扫描始终为回退路径（未启用/索引缺失零影响）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
 - **告警监控**：**阈值告警** `alert`（按 UTC 窗口计数对比阈值）；**异常基线检测** `baseline`（窗口计数的均值/标准差 z-score，超 sigma 标记异常）；**多渠道通知分发**（stdout / `--notify-file` JSONL 追加 / `--webhook` 经 curl POST 且失败降级不中断）。
@@ -89,7 +90,8 @@ moonlog <command> <dir> [args...]
   merge <dir> <max-segments>    将连续的已 roll 段合并至不超过 N 段
   maintain <dir> <max-segments> [ttl]
                                 一键维护：合并 + 冗余回收 + 过期折叠 + 压缩
-                                已 roll 段 + fsck
+                                已 roll 段 + 构建倒排/字段列 sidecar
+                                （3.2）+ fsck
   cursor <dir> <start|-> <limit>  按批读取消费游标（`-` 从持久化位置续读）
   cursor-commit <dir> <position> 持久化消费游标位置
   cursor-lag <dir>              报告每个消费游标的滞后量（next_offset -
@@ -207,23 +209,31 @@ partitions <dir> [--unit day|hour] [--json]
                               prune-expired 整段淘汰，清理只触碰被回收
                               的段文件，读者（共享锁）不被阻塞
 search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
-                    [--from off] [--to off]
-                              全文检索（线性扫描，无倒排索引）：在 key 和/
-                              或 value 中匹配子串，`--ignore-case` 折叠
-                              ASCII 大小写，`--limit` 提前停止，`--from`/
-                              `--to` 限定 offset 区间
+                    [--from off] [--to off] [--inverted]
+                              全文检索：默认线性扫描 key/value 子串（无倒
+                              排索引依赖）；`--inverted` 改走段级词倒排索
+                              引（<base>.log.inv sidecar，lazy 构建或
+                              maintain 预建）——查询词按 ASCII 词法分词
+                              折叠小写后做**完整词命中**（词级语义，与子
+                              串不同；CJK 文本请用线性路径），`--field`/
+                              `--ignore-case` 在该模式下忽略；`--limit`
+                              提前停止，`--from`/`--to` 限定 offset 区间
 query <dir> [--level <lv>] [--service <svc>] [--host <h>]
               [--trace-id <id>] [--contains <text>] [--since <ts>]
-              [--until <ts>] [--limit N] [--sort-by-time] [--json]
+              [--until <ts>] [--limit N] [--indexed] [--sort-by-time]
+              [--json]
                               统一 Schema 联合过滤：全部给定条件按 AND 匹配
                               （`--service` 匹配记录键或解析的服务字段；
                               `--contains` 大小写不敏感子串匹配 value；
                               `--since`/`--until` 限定记录时间戳区间，
                               epoch ms 含端点；`--limit` 提前停止）；
-                              `--sort-by-time` 按事件时间排序输出（同刻保持
-                              offset 序，处理乱序到达）；`--json` 以单行
-                              JSONL 输出；无 schema 的旧记录仍可按
-                              key/contains 过滤
+                              `--indexed` 用第一个等值过滤经字段列索引
+                              预筛（sidecar lazy 构建，maintain 预建）
+                              再全条件精滤，无等值过滤时退回线性；
+                              `--sort-by-time` 按事件时间排序输出（同刻
+                              保持 offset 序）；`--json` 以单行 JSONL
+                              输出；无 schema 的旧记录仍可按 key/
+                              contains 过滤
 context <dir> <offset> [--before N] [--after N]
                               上下文检索：打印目标 offset 前后各 N 条（默认
                               3/3，自动 clamp 到日志边界并跨段）
@@ -529,6 +539,7 @@ u32 crc32          (仅覆盖 body)
 - M117 时间规范化（2.3）：core 新增 `normalize_ts`/`parse_iso8601_ms`（+3 单测）——纯数字按位数缩放（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），ISO-8601 解析 `Z`/`±HH:MM`/`±HHMM` 时区、`T`/空格分隔、小数秒截断毫秒（正向 days-from-civil 与 `format_utc` 的 days-to-civil 互逆，无日历库）；`ingest_timestamp` 与 schema 六字段的 ts 提取改走 `normalize_ts`（此前只认纯数字毫秒：秒级值错 1000 倍、ISO8601 直接回退到达序）；`ingest`/`http` 增加 `--clock-skew <ms>`（固定偏移补偿采集端时钟慢/快，作用于全部记录时间戳含到达序回退值）；`query` 增加 `--sort-by-time`（物化命中后按事件时间排序、tie 保 offset 序，处理乱序到达）。实测：`2026-11-06T20:00:00+08:00`/`12:00:00Z` 同事件归一为同一 1793966400000；四条三时区乱序到达 `--sort-by-time` 输出正确事件序；秒/毫秒/ISO 三写法同值；`--clock-skew 5000` 精确 +5s；trend 的 UTC 小时桶往返正确。开发注记：MoonBit 链式算术表达式中的裸数字字面量会被定型为 Int 向左传播（如 `(153 * mp + 2) / 5 + d - 1` 整条变 Int），days-from-civil 需对字面量逐个 `(: Int64)` 标注
 - M118 脱敏与字段富化（2.4）：core 新增 `mask_sensitive`（+3 单测）——单遍扫描逐字节保真、无正则引擎：敏感字段名值段（内置词表 password/passwd/pwd/secret/secret_key/token/api_key/apikey/access_key/authorization/auth/credential(s)/session/session_id/sessionid/cookie/private_key + `--mask-fields` 自定义，ASCII 忽略大小写、词边界判定）→ `name=[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀 + 双点 token run）→ `[REDACTED]`；11 位手机号（1[3-9] 开头、数字边界）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`，UUID 分段与 19 位纳秒时间戳不误伤；CLI `ingest`/`http` 增加 `--mask`/`--mask-fields <csv>`/`--meta <csv>`（`--meta k=v,k2=v2` 写入前为每条 value 追加部署元数据，k 缺 `=` 报错），掩码与富化在 schema 转换之后、幂等去重之前执行（重复投递判定一致；schema 模式下非规范敏感字段天然不落盘 + message 内模式掩码双保险）。实测：kv/schema/lines/HTTP 四条路径——`phone=138****5678`、`idcard=110***********777X`、`token=[REDACTED]`、`sha=[REDACTED]`、lines 整行 `139****5678 … Bearer [REDACTED]`，四项明文 `search` 全部 0 matches；`env=prod region=cn-north version=2.1.0` 富化落盘
 - M119 按时间分区（3.1）：core `Log` 增加 `partition_ms`/`active_bucket` 与 pub `time_bucket`——`put`/`ingest`/`http` 的 `--partition day|hour` 使 append 在记录时间桶与活跃段桶不同时自动滚动新段（`append_batch` 逐条复用同一路径；`Log::recover` 从活跃段首记录恢复桶，重开后同桶续写不切段），桶按 epoch 对齐（负 ts clamp 0、非法 unit 报错）；单段大小仍受 roll_size 控制（分区+段两层大小可控），+2 单测（跨桶滚动/迟到数据开新段/recover 恢复桶）；CLI 新增 `partitions` 视图（按段首记录桶分组：段数/记录数/字节/UTC span，`--unit day|hour` + `--json`）；过期清理沿用整段回收语义——分区对齐即整分区淘汰，prune 只触碰被回收段、读者共享锁不阻塞（并发冒烟验证）。实测：put 三条跨两天 → 2 段、partitions day/hour 两视图正确、ingest `--ts-field` 归一后按事件时间分桶、schema+partition 组合正常、prune-before 精确淘汰旧分区（dropped 1）。开发注记：`Log::recover` 因读段首记录需补 `R : @io.LogReader` 约束；MoonBit 可选默认参数（`partition_ms~ = 0`）保证全部既有调用点零改动
+- M120 倒排 + 列式索引（3.2）：segment 新增 `InvIndex`（词倒排 terms + 字段列 fields 双 posting 表，pub `tokenize` ASCII 词法小写折叠、`build_inv_index`/`ensure_inv_index` lazy 全段构建、`inv_term_postings`/`inv_field_postings` 查询、`encode`/`decode_inv_index` sidecar 序列化 + CRC，+3 单测含 roundtrip 与 CRC 破坏拒绝）；`<base>.log.inv` sidecar 随 `load_segment_keys` 加载、`flush_meta` 幂等写出、`maintain`/`serve` 管线顺带全量构建；CLI `search --inverted`（词级全文，候选经倒排预筛按 offset 序输出，`(inverted)` 后缀标注）与 `query --indexed`（首个等值过滤经字段列预筛（service 经 `__key__` 并集）后 schema_matches 全条件精滤，`(indexed)` 后缀），linear/inverted/indexed 冒烟结果一致；native_bench 新增对比基准——2000 条 10% 命中下线性全扫 2.69ms vs 列索引查询 167ns（约 1.6 万倍），验收"关键词与字段组合查询均秒级返回"达成。开发注记：encode/decode 的 entry 布局曾不一致（[klen,key,n,...] vs [klen,n,key,...]）导致 decode 读到垃圾 n 触发 Truncated——调试打印定位后对齐；另有 Edit 凭记忆写 oldString 误改 `meta_dirty/fsync_dirty` 初始值破坏既有 dirty 测试（git diff 揪出，恢复 true）——教训：编辑构造体时 oldString 必须取自重读原文
 
 ## 许可
 

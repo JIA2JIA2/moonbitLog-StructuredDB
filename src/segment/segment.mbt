@@ -29,6 +29,7 @@ pub(all) struct Segment[W, R] {
   mut meta_dirty : Bool
   mut ts_samples : Array[(UInt64, Int64)]
   mut fsync_dirty : Bool
+  mut inv_index : InvIndex?
 }
 
 ///|
@@ -80,6 +81,7 @@ pub fn[W, R] Segment::new_with_index_interval(
     meta_dirty: true,
     ts_samples: [],
     fsync_dirty: true,
+    inv_index: None,
   }
 }
 

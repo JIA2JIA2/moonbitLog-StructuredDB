@@ -8,9 +8,13 @@ import {
 }
 
 // Values
+pub fn decode_inv_index(Bytes) -> InvIndex raise @core.MetaError
+
 pub fn decode_segment_meta(Bytes) -> SegmentMeta raise @core.MetaError
 
 pub fn segment_file_name(UInt64) -> String
+
+pub fn tokenize(Bytes, Int32) -> Array[Bytes]
 
 // Errors
 
@@ -32,6 +36,12 @@ pub(all) struct IndexEntry {
   position : Int64
   timestamp : Int64
 }
+
+pub(all) struct InvIndex {
+  terms : @hashmap.HashMap[Bytes, Array[Int32]]
+  fields : @hashmap.HashMap[Bytes, Array[Int32]]
+}
+pub fn InvIndex::encode(Self) -> Bytes
 
 pub(all) struct Segment[W, R] {
   mut base_offset : UInt64
@@ -56,21 +66,26 @@ pub(all) struct Segment[W, R] {
   mut meta_dirty : Bool
   mut ts_samples : Array[(UInt64, Int64)]
   mut fsync_dirty : Bool
+  mut inv_index : InvIndex?
 }
 pub fn[W : @io.LogWriter, R] Segment::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W, R] Segment::apply_meta(Self[W, R], SegmentMeta) -> Unit
+pub fn[W, R : @io.LogReader] Segment::build_inv_index(Self[W, R]) -> Unit raise @io.IoError
 pub fn[W, R] Segment::byte_size(Self[W, R]) -> Int64
 pub fn[W, R] Segment::comp_algo(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Segment::compute_checksum(Self[W, R]) -> UInt32 raise @io.IoError
 pub fn[W, R] Segment::count(Self[W, R]) -> Int32
 pub fn[W, R] Segment::each_key(Self[W, R], (Bytes, UInt64, Bool) -> Unit) -> Unit
 pub fn[W, R] Segment::encode_keys(Self[W, R]) -> Bytes
+pub fn[W, R : @io.LogReader] Segment::ensure_inv_index(Self[W, R]) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::for_each(Self[W, R], UInt64, UInt64, (@core.Record) -> Unit) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::for_each_while(Self[W, R], UInt64, UInt64, (@core.Record) -> Bool) -> Unit raise @io.IoError
 pub fn[W, R : @io.LogReader] Segment::get(Self[W, R], UInt64) -> @core.Record? raise @io.IoError
 pub fn[W, R] Segment::has_checksum(Self[W, R]) -> Bool
 pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
+pub fn[W, R] Segment::inv_field_postings(Self[W, R], Bytes, Bytes) -> Array[Int32]
+pub fn[W, R] Segment::inv_term_postings(Self[W, R], Bytes) -> Array[Int32]
 pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
 pub fn[W, R] Segment::is_ts_sorted(Self[W, R]) -> Bool
 pub fn[W, R] Segment::key_count(Self[W, R]) -> Int32

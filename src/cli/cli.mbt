@@ -1056,6 +1056,11 @@ fn run_maintenance(
       None => -1
     }
     let packed = @backend_native.compress_rolled_segments(dir, log)
+    // Build the inverted/field-column sidecars so indexed queries load them
+    // instead of rebuilding from data (3.2). Idempotent.
+    for seg in log.segments {
+      seg.ensure_inv_index()
+    }
     @backend_native.flush_meta(dir, log)
     close_log(log)
     (merged, dropped, folded, packed)
@@ -2677,9 +2682,14 @@ fn match_needle(hay : Bytes, needle : Bytes, ignore_case : Bool) -> Bool {
 
 ///|
 /// Full-text search: stream records in offset order and print those whose key
-/// and/or value contains `text`. This is a linear scan (no inverted index), so
-/// it costs O(records) per query — fine for log-sized directories; `--field`
-/// selects `both` (default), `key` or `value`; `--ignore-case` folds ASCII
+/// and/or value contains `text`. The linear scan costs O(records) per query;
+/// with `--inverted` the per-segment inverted index (built lazily on first
+/// use, persisted as the `<base>.log.inv` sidecar) preselects candidates and
+/// a record matches when any query token occurs as a full word in its key or
+/// value (ASCII case-folded) — word-level semantics, unlike the substring
+/// scan. `--field`
+/// selects `both` (default), `key` or `value` (ignored with `--inverted`);
+/// `--ignore-case` folds ASCII
 /// case; `--limit` stops early; `--from`/`--to` bound the offset range.
 fn cmd_search(
   dir : String,
@@ -2689,6 +2699,7 @@ fn cmd_search(
   limit : String?,
   from : String?,
   to : String?,
+  inverted : Bool,
 ) -> Unit raise @io.IoError {
   if field != "both" && field != "key" && field != "value" {
     raise @io.IoError::Invalid("invalid field: " + field + " (both|key|value)")
@@ -2700,6 +2711,68 @@ fn cmd_search(
         _ => raise @io.IoError::Invalid("invalid limit: " + s)
       }
     None => -1
+  }
+  if inverted {
+    let toks = @segment.tokenize(@utf8.encode(text), 16)
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let lo = match from {
+        Some(s) => parse_offset(s)
+        None => (0 : UInt64)
+      }
+      let hi = match to {
+        Some(s) => parse_offset(s)
+        None => log.next_offset()
+      }
+      let mut hits = 0
+      let mut stop = false
+      for seg in log.segments {
+        if stop {
+          break
+        }
+        seg.ensure_inv_index()
+        let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
+        for tok in toks {
+          for idx in seg.inv_term_postings(tok) {
+            let off = seg.base_offset + idx.to_uint64()
+            if off >= lo && off < hi {
+              seen.set(off, true)
+            }
+          }
+        }
+        let cands : Array[UInt64] = []
+        seen.each(fn(k, _) { cands.push(k) })
+        cands
+        .mut_view()
+        .sort_by(fn(a, b) {
+          let d = a.compare(b)
+          if d < 0 {
+            -1
+          } else if d > 0 {
+            1
+          } else {
+            0
+          }
+        })
+        for off in cands {
+          if max_hits >= 0 && hits >= max_hits {
+            stop = true
+            break
+          }
+          let rec = log.get(off) catch { _ => None }
+          match rec {
+            Some(r) => {
+              print_record(r)
+              hits = hits + 1
+            }
+            None => ()
+          }
+        }
+      }
+      println("(" + hits.to_string() + " matches) (inverted)")
+      close_log(log)
+    })
+    return
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -2742,7 +2815,11 @@ fn cmd_search(
 /// `--limit` stops early. With `--sort-by-time`, matches are collected and
 /// printed ordered by event time (ties keep offset order) instead of the
 /// arrival (offset) order — the standard answer to out-of-order delivery.
-/// Output is the standard record line, or JSON with
+/// With `--indexed`, the first given equality filter (`--level`/`--service`/
+/// `--host`/`--trace-id`) preselects candidates through the per-segment
+/// field-column index (`name=value` postings, service also via the record
+/// key) before the full AND refinement — no equality filter falls back to
+/// the linear scan. Output is the standard record line, or JSON with
 /// `--json`. Non-schema records still match `--service` via the key and
 /// `--contains` via the value, so mixed directories stay queryable.
 fn cmd_query(
@@ -2755,6 +2832,7 @@ fn cmd_query(
   since : String?,
   until : String?,
   limit : String?,
+  indexed : Bool,
   sort_by_time : Bool,
   json : Bool,
 ) -> Unit raise @io.IoError {
@@ -2802,6 +2880,115 @@ fn cmd_query(
         _ => raise @io.IoError::Invalid("invalid limit: " + s)
       }
     None => -1
+  }
+  // --indexed: the first given equality filter preselects candidates through
+  // the per-segment field-column index; the full AND refinement still runs.
+  let idx_sel : (Bytes, Bytes, Bool)? = if indexed {
+    match level_b {
+      Some(l) => Some((b"level", l, false))
+      None =>
+        match service_b {
+          Some(s) => Some((b"service", s, true))
+          None =>
+            match host_b {
+              Some(h) => Some((b"host", h, false))
+              None =>
+                match trace_b {
+                  Some(t) => Some((b"trace_id", t, false))
+                  None => None
+                }
+            }
+        }
+    }
+  } else {
+    None
+  }
+  match idx_sel {
+    Some((fname, fval, also_key)) => {
+      run_locked(dir, false, () => {
+        let log = open_log(dir)
+        let mut hits = 0
+        let mut stop = false
+        for seg in log.segments {
+          if stop {
+            break
+          }
+          seg.ensure_inv_index()
+          let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([],
+          )
+          for i2 in seg.inv_field_postings(fname, fval) {
+            let off = seg.base_offset + i2.to_uint64()
+            seen.set(off, true)
+          }
+          if also_key {
+            for i2 in seg.inv_field_postings(b"__key__", fval) {
+              let off = seg.base_offset + i2.to_uint64()
+              seen.set(off, true)
+            }
+          }
+          let cands : Array[UInt64] = []
+          seen.each(fn(k, _) { cands.push(k) })
+          cands
+          .mut_view()
+          .sort_by(fn(a, b) {
+            let d = a.compare(b)
+            if d < 0 {
+              -1
+            } else if d > 0 {
+              1
+            } else {
+              0
+            }
+          })
+          for off in cands {
+            if max_hits >= 0 && hits >= max_hits {
+              stop = true
+              break
+            }
+            let rec = log.get(off) catch { _ => None }
+            match rec {
+              Some(r) => {
+                let mut hit = true
+                match since_ts {
+                  Some(t) => if r.timestamp < t { hit = false }
+                  None => ()
+                }
+                match until_ts {
+                  Some(t) => if r.timestamp > t { hit = false }
+                  None => ()
+                }
+                if hit {
+                  let fields = @core.parse_kv_pairs(r.value)
+                  hit = @core.schema_matches(
+                    fields,
+                    r.key,
+                    r.value,
+                    level_b,
+                    service_b,
+                    host_b,
+                    trace_b,
+                    contains_b,
+                  )
+                }
+                if hit {
+                  if json {
+                    print_json_record(r)
+                  } else {
+                    print_record(r)
+                  }
+                  hits = hits + 1
+                }
+              }
+              None => ()
+            }
+          }
+        }
+        println("(" + hits.to_string() + " matches) (indexed)")
+        close_log(log)
+      })
+      return
+    }
+    None => ()
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -4334,6 +4521,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut field = "both"
       let mut ignore_case = false
+      let mut inverted = false
       let mut limit : String? = (None : String?)
       let mut from : String? = (None : String?)
       let mut to : String? = (None : String?)
@@ -4342,6 +4530,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         let a = args[i]
         if a == "--ignore-case" {
           ignore_case = true
+        } else if a == "--inverted" {
+          inverted = true
         } else if a == "--field" && i + 1 < args.length() {
           field = args[i + 1]
           i = i + 1
@@ -4357,7 +4547,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         }
         i = i + 1
       }
-      cmd_search(args[2], args[3], field, ignore_case, limit, from, to)
+      cmd_search(
+        args[2],
+        args[3],
+        field,
+        ignore_case,
+        limit,
+        from,
+        to,
+        inverted,
+      )
     }
   } else if cmd == "query" {
     if args.length() < 3 {
@@ -4371,6 +4570,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
       let mut limit : String? = (None : String?)
+      let mut indexed = false
       let mut sort_by_time = false
       let mut json = false
       let mut i = 3
@@ -4400,6 +4600,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--limit" && i + 1 < args.length() {
           limit = Some(args[i + 1])
           i = i + 1
+        } else if a == "--indexed" {
+          indexed = true
         } else if a == "--sort-by-time" {
           sort_by_time = true
         } else if a == "--json" {
@@ -4417,6 +4619,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         since,
         until,
         limit,
+        indexed,
         sort_by_time,
         json,
       )

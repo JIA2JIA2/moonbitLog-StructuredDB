@@ -638,6 +638,43 @@ fn load_segment_keys(
     Some(_) => seg.mark_meta_clean()
     None => ignore(seg.rebuild_index() catch { _ => 0 })
   }
+  // The inverted/field-column sidecar is optional: absence just means the
+  // index is rebuilt lazily on the first indexed query (and rewritten on the
+  // next flush).
+  load_segment_inv(dir, base, seg)
+}
+
+///|
+/// File name of a segment's persisted inverted/field-column index sidecar.
+fn segment_inv_name(base : UInt64) -> String {
+  @segment.segment_file_name(base) + ".inv"
+}
+
+///|
+/// Path of a segment's persisted inverted/field-column index sidecar.
+fn segment_inv_path(dir : String, base : UInt64) -> String {
+  dir + "/" + segment_inv_name(base)
+}
+
+///|
+/// Load a segment's persisted inverted/field-column index into memory. A
+/// missing or invalid sidecar is fine — the index is rebuilt lazily on the
+/// first indexed query.
+fn load_segment_inv(
+  dir : String,
+  base : UInt64,
+  seg : @segment.Segment[NativeFileLog, NativeFileLog],
+) -> Unit {
+  let ip = segment_inv_path(dir, base)
+  if file_exists(ip) {
+    let decoded = Some(@segment.decode_inv_index(read_file(ip))) catch {
+      _ => None
+    }
+    match decoded {
+      Some(ix) => seg.inv_index = Some(ix)
+      None => ()
+    }
+  }
 }
 
 ///|
@@ -837,6 +874,13 @@ pub fn flush_meta(
         seg.encode_keys(),
       )
       seg.mark_meta_clean()
+    }
+    // Persist the inverted/field-column index whenever it has been built
+    // (lazily, by an indexed query); rewritten idempotently per flush.
+    match seg.inv_index {
+      Some(ix) =>
+        write_file_atomic(dir, segment_inv_name(seg.base_offset), ix.encode())
+      None => ()
     }
     bases.push(seg.base_offset)
     let stored = if seg.is_compressed() {

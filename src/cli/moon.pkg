@@ -5,6 +5,7 @@ supported_targets = "-all+native"
 import {
   "JIA2JIA2/lsdb/src/io",
   "JIA2JIA2/lsdb/src/core",
+  "JIA2JIA2/lsdb/src/segment",
   "JIA2JIA2/lsdb/src/log",
   "JIA2JIA2/lsdb/src/backend_native",
   "moonbitlang/core/buffer",
