@@ -95,7 +95,11 @@
 ///                                    context, skipping interleaved traffic
 ///   aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
 ///                    [--match <text>] [--top N] [--json]
-///                                    multi-dimensional count aggregation
+///                    [--quantile <field>]
+///                                    multi-dimensional count aggregation;
+///                                    with --quantile, report count/min/avg/
+///                                    p50/p95/p99/max of the numeric field
+///                                    per bucket instead of counts only
 ///   cluster <dir> [--match <text>] [--top N]
 ///                                    error clustering by normalized template
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
@@ -4097,6 +4101,28 @@ fn top_counts(
 /// (records without it bucket as `<missing>`). `--match <text>` limits to
 /// records containing the text (ASCII case-insensitive, key or value).
 /// `--json` emits the buckets as JSON.
+
+///|
+/// Nearest-rank percentile of a sorted array: `vals[ceil(q*n)-1]`, clamped
+/// into range (zero dependency — no ceil/math import).
+fn pct_of(sorted : Array[Double], q : Double) -> Double {
+  let n = sorted.length()
+  let prod = q * n.to_double()
+  let mut idx = prod.to_int()
+  if prod > idx.to_double() {
+    idx = idx + 1
+  }
+  idx = idx - 1
+  if idx < 0 {
+    idx = 0
+  }
+  if idx >= n {
+    idx = n - 1
+  }
+  sorted[idx]
+}
+
+///|
 fn cmd_aggregate(
   dir : String,
   by : String,
@@ -4104,6 +4130,7 @@ fn cmd_aggregate(
   match_text : String?,
   top : String?,
   json : Bool,
+  quantile : String?,
 ) -> Unit raise @io.IoError {
   let top_n = match top {
     Some(s) =>
@@ -4133,9 +4160,16 @@ fn cmd_aggregate(
     Some(s) => Some(@utf8.encode(s))
     None => None
   }
+  let qfield : Bytes? = match quantile {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    let qvals : @hashmap.HashMap[Bytes, Array[Double]] = @hashmap.HashMap::HashMap([],
+    )
+    let mut skipped : Int32 = 0
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
       let pass = match needle {
         Some(n) =>
@@ -4179,6 +4213,34 @@ fn cmd_aggregate(
               rec.key
             }
         }
+        match qfield {
+          Some(qf) => {
+            let qpairs = @core.parse_kv_pairs(rec.value)
+            let mut qv : Bytes? = None
+            for qp in qpairs {
+              if qp.0 == qf {
+                qv = Some(qp.1)
+              }
+            }
+            match qv {
+              Some(raw) => {
+                let d_opt = Some(@string.parse_double(@utf8.decode_lossy(raw))) catch {
+                  _ => None
+                }
+                match d_opt {
+                  Some(d) =>
+                    match qvals.get(bucket) {
+                      Some(arr) => arr.push(d)
+                      None => qvals.set(bucket, [d])
+                    }
+                  None => skipped = skipped + 1
+                }
+              }
+              None => skipped = skipped + 1
+            }
+          }
+          None => ()
+        }
         bump_bytes(counts, bucket)
       }
       true
@@ -4191,33 +4253,154 @@ fn cmd_aggregate(
       }
     }
     let shown = top_counts(items, top_n)
-    if json {
-      let by_label = match kv_field {
-        Some(f) => "kv:" + f
-        None => by
-      }
-      let mut s = "{\"by\":\"" + by_label + "\",\"buckets\":["
-      let mut first = true
-      for item in shown {
-        if !first {
-          s = s + ","
+    match qfield {
+      Some(qf) => {
+        // Quantile table (5.1): count/min/avg/p50/p95/p99/max per bucket,
+        // buckets ordered by record count (same --top clipping).
+        let qf_str = bytes_to_string(qf)
+        if json {
+          let by_label = match kv_field {
+            Some(f) => "kv:" + f
+            None => by
+          }
+          let mut s = "{\"by\":\"" +
+            by_label +
+            "\",\"quantile\":\"" +
+            qf_str +
+            "\",\"buckets\":["
+          let mut first = true
+          for item in shown {
+            match qvals.get(item.0) {
+              Some(vals) => {
+                vals
+                .mut_view()
+                .sort_by(fn(a, b) {
+                  if a < b {
+                    -1
+                  } else if a > b {
+                    1
+                  } else {
+                    0
+                  }
+                })
+                let n = vals.length()
+                let mut sum : Double = 0.0
+                for v in vals {
+                  sum = sum + v
+                }
+                if !first {
+                  s = s + ","
+                }
+                first = false
+                s = s +
+                  "{\"bucket\":\"" +
+                  json_escape_str(bytes_to_string(item.0)) +
+                  "\",\"count\":" +
+                  n.to_string() +
+                  ",\"min\":" +
+                  vals[0].to_string() +
+                  ",\"avg\":" +
+                  (sum / n.to_double()).to_string() +
+                  ",\"p50\":" +
+                  pct_of(vals, 0.5).to_string() +
+                  ",\"p95\":" +
+                  pct_of(vals, 0.95).to_string() +
+                  ",\"p99\":" +
+                  pct_of(vals, 0.99).to_string() +
+                  ",\"max\":" +
+                  vals[n - 1].to_string() +
+                  "}"
+              }
+              None => ()
+            }
+          }
+          s = s +
+            "],\"skipped\":" +
+            skipped.to_string() +
+            ",\"total_buckets\":" +
+            counts.length().to_string() +
+            "}"
+          println(s)
+        } else {
+          println("count  min  avg  p50  p95  p99  max  bucket")
+          for item in shown {
+            match qvals.get(item.0) {
+              Some(vals) => {
+                vals
+                .mut_view()
+                .sort_by(fn(a, b) {
+                  if a < b {
+                    -1
+                  } else if a > b {
+                    1
+                  } else {
+                    0
+                  }
+                })
+                let n = vals.length()
+                let mut sum : Double = 0.0
+                for v in vals {
+                  sum = sum + v
+                }
+                println(
+                  n.to_string() +
+                  "  " +
+                  vals[0].to_string() +
+                  "  " +
+                  (sum / n.to_double()).to_string() +
+                  "  " +
+                  pct_of(vals, 0.5).to_string() +
+                  "  " +
+                  pct_of(vals, 0.95).to_string() +
+                  "  " +
+                  pct_of(vals, 0.99).to_string() +
+                  "  " +
+                  vals[n - 1].to_string() +
+                  "  " +
+                  bytes_to_string(item.0),
+                )
+              }
+              None => ()
+            }
+          }
+          println(
+            "(" +
+            counts.length().to_string() +
+            " buckets, " +
+            skipped.to_string() +
+            " skipped)",
+          )
         }
-        first = false
-        s = s +
-          "{\"bucket\":\"" +
-          json_escape_str(bytes_to_string(item.0)) +
-          "\",\"count\":" +
-          item.1.to_string() +
-          "}"
       }
-      s = s + "],\"total_buckets\":" + counts.length().to_string() + "}"
-      println(s)
-    } else {
-      println("count  bucket")
-      for item in shown {
-        println(item.1.to_string() + "  " + bytes_to_string(item.0))
-      }
-      println("(" + counts.length().to_string() + " buckets)")
+      None =>
+        if json {
+          let by_label = match kv_field {
+            Some(f) => "kv:" + f
+            None => by
+          }
+          let mut s = "{\"by\":\"" + by_label + "\",\"buckets\":["
+          let mut first = true
+          for item in shown {
+            if !first {
+              s = s + ","
+            }
+            first = false
+            s = s +
+              "{\"bucket\":\"" +
+              json_escape_str(bytes_to_string(item.0)) +
+              "\",\"count\":" +
+              item.1.to_string() +
+              "}"
+          }
+          s = s + "],\"total_buckets\":" + counts.length().to_string() + "}"
+          println(s)
+        } else {
+          println("count  bucket")
+          for item in shown {
+            println(item.1.to_string() + "  " + bytes_to_string(item.0))
+          }
+          println("(" + counts.length().to_string() + " buckets)")
+        }
     }
     close_log(log)
   })
@@ -5650,6 +5833,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut kv_field : String? = (None : String?)
       let mut match_text : String? = (None : String?)
       let mut top : String? = (None : String?)
+      let mut quantile : String? = (None : String?)
       let mut json = false
       let mut i = 3
       while i < args.length() {
@@ -5662,6 +5846,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--kv-field" && i + 1 < args.length() {
           kv_field = Some(args[i + 1])
           i = i + 1
+        } else if a == "--quantile" && i + 1 < args.length() {
+          quantile = Some(args[i + 1])
+          i = i + 1
         } else if a == "--match" && i + 1 < args.length() {
           match_text = Some(args[i + 1])
           i = i + 1
@@ -5671,7 +5858,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         }
         i = i + 1
       }
-      cmd_aggregate(args[2], by, kv_field, match_text, top, json)
+      cmd_aggregate(args[2], by, kv_field, match_text, top, json, quantile)
     }
   } else if cmd == "cluster" {
     if args.length() < 3 {
