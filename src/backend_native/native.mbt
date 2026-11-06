@@ -75,6 +75,18 @@ extern "C" fn moonlog_tcp_listen(port : Int32) -> Int32 = "moonlog_tcp_listen"
 extern "C" fn moonlog_tcp_accept(listen_fd : Int32) -> Int32 = "moonlog_tcp_accept"
 
 ///|
+extern "C" fn moonlog_tcp_accept_timeout(
+  listen_fd : Int32,
+  ms : Int32,
+) -> Int32 = "moonlog_tcp_accept_timeout"
+
+///|
+extern "C" fn moonlog_install_shutdown_handler() -> Int32 = "moonlog_install_shutdown_handler"
+
+///|
+extern "C" fn moonlog_shutdown_requested() -> Int32 = "moonlog_shutdown_requested"
+
+///|
 extern "C" fn moonlog_conn_read(fd : Int32, max : Int32) -> Bytes = "moonlog_conn_read"
 
 ///|
@@ -1209,6 +1221,27 @@ pub fn tcp_listen(port : Int32) -> Int32 {
 /// negative value on error.
 pub fn tcp_accept(listen_fd : Int32) -> Int32 {
   moonlog_tcp_accept(listen_fd)
+}
+
+///|
+/// Accept one pending connection, waiting at most `ms` milliseconds. Returns
+/// the connection fd, or a negative value on timeout/error.
+pub fn tcp_accept_timeout(listen_fd : Int32, ms : Int32) -> Int32 {
+  moonlog_tcp_accept_timeout(listen_fd, ms)
+}
+
+///|
+/// Install SIGTERM/SIGINT handlers that only set an in-process flag (no work
+/// runs in the handler). Long-running commands poll `shutdown_requested` and
+/// finish in-flight work before exiting.
+pub fn install_shutdown_handler() -> Unit {
+  ignore(moonlog_install_shutdown_handler())
+}
+
+///|
+/// Whether a shutdown was requested via SIGTERM/SIGINT.
+pub fn shutdown_requested() -> Bool {
+  moonlog_shutdown_requested() > 0
 }
 
 ///|

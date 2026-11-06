@@ -20,6 +20,15 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
+
+static volatile sig_atomic_t moonlog_shutdown_flag = 0;
+
+static void moonlog_on_shutdown_signal(int sig) {
+  (void)sig;
+  moonlog_shutdown_flag = 1;
+}
 
 static char *moonlog_c_path(moonbit_bytes_t path) {
   int32_t len = Moonbit_array_length(path);
@@ -472,4 +481,43 @@ moonbit_bytes_t moonlog_read_blocking(int32_t fd, int32_t max) {
     return out;
   }
   return buf;
+}
+
+/*
+ * Accept with a timeout: wait up to `ms` milliseconds for a pending
+ * connection. Returns the connection fd, or -1 on timeout/error. Lets the
+ * HTTP server keep draining its backlog while no client is connecting.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_tcp_accept_timeout(int32_t listen_fd, int32_t ms) {
+  struct pollfd pfd;
+  pfd.fd = listen_fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+  int r = poll(&pfd, 1, ms);
+  if (r <= 0) {
+    return -1;
+  }
+  int fd = accept(listen_fd, NULL, NULL);
+  return fd < 0 ? -1 : fd;
+}
+
+/*
+ * Graceful-shutdown support: install handlers for SIGTERM/SIGINT that only set
+ * a flag, and let the MoonBit loop poll it. The HTTP server uses this to drain
+ * its in-memory backlog before exiting, so buffered requests are never lost.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_install_shutdown_handler(void) {
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = moonlog_on_shutdown_signal;
+  sigaction(SIGTERM, &sa, NULL);
+  sigaction(SIGINT, &sa, NULL);
+  return 0;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_shutdown_requested(void) {
+  return moonlog_shutdown_flag ? 1 : 0;
 }

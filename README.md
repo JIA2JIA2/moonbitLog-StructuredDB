@@ -18,6 +18,7 @@
 - **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
 - **多源接入**（1.1）：四类来源均可入库——**Agent 采集**（`ingest --follow` 本地文件 agent，断点续采/轮转）、**离线批量导入**（`ingest --once`）、**HTTP 推送**（`http` 服务：`POST /`/`/push` 逐行入库 + `/health`/`/stats`；SDK 直接调用 `Log::append`）、**消息队列订阅**（`ingest --fifo` 订阅命名管道，写者推送批次、跨写者持续采集；也兼容 `curl`/`kcat` 等外部桥接写入）。
 - **高吞吐写入**（1.2）：append-only 批量写入（`Log::append_batch` 每条自带 timestamp），峰值流量靠 `SyncPolicy::Batch`（批末一次 fsync）与 `--batch N` 分批提交；架构不做逐条随机更新（更新=追加新版本，tombstone 删除）。`bench-write` 现场压测并**两阶段校验无丢失**（写入进程关闭后重开：精确条数 + offset 连续 + verify_fast）：本地参考 1000 条/批约 **8–9 万 records/s**、5000 条/批约 9 万、逐批 fsync 约 600/s；内核批量基准 1000 条/批 **4.3ms（≈23 万 records/s）**，单条路径约 135µs（批量快约 31 倍）。
+- **缓冲与背压**（1.3）：下游过载时**缓冲而非丢弃**——HTTP 推送端点用有界入站队列（`--queue` 行数上限）：入队成功返回 **202**（含 pending），队列满返回 **429 + Retry-After** 明确反压（客户端重试，无静默丢数据）；后台按 `--batch` 行分批落库，积压超 `--backlog-alert` 打印 `WARN backlog` 并经 `/stats` 暴露 `pending`/`backlog_alerts`；**SIGTERM/SIGINT 优雅关闭**（新增信号 stub + 200ms 超时 accept 轮询）在退出前清空队列，实测并发超限场景 429 重试后 **1200/1200 条零丢失**。FIFO 订阅侧由内核管道满自动反压写者。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -112,12 +113,20 @@ moonlog <command> <dir> [args...]
                                 以命名游标 `ingest-<basename>` 持久化，重跑
                                 自动续采（`--from` 可覆盖），`--batch` 控制
                                 每批写入条数（默认 256）
-  http <dir> [--port N] [--format lines|kv] [--key <name>]
-            [--key-field <name>] [--ts-field <name>]
+  http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
+            [--format lines|kv] [--key <name>] [--key-field <name>]
+            [--ts-field <name>]
                                 在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
-                                或 `/push`（请求体为日志行，按上述格式解析
-                                入库）、`GET /health`、`GET /stats`；SDK
-                                接入直接调用库 API `Log::append`
+                                或 `/push` 先进入**有界队列**（`--queue` 行
+                                数上限，默认 10000）并返回 202；队列满时返回
+                                **429 + Retry-After**（明确反压，客户端重试
+                                即可，不静默丢数据）；后台按 `--batch` 行
+                                分批落库，积压超 `--backlog-alert`（默认
+                                5000）时打印 `WARN backlog` 并经 `/stats`
+                                的 `pending`/`backlog_alerts` 暴露；SIGTERM/
+                                SIGINT 优雅关闭前会清空队列；另有 `GET
+                                /health`、`GET /stats`；SDK 直接调用库 API
+                                `Log::append`
   serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
                                 周期性执行维护（合并 + 冗余回收 + 可选过期折
                                 叠 + 压缩 + flush 元数据）；`--every` 或
@@ -460,6 +469,7 @@ u32 crc32          (仅覆盖 body)
 - M109 运维管理 RBAC：core 新增 `RbacRole`/`parse_rbac_line`/`rbac_allows`/`rbac_find`（Bytes 模型 + 单测），CLI 以 `<dir>/RBAC` 规则文件（`role=.. token=.. allow=cmds|*`）控制访问——文件存在时除 `rbac init`/`rbac check` 外所有命令需 `MOONLOG_TOKEN` 且角色允许，拒绝事件追加 `AUDIT.log`；`rbac init/add/list/remove/check` 管理命令（`list` 隐藏 token 尾部）；无 RBAC 文件保持开放向后兼容。TTL 清理（prune/compact-expired/retain_before/`--ttl`）与导出归档（export/export-jsonl/import/backup）此前已覆盖
 - M110 多源接入（1.1）：补齐四类采集来源——**HTTP 推送端点** `http`（127.0.0.1 监听，`POST /`/`/push` 按 `lines|kv` 格式逐行入库、`GET /health`、`GET /stats`；新增 TCP（listen/accept/read/write）C stub 与 core `parse_http_request` 及单测）；**消息队列订阅** `ingest --fifo`（命名管道订阅，写者推送批次、跨写者持续采集、半行跨 chunk 保留；新增 mkfifo/阻塞读 C stub）；Agent 采集（`ingest --follow`）与离线批量导入（`ingest --once`）此前已覆盖；SDK 接入即库 API `Log::append`。`ingest` 的入库流水线抽取为共享 `ingest_lines`/`ingest_timestamp`（HTTP 与 FIFO 复用）
 - M111 高吞吐写入（1.2）：append-only 批量链路此前已覆盖（`append_batch` 每条自带 timestamp、`append_batch_atomic`、`put-batch`、`SyncPolicy::Batch`、`ingest --batch`），补齐**可执行压测**——CLI `bench-write <dir> <count> [--batch N] [--sync always|batch|never]`：分批批量写入并报告 records/s，随后**重新打开目录做两阶段无丢失校验**（精确条数 + offset 连续 + `verify_fast` 干净）；新增 native `bench append batch bulk write` 基准（1000 条/批 4.30ms ≈ 23.2 万 records/s，对比单条 append 135µs，批量快约 31 倍）。实测：1000 条/批 Batch 模式 ≈ 79.7k/s、5000 条/批 ≈ 89.1k/s、`--sync never` ≈ 89.7k/s、`--sync always`（逐批 fsync）≈ 605/s——全部 verify `ok (no loss)`
+- M112 缓冲与背压（1.3）：HTTP 端点改为**有界入站队列**（`--queue` 行数上限）——`POST` 入队成功返回 **202**（含 pending），队列满返回 **429 + Retry-After**（明确反压、无静默丢弃），后台按 `--batch` 行分批落库；积压超 `--backlog-alert` 打印 `WARN backlog` 并在 `/stats` 暴露 `pending`/`backlog_alerts`；新增 `poll` 超时 accept（空闲时持续消化队列）与 SIGTERM/SIGINT 信号 stub——**优雅关闭前清空队列**（冒烟实测并发超限 429 重试后 1200/1200 零丢失、积压告警触发、退出提示 backlog drained）。首版冒烟曾发现"kill 时队列 200 行未落盘"的静默丢失，由此补上优雅关闭
 
 ## 许可
 

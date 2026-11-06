@@ -40,11 +40,16 @@
 ///                                    resumable via the `ingest-<basename>`
 ///                                    cursor; `--fifo` subscribes to a named
 ///                                    pipe instead (writers push batches)
-///   http <dir> [--port N] [--format lines|kv] [--key <name>]
-///             [--key-field <name>] [--ts-field <name>]
+///   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
+///             [--format lines|kv] [--key <name>] [--key-field <name>]
+///             [--ts-field <name>]
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
-///                                    or /push ingests lines, GET /health,
-///                                    GET /stats); SDK calls use Log::append
+///                                    or /push buffers into a bounded queue
+///                                    and answers 202, or 429 + Retry-After
+///                                    when the backlog is full — explicit
+///                                    backpressure, no silent drops; backlog
+///                                    beyond --backlog-alert warns and is
+///                                    exposed via /stats; GET /health, /stats)
 ///   bench-write <dir> <count> [--batch N] [--sync always|batch|never]
 ///                [--prefix <p>]
 ///                                    bulk-write benchmark: report throughput,
@@ -1907,19 +1912,26 @@ fn find_header_end(data : Bytes) -> Int32 {
 fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
   let reason = if status == 200 {
     "OK"
+  } else if status == 202 {
+    "Accepted"
   } else if status == 400 {
     "Bad Request"
   } else if status == 404 {
     "Not Found"
+  } else if status == 429 {
+    "Too Many Requests"
   } else {
     "Error"
   }
+  let retry = if status == 429 { "Retry-After: 1\r\n" } else { "" }
   let body_bytes = @utf8.encode(body)
   let head = "HTTP/1.1 " +
     status.to_string() +
     " " +
     reason +
-    "\r\nContent-Type: application/json\r\nContent-Length: " +
+    "\r\n" +
+    retry +
+    "Content-Type: application/json\r\nContent-Length: " +
     body_bytes.length().to_string() +
     "\r\nConnection: close\r\n\r\n"
   ignore(@backend_native.conn_write(conn, @utf8.encode(head)))
@@ -1927,14 +1939,92 @@ fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
 }
 
 ///|
-/// Handle one HTTP connection: read the head and body, route, respond.
-fn handle_http_connection(
+/// Bounded in-flight queue for the HTTP push server: received lines wait here
+/// while the writer drains them in batches of `batch`. When a request would
+/// exceed `capacity`, it is rejected with 429 (explicit backpressure — the
+/// client retries, nothing is dropped silently). Sustained backlog beyond
+/// `alert_threshold` raises a warning and increments `alerts`.
+struct HttpQueue {
+  mut lines : Array[Bytes]
+  mut head : Int32
+  mut pending : Int32
+  capacity : Int32
+  batch : Int32
+  alert_threshold : Int32
+  mut alerts : Int32
+}
+
+///|
+/// Offer `lines` to the queue; false when they would exceed the capacity.
+fn http_queue_enqueue(q : HttpQueue, lines : Array[Bytes]) -> Bool {
+  if q.pending + lines.length() > q.capacity {
+    return false
+  }
+  for line in lines {
+    q.lines.push(line)
+  }
+  q.pending = q.pending + lines.length()
+  true
+}
+
+///|
+/// Write one batch from the queue head, compact the backing array periodically,
+/// and raise a warning when the backlog exceeds the alert threshold.
+fn http_queue_drain(
+  q : HttpQueue,
   dir : String,
-  conn : Int32,
   format : String,
   key_bytes : Bytes,
   field_bytes : Bytes,
   ts_field_bytes : Bytes?,
+) -> Unit raise @io.IoError {
+  if q.pending <= 0 {
+    return
+  }
+  let take = if q.pending < q.batch { q.pending } else { q.batch }
+  let chunk : Array[Bytes] = []
+  let mut i = 0
+  while i < take {
+    chunk.push(q.lines[q.head + i])
+    i = i + 1
+  }
+  q.head = q.head + take
+  q.pending = q.pending - take
+  ignore(
+    ingest_lines(
+      dir, chunk, format, key_bytes, field_bytes, ts_field_bytes, take,
+    ),
+  )
+  if q.head > 4096 && q.head * 2 > q.lines.length() {
+    let rest : Array[Bytes] = []
+    let mut j = q.head
+    while j < q.lines.length() {
+      rest.push(q.lines[j])
+      j = j + 1
+    }
+    q.lines = rest
+    q.head = 0
+  }
+  if q.pending > q.alert_threshold {
+    q.alerts = q.alerts + 1
+    println(
+      "WARN backlog " +
+      q.pending.to_string() +
+      " lines (threshold " +
+      q.alert_threshold.to_string() +
+      ")",
+    )
+  }
+}
+
+///|
+/// Handle one HTTP connection: read the head and body, route, respond. POST
+/// payloads are buffered into `q` (the drain loop writes them); the writer's
+/// parsing options live with the queue.
+fn handle_http_connection(
+  dir : String,
+  conn : Int32,
+  q : HttpQueue,
 ) -> Unit raise @io.IoError {
   let mut head = b""
   let mut header_end = -1
@@ -1981,6 +2071,10 @@ fn handle_http_connection(
         log.segment_count().to_string() +
         ",\"next_offset\":" +
         log.next_offset().to_string() +
+        ",\"pending\":" +
+        q.pending.to_string() +
+        ",\"backlog_alerts\":" +
+        q.alerts.to_string() +
         "}"
       http_respond(conn, 200, payload)
       close_log(log)
@@ -1991,10 +2085,27 @@ fn handle_http_connection(
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
     }
-    let written = ingest_lines(
-      dir, lines, format, key_bytes, field_bytes, ts_field_bytes, 256,
-    )
-    http_respond(conn, 200, "{\"ingested\":" + written.to_string() + "}")
+    if http_queue_enqueue(q, lines) {
+      http_respond(
+        conn,
+        202,
+        "{\"accepted\":" +
+        lines.length().to_string() +
+        ",\"pending\":" +
+        q.pending.to_string() +
+        "}",
+      )
+    } else {
+      // Explicit backpressure: the request was not buffered, so the client can
+      // retry the same payload — nothing is dropped silently.
+      http_respond(
+        conn,
+        429,
+        "{\"error\":\"backlog full\",\"pending\":" +
+        q.pending.to_string() +
+        ",\"retry_after_ms\":1000}",
+      )
+    }
   } else {
     http_respond(conn, 404, "{\"error\":\"not found\"}")
   }
@@ -2009,6 +2120,9 @@ fn handle_http_connection(
 fn cmd_http(
   dir : String,
   port : String?,
+  queue_cap : String?,
+  batch : String?,
+  backlog_alert : String?,
   format : String,
   key : String,
   key_field : String,
@@ -2024,6 +2138,32 @@ fn cmd_http(
       }
     None => 8080
   }
+  let queue_cap_n = match queue_cap {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid queue size: " + s)
+      }
+    None => 10000
+  }
+  let batch_n = match batch {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid batch: " + s)
+      }
+    None => 256
+  }
+  let backlog_alert_n = match backlog_alert {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid backlog alert: " + s)
+      }
+    None => 5000
+  }
+  if queue_cap_n <= 0 || batch_n <= 0 || backlog_alert_n < 0 {
+    raise @io.IoError::Invalid(
+      "queue and batch must be positive, backlog alert non-negative",
+    )
+  }
   let listen_fd = @backend_native.tcp_listen(port_n)
   if listen_fd < 0 {
     raise @io.IoError::Invalid(
@@ -2037,7 +2177,13 @@ fn cmd_http(
   println(
     "moonlog http listening on http://127.0.0.1:" +
     port_n.to_string() +
-    "  (POST / or /push, GET /health, GET /stats)",
+    "  (POST / or /push, GET /health, GET /stats; queue " +
+    queue_cap_n.to_string() +
+    " lines, batch " +
+    batch_n.to_string() +
+    ", backlog alert " +
+    backlog_alert_n.to_string() +
+    ")",
   )
   let key_bytes = @utf8.encode(key)
   let field_bytes = @utf8.encode(key_field)
@@ -2045,15 +2191,40 @@ fn cmd_http(
     Some(f) => Some(@utf8.encode(f))
     None => None
   }
-  while true {
-    let conn = @backend_native.tcp_accept(listen_fd)
-    if conn >= 0 {
-      handle_http_connection(
-        dir, conn, format, key_bytes, field_bytes, ts_field_bytes,
-      )
-      @backend_native.close_fd(conn)
+  let q : HttpQueue = {
+    lines: [],
+    head: 0,
+    pending: 0,
+    capacity: queue_cap_n,
+    batch: batch_n,
+    alert_threshold: backlog_alert_n,
+    alerts: 0,
+  }
+  @backend_native.install_shutdown_handler()
+  let mut stopping = false
+  while !stopping {
+    // Drain one batch first, so a burst backlog keeps shrinking even while no
+    // new client connects (the accept below times out and loops back here).
+    http_queue_drain(q, dir, format, key_bytes, field_bytes, ts_field_bytes)
+    stopping = @backend_native.shutdown_requested()
+    if !stopping {
+      let conn = @backend_native.tcp_accept_timeout(listen_fd, 200)
+      if conn >= 0 {
+        handle_http_connection(dir, conn, q)
+        @backend_native.close_fd(conn)
+      }
     }
   }
+  // Graceful shutdown: write every buffered line before exiting, so nothing
+  // accepted with 202 is lost.
+  while q.pending > 0 {
+    http_queue_drain(q, dir, format, key_bytes, field_bytes, ts_field_bytes)
+  }
+  println(
+    "moonlog http shut down (backlog drained, " +
+    q.alerts.to_string() +
+    " backlog alerts total)",
+  )
 }
 
 ///|
@@ -3280,6 +3451,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut port : String? = (None : String?)
+      let mut queue_cap : String? = (None : String?)
+      let mut batch : String? = (None : String?)
+      let mut backlog_alert : String? = (None : String?)
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
@@ -3289,6 +3463,15 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         let a = args[i]
         if a == "--port" && i + 1 < args.length() {
           port = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--queue" && i + 1 < args.length() {
+          queue_cap = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--batch" && i + 1 < args.length() {
+          batch = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--backlog-alert" && i + 1 < args.length() {
+          backlog_alert = Some(args[i + 1])
           i = i + 1
         } else if a == "--format" && i + 1 < args.length() {
           format = args[i + 1]
@@ -3305,7 +3488,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         }
         i = i + 1
       }
-      cmd_http(args[2], port, format, key, key_field, ts_field)
+      cmd_http(
+        args[2],
+        port,
+        queue_cap,
+        batch,
+        backlog_alert,
+        format,
+        key,
+        key_field,
+        ts_field,
+      )
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {
