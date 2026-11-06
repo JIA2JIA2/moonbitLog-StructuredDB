@@ -15,12 +15,13 @@
 - **可配置持久化**：`SyncPolicy` 支持 `Never` / `Always` / `Batch`；CLI **默认 `Always`**（命令返回即已 fsync），可用 `MOONLOG_SYNC=batch|never` 调整。
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——备份副本比源端段文件新（源端自上次备份未被修改）即跳过，源端已删除的段自动清理，大目录备份成本降为 O(变更)。
-- **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
+- **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv`/`json`/`template` 四种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
 - **多源接入**（1.1）：四类来源均可入库——**Agent 采集**（`ingest --follow` 本地文件 agent，断点续采/轮转）、**离线批量导入**（`ingest --once`）、**HTTP 推送**（`http` 服务：`POST /`/`/push` 逐行入库 + `/health`/`/stats`；SDK 直接调用 `Log::append`）、**消息队列订阅**（`ingest --fifo` 订阅命名管道，写者推送批次、跨写者持续采集；也兼容 `curl`/`kcat` 等外部桥接写入）。
 - **高吞吐写入**（1.2）：append-only 批量写入（`Log::append_batch` 每条自带 timestamp），峰值流量靠 `SyncPolicy::Batch`（批末一次 fsync）与 `--batch N` 分批提交；架构不做逐条随机更新（更新=追加新版本，tombstone 删除）。`bench-write` 现场压测并**两阶段校验无丢失**（写入进程关闭后重开：精确条数 + offset 连续 + verify_fast）：本地参考 1000 条/批约 **8–9 万 records/s**、5000 条/批约 9 万、逐批 fsync 约 600/s；内核批量基准 1000 条/批 **4.3ms（≈23 万 records/s）**，单条路径约 135µs（批量快约 31 倍）。
 - **缓冲与背压**（1.3）：下游过载时**缓冲而非丢弃**——HTTP 推送端点用有界入站队列（`--queue` 行数上限）：入队成功返回 **202**（含 pending），队列满返回 **429 + Retry-After** 明确反压（客户端重试，无静默丢数据）；后台按 `--batch` 行分批落库，积压超 `--backlog-alert` 打印 `WARN backlog` 并经 `/stats` 暴露 `pending`/`backlog_alerts`；**SIGTERM/SIGINT 优雅关闭**（新增信号 stub + 200ms 超时 accept 轮询）在退出前清空队列，实测并发超限场景 429 重试后 **1200/1200 条零丢失**。FIFO 订阅侧由内核管道满自动反压写者。
 - **幂等与重放**（1.4）：`--idempotent`（`put`/`ingest`/`http`）开启写入侧幂等——待写记录的 (key, value) 与该键最新 live 记录完全一致时**识别为重复投递并跳过**（返回既有 offset），否则正常追加；检查骑乘增量维护的 key 索引（O(1) 热路径）。重放文件（`ingest --from 0`）、HTTP 429 重试、批次重投全部幂等：实测重放 2 行 `2 duplicates skipped` 零新增，非幂等对照翻倍至 4。断点续传（采集位点命名游标）与此互补：位点内不重读、位点外的重复投递靠幂等兜底。
 - **源头采样限流**（1.5）：`ingest`/`http` 的采样管线（core `SamplingConfig` + `sampling_allows`，单测覆盖）——**按级别** `--min-level debug|info|warn|error|fatal`（kv `--level-field` 字段的严重度阈值，未知级别不参与过滤）、**按比例** `--sample-rate 0-100`（FNV-1a 确定性哈希，同内容判定恒定、与幂等重放一致）、**按规则** `--include`/`--exclude`（原始行子串，ASCII 忽略大小写）。采样在源头（入队/写入前）执行，`ingest` 输出 `(N sampled out)`、HTTP 202 响应含 `sampled_out`——实测 `--min-level warn` 丢 debug/info、`--sample-rate 50` 采样 99/200、`--sample-rate 0` 全丢。
+- **统一 Schema**（2.2）：`ingest`/`http` 的 `--schema` 将解析出的字段归一到**六大基础字段**——时间戳（`ts`/`@timestamp`/`timestamp`/`time`）、级别（`level`/`severity`）、服务名（`service`/`service_name`/`app`/`application`）、主机（`host`/`hostname`）、trace_id（`trace_id`/`traceId`/`trace`）、消息（`message`/`msg`；core `canonical_field` 别名映射，单测覆盖）：**服务名提升为记录键**、标准字段按固定顺序重组为 value（`level=… host=… trace_id=… message=…`）、时间戳取自解析值——不同服务的字段命名习惯入库后口径一致；**联合过滤查询** `query`（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND 组合 + `--since`/`--until` 时间窗 + `--limit`/`--json`；core `schema_matches` 单测覆盖）——如 `query --trace-id t9` 一次关联多个服务的同一链路；非 schema 记录仍可按 key/contains 过滤，混合目录可查。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -106,7 +107,7 @@ moonlog <command> <dir> [args...]
                     [--ts-field <name>] [--from <bytes>] [--batch N]
                     [--interval ms] [--idempotent] [--min-level <level>]
                     [--level-field <name>] [--sample-rate 0-100]
-                    [--include <text>] [--exclude <text>]
+                    [--include <text>] [--exclude <text>] [--schema]
                                 采集外部日志文件：每行按格式解析为字段并写入
                                 （`lines` 默认整行为 value；`kv` 解析空格分
                                 隔 name=value 对；`json` 解析顶层 JSON 对象
@@ -115,8 +116,10 @@ moonlog <command> <dir> [args...]
                                 价，不含正则）；`--key-field` 字段提升为记
                                 录键、`--value-field` 字段作为 value（缺省
                                 整行）、`--ts-field` 从字段取时间戳；`--idem
-                                potent` 幂等去重；`--min-level`/`--sample-ra
-                                te`/`--include`/`--exclude` 源头采样限流；
+                                 potent` 幂等去重；`--min-level`/`--sample-ra
+                                 te`/`--include`/`--exclude` 源头采样限流；
+                                 `--schema` 统一六字段（服务名提升为键、标
+                                 准字段重组 value、别名归一，详见下 `query`）；
                                 `--once` 导入到当前末尾即退出，`--follow` 持
                                 续跟踪追加（半行留待下轮、截断/轮转自动从零
                                 重采）；`--fifo` 改为订阅命名管道（写者推送
@@ -126,7 +129,7 @@ moonlog <command> <dir> [args...]
                                 条数（默认 256）
   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
             [--format lines|kv] [--key <name>] [--key-field <name>]
-            [--ts-field <name>]
+            [--ts-field <name>] [--schema]
                                 在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
                                 或 `/push` 先进入**有界队列**（`--queue` 行
                                 数上限，默认 10000）并返回 202；队列满时返回
@@ -183,6 +186,16 @@ search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
                               或 value 中匹配子串，`--ignore-case` 折叠
                               ASCII 大小写，`--limit` 提前停止，`--from`/
                               `--to` 限定 offset 区间
+query <dir> [--level <lv>] [--service <svc>] [--host <h>]
+              [--trace-id <id>] [--contains <text>] [--since <ts>]
+              [--until <ts>] [--limit N] [--json]
+                              统一 Schema 联合过滤：全部给定条件按 AND 匹配
+                              （`--service` 匹配记录键或解析的服务字段；
+                              `--contains` 大小写不敏感子串匹配 value；
+                              `--since`/`--until` 限定记录时间戳区间，
+                              epoch ms 含端点；`--limit` 提前停止），
+                              `--json` 以单行 JSONL 输出；无 schema 的
+                              旧记录仍可按 key/contains 过滤
 context <dir> <offset> [--before N] [--after N]
                               上下文检索：打印目标 offset 前后各 N 条（默认
                               3/3，自动 clamp 到日志边界并跨段）
@@ -484,6 +497,7 @@ u32 crc32          (仅覆盖 body)
 - M113 幂等与重放（1.4）：core 新增 `Log::append_idempotent`——待写 (key, value) 与该键最新 live 记录一致时跳过并返回既有 offset（检查骑乘增量 key 索引，O(1)），否则正常追加；CLI `put`/`ingest`/`http` 增加 `--idempotent`（重放文件、HTTP 429 重试、批次重投全部幂等：实测重放 2 行 `2 duplicates skipped` 零新增，非幂等对照翻倍至 4）；`ingest` 输出补充重复跳过计数；与采集位点断点续传互补（位点内不重读，位点外重复投递靠幂等兜底）。新增 2 个幂等单测（基本语义 + 跨段）
 - M114 源头采样限流（1.5）：core 新增 `SamplingConfig` + `sampling_allows`（**按级别** `level_rank` 五级映射、**按比例** `fnv1a_hash` 确定性采样——同内容判定恒定与幂等重放一致、**按规则** include/exclude 子串）+ 5 个单测；`ingest`/`http` 增加 `--min-level`/`--level-field`/`--sample-rate`/`--include`/`--exclude`，采样在源头（HTTP 入队前 / ingest 写入前）执行，`ingest` 输出 `(N sampled out)`、HTTP 202 响应含 `sampled_out`。实测：`--min-level warn` 丢 debug/info、`--sample-rate 0` 全丢、`--sample-rate 50` 采样 99/200、`--exclude healthcheck` 精确过滤
 - M115 结构化解析（2.1）：`--format json`（core `json_object_fields` 复用 `moonbitlang/core/json`，顶层对象字段展平、ParseError 由入库管线捕获）与 `--template "<ip> - <user>"`（core `parse_by_template`——字面 + `<name>` 占位符的**轻量 Grok 等价**，贪婪捕获到下一字面首现，不含正则引擎）；`--value-field` 指定字段作为 value（缺省整行）；`ingest_timestamp` 统一从解析字段提取时间戳（json/template/kv 三格式共用）。实测：JSON 行 key/value 字段提取、模板四字段提取、`--min-level warn` 组合采样全部准确
+- M116 统一 Schema（2.2）：core 新增 `canonical_field`/`SchemaFields`/`schema_from_fields`/`schema_value`/`schema_matches`（六槽位别名映射 + 4 个单测）；`ingest`/`http` 增加 `--schema`——解析字段按六大基础字段（时间戳/级别/服务名/主机/trace_id/消息，接受常用别名 `@timestamp`/`severity`/`service_name`/`app`/`hostname`/`traceId`/`msg` 等）归一，**服务名提升为记录键**、标准字段按固定顺序重组 value、时间戳取自解析值，异构服务入库口径一致（实测 `severity=… service_name=… traceId=… @timestamp=…` 与 `level=… service=… trace_id=… timestamp=…` 两种命名习惯归一为同一 shape）；新增 `query` 联合过滤命令（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND + `--since`/`--until` 时间窗 + `--limit`/`--json`，流式线性扫描），跨服务联查实测 `--trace-id t9` 命中 orders 与 inventory 两条异构来源记录；HTTP 推送经队列异步落库同样按 schema 归一（curl POST `severity=fatal service=gateway …` → `query --service gateway` 可查）。开发注记：初版 `SchemaFields` 以 mut 字段 + 循环赋值实现触发 native SIGABRT，重构为六个独立 first-match 查找后消除；定位中确认测试内 panic 断言在 native 以 SIGABRT 呈现（此前所谓工具链深坑，实为断言失败路径的表象）
 
 ## 许可
 

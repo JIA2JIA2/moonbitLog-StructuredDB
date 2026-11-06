@@ -13,6 +13,8 @@ pub fn bytes_contains(Bytes, Bytes) -> Bool
 
 pub fn bytes_contains_ci(Bytes, Bytes) -> Bool
 
+pub fn canonical_field(Bytes) -> Int32
+
 pub fn crc32(Bytes) -> UInt32
 
 pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
@@ -52,6 +54,12 @@ pub fn rle_decompress(Bytes, Int64) -> Bytes raise MetaError
 pub fn sample_passes(Bytes, Int32) -> Bool
 
 pub fn sampling_allows(Bytes, Array[(Bytes, Bytes)], SamplingConfig) -> Bool
+
+pub fn schema_from_fields(Array[(Bytes, Bytes)], Int64) -> SchemaFields
+
+pub fn schema_matches(Array[(Bytes, Bytes)], Bytes, Bytes, Bytes?, Bytes?, Bytes?, Bytes?, Bytes?) -> Bool
+
+pub fn schema_value(SchemaFields) -> Bytes
 
 pub fn shell_quote(String) -> String
 
@@ -114,6 +122,15 @@ pub(all) struct SamplingConfig {
   sample_rate : Int32
   include_text : Bytes
   exclude_text : Bytes
+}
+
+pub(all) struct SchemaFields {
+  ts : Int64?
+  level : Bytes?
+  service : Bytes?
+  host : Bytes?
+  trace_id : Bytes?
+  message : Bytes?
 }
 
 // Type aliases

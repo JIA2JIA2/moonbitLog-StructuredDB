@@ -138,6 +138,7 @@ struct IngestOptions {
   idempotent : Bool
   sampling : @core.SamplingConfig?
   from_bytes : Int64?
+  schema : Bool
 }
 
 ///|
@@ -147,7 +148,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1863,6 +1864,28 @@ fn ingest_timestamp(
 }
 
 ///|
+/// Unified-schema transform for one parsed line: extract the six canonical
+/// fields, promote `service` to the record key, re-serialize the standard
+/// fields into the value, and pick up the schema timestamp when present.
+/// A line with no canonical fields keeps its original key/value (the ts
+/// stays None so the regular timestamp path applies).
+fn schema_transform(
+  key : Bytes,
+  value : Bytes,
+  fields : Array[(Bytes, Bytes)],
+  fallback_ts : Int64,
+) -> (Bytes, Bytes, Int64?) {
+  let f = @core.schema_from_fields(fields, fallback_ts)
+  let k = match f.service {
+    Some(s) => s
+    None => key
+  }
+  let v = @core.schema_value(f)
+  let v2 = if v.length() == 0 { value } else { v }
+  (k, v2, f.ts)
+}
+
+///|
 /// Append parsed lines to the log in batches of `opts.batch_n`, flushing and
 /// persisting metadata per batch. With `idempotent`, a line whose (key, value)
 /// matches the key's latest live record is recognized as a duplicate delivery
@@ -1891,13 +1914,21 @@ fn ingest_lines(
       let log = open_log(dir)
       let mut j = i
       while j < chunk_end {
-        let (k, v, fields) = parse_ingest_line(lines[j], opts)
+        let (raw_k, raw_v, fields) = parse_ingest_line(lines[j], opts)
+        let (k, v, schema_ts) = if opts.schema {
+          schema_transform(raw_k, raw_v, fields, ts_base + j.to_int64())
+        } else {
+          (raw_k, raw_v, None)
+        }
         let keep = match opts.sampling {
           Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
           None => true
         }
         if keep {
-          let rec_ts = ingest_timestamp(fields, opts, ts_base + j.to_int64())
+          let rec_ts = match schema_ts {
+            Some(t) => t
+            None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
+          }
           if opts.idempotent {
             let (added, _) = log.append_idempotent(k, v, rec_ts)
             if added {
@@ -2434,6 +2465,114 @@ fn cmd_search(
       }
       if hit {
         print_record(rec)
+        hits = hits + 1
+      }
+      max_hits < 0 || hits < max_hits
+    })
+    println("(" + hits.to_string() + " matches)")
+    close_log(log)
+  })
+}
+
+///|
+/// Unified-schema query: stream records in offset order and keep those that
+/// match every given condition (AND). `--service` matches the record key
+/// (schema ingest stores the service name as the key) or a parsed service
+/// field; `--level`, `--host` and `--trace-id` match parsed fields;
+/// `--contains` matches the raw value as an ASCII case-insensitive substring;
+/// `--since`/`--until` bound the record timestamp (epoch ms, inclusive);
+/// `--limit` stops early. Output is the standard record line, or JSON with
+/// `--json`. Non-schema records still match `--service` via the key and
+/// `--contains` via the value, so mixed directories stay queryable.
+fn cmd_query(
+  dir : String,
+  level : String?,
+  service : String?,
+  host : String?,
+  trace_id : String?,
+  contains : String?,
+  since : String?,
+  until : String?,
+  limit : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  let level_b : Bytes? = match level {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let service_b : Bytes? = match service {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let host_b : Bytes? = match host {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let trace_b : Bytes? = match trace_id {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let contains_b : Bytes? = match contains {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  let max_hits = match limit {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid limit: " + s)
+      }
+    None => -1
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let mut hits = 0
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      let mut hit = true
+      match since_ts {
+        Some(t) => if rec.timestamp < t { hit = false }
+        None => ()
+      }
+      match until_ts {
+        Some(t) => if rec.timestamp > t { hit = false }
+        None => ()
+      }
+      if hit {
+        let fields = @core.parse_kv_pairs(rec.value)
+        hit = @core.schema_matches(
+          fields,
+          rec.key,
+          rec.value,
+          level_b,
+          service_b,
+          host_b,
+          trace_b,
+          contains_b,
+        )
+      }
+      if hit {
+        if json {
+          print_json_record(rec)
+        } else {
+          print_record(rec)
+        }
         hits = hits + 1
       }
       max_hits < 0 || hits < max_hits
@@ -3551,6 +3690,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
       let mut idempotent = false
+      let mut schema = false
       let mut from_str : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -3612,6 +3752,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--exclude" && i + 1 < args.length() {
           exclude_str = Some(args[i + 1])
           i = i + 1
+        } else if a == "--schema" {
+          schema = true
         }
         i = i + 1
       }
@@ -3651,6 +3793,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         idempotent,
         sampling,
         from_bytes,
+        schema,
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -3669,6 +3812,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
       let mut idempotent = false
+      let mut schema = false
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
       let mut sample_rate : String? = (None : String?)
@@ -3724,6 +3868,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--exclude" && i + 1 < args.length() {
           exclude_str = Some(args[i + 1])
           i = i + 1
+        } else if a == "--schema" {
+          schema = true
         }
         i = i + 1
       }
@@ -3754,6 +3900,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         idempotent,
         sampling,
         from_bytes: None,
+        schema,
       }
       cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
     }
@@ -3811,6 +3958,64 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_search(args[2], args[3], field, ignore_case, limit, from, to)
+    }
+  } else if cmd == "query" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut level : String? = (None : String?)
+      let mut service : String? = (None : String?)
+      let mut host : String? = (None : String?)
+      let mut trace_id : String? = (None : String?)
+      let mut contains : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
+      let mut limit : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--level" && i + 1 < args.length() {
+          level = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--host" && i + 1 < args.length() {
+          host = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--trace-id" && i + 1 < args.length() {
+          trace_id = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--contains" && i + 1 < args.length() {
+          contains = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--limit" && i + 1 < args.length() {
+          limit = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        }
+        i = i + 1
+      }
+      cmd_query(
+        args[2],
+        level,
+        service,
+        host,
+        trace_id,
+        contains,
+        since,
+        until,
+        limit,
+        json,
+      )
     }
   } else if cmd == "context" {
     if args.length() < 4 {
