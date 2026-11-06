@@ -1851,3 +1851,67 @@ test "export/import roundtrip property" {
   clean_dir(src)
   clean_dir(dst)
 }
+
+///|
+test "tier moves cold segments behind symlinks and reads still work" {
+  let dir = "/tmp/moonlog_tier_dir"
+  let cold = "/tmp/moonlog_tier_cold"
+  ignore(@backend_native.ensure_dir(dir))
+  ignore(@backend_native.ensure_dir(cold))
+  clean_dir(dir)
+  clean_dir(cold)
+  let log : @log.Log[
+    @backend_native.NativeFileLog,
+    @backend_native.NativeFileLog,
+  ] = @log.Log::new((60 : Int64), base => {
+    @backend_native.open_segment_in_dir(dir, base) catch {
+      _ => panic()
+    }
+  })
+  for i = 0; i < 8; i = i + 1 {
+    ignore(log.append(b"k", b"v", i.to_int64()) catch { _ => panic() })
+  }
+  assert_true(log.segment_count() >= 3)
+  let segment_count = log.segment_count()
+  @backend_native.flush_meta(dir, log) catch {
+    _ => panic()
+  }
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  // warm=0: everything but the active segment goes cold.
+  let moved = @backend_native.tier_log_dir(dir, cold, (60 : Int64), 0) catch {
+    _ => panic()
+  }
+  assert_eq(moved, segment_count - 1)
+  let first_name = @segment.segment_file_name((0 : UInt64))
+  assert_true(@backend_native.is_symlink(dir + "/" + first_name))
+  assert_true(!@backend_native.is_symlink(cold + "/" + first_name))
+  assert_true(@backend_native.file_exists(cold + "/" + first_name))
+  // Cold segments stay readable through the links.
+  let rlog = @backend_native.open_log_dir(dir, (60 : Int64)) catch {
+    _ => panic()
+  }
+  assert_eq(rlog.count(), 8)
+  let recs = rlog.scan() catch { _ => panic() }
+  assert_eq(recs.length(), 8)
+  assert_eq(recs[0].value, b"v")
+  // Idempotent: nothing more to move.
+  let again = @backend_native.tier_log_dir(dir, cold, (60 : Int64), 0) catch {
+    _ => panic()
+  }
+  assert_eq(again, 0)
+  // Pruning a cold segment removes its cold copy too.
+  ignore(
+    rlog.retain_last(1, seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    }),
+  )
+  assert_true(!@backend_native.file_exists(cold + "/" + first_name))
+  for seg in rlog.segments {
+    seg.writer.close()
+  }
+  clean_dir(dir)
+  clean_dir(cold)
+}

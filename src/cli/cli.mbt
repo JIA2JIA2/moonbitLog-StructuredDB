@@ -61,6 +61,10 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
+///   tier <dir> <cold-dir> [--warm N] [--dry-run]
+///                                    hot/warm/cold tiering: compress rolled
+///                                    segments, move the oldest ones into
+///                                    cold-dir behind symlinks
 ///   fsck <dir> [fast] [--fix] [--dry-run]
 ///                                    verify integrity; --fix repairs what it
 ///                                    can; --dry-run only prints the repair plan
@@ -80,7 +84,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1186,6 +1190,50 @@ fn cmd_compress(
 }
 
 ///|
+/// Tier a directory into hot/warm/cold storage: rolled segments are
+/// compressed in place (warm), and segments older than the newest `--warm N`
+/// rolled ones are moved into `cold-dir` with symlinks left behind (cold), so
+/// readers, verification and backups keep working unchanged. `--dry-run`
+/// prints the plan without touching anything.
+fn cmd_tier(
+  dir : String,
+  cold_dir : String,
+  warm : String?,
+  dry : Bool,
+) -> Unit raise @io.IoError {
+  let warm_n = match warm {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid warm count: " + s)
+      }
+    None => 1
+  }
+  if dry {
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let n = log.segment_count()
+      let cut = n - 1 - warm_n
+      let to_move = if cut > 0 { cut } else { 0 }
+      println(
+        "tier plan: " +
+        to_move.to_string() +
+        " cold of " +
+        n.to_string() +
+        " segments (warm " +
+        warm_n.to_string() +
+        ")",
+      )
+      close_log(log)
+    })
+  } else {
+    run_locked(dir, true, () => {
+      let moved = @backend_native.tier_log_dir(dir, cold_dir, ROLL_SIZE, warm_n)
+      println("tiered " + moved.to_string() + " segments cold into " + cold_dir)
+    })
+  }
+}
+
+///|
 /// Export the whole directory (including tombstones) to a portable record
 /// stream file.
 fn cmd_export(dir : String, file : String) -> Unit raise @io.IoError {
@@ -1997,6 +2045,25 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_compact_expired(args[2], args[3])
+    }
+  } else if cmd == "tier" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut warm : String? = (None : String?)
+      let mut dry = false
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--dry-run" {
+          dry = true
+        } else if a == "--warm" && i + 1 < args.length() {
+          warm = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_tier(args[2], args[3], warm, dry)
     }
   } else if cmd == "compress" {
     let mut algo = "lzss"

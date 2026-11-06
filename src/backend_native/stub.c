@@ -290,3 +290,62 @@ int32_t moonlog_sleep_ms(int32_t ms) {
   ts.tv_nsec = (long)(ms % 1000) * 1000000L;
   return (int32_t)nanosleep(&ts, NULL);
 }
+
+/*
+ * Cold-tier support: a cold segment lives in another directory and the main
+ * path becomes a symlink to it, so every existing reader keeps working.
+ */
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_symlink(moonbit_bytes_t target, moonbit_bytes_t link_path) {
+  char *t = moonlog_c_path(target);
+  char *l = moonlog_c_path(link_path);
+  if (t == NULL || l == NULL) {
+    free(t);
+    free(l);
+    return -1;
+  }
+  int r = symlink(t, l);
+  free(t);
+  free(l);
+  return r < 0 ? -1 : 0;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_is_symlink(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return 0;
+  }
+  struct stat st;
+  int r = lstat(p, &st);
+  free(p);
+  return (r == 0 && S_ISLNK(st.st_mode)) ? 1 : 0;
+}
+
+/*
+ * Remove a path; when it is a symlink, also remove the file it points at
+ * (used when a cold segment is pruned so the cold copy does not linger).
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_remove_with_link(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  char target[4096];
+  target[0] = 0;
+  struct stat st;
+  if (lstat(p, &st) == 0 && S_ISLNK(st.st_mode)) {
+    ssize_t n = readlink(p, target, sizeof(target) - 1);
+    if (n > 0) {
+      target[n] = 0;
+    }
+  }
+  int r = unlink(p);
+  if (target[0] != 0) {
+    unlink(target);
+  }
+  free(p);
+  return r;
+}

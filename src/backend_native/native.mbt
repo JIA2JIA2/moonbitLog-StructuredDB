@@ -53,6 +53,18 @@ extern "C" fn moonlog_closedir(handle : Int64) -> Int32 = "moonlog_closedir"
 extern "C" fn moonlog_mtime_ns(path : Bytes) -> Int64 = "moonlog_mtime_ns"
 
 ///|
+#borrow(target, link_path)
+extern "C" fn moonlog_symlink(target : Bytes, link_path : Bytes) -> Int32 = "moonlog_symlink"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_is_symlink(path : Bytes) -> Int32 = "moonlog_is_symlink"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_remove_with_link(path : Bytes) -> Int32 = "moonlog_remove_with_link"
+
+///|
 /// Number of buffered bytes at which an append is flushed to the descriptor.
 const WRITE_BUFFER_LIMIT : Int32 = 65536
 
@@ -597,9 +609,14 @@ fn write_file_atomic(
 }
 
 ///|
-/// Remove a segment's data and index files (retention).
+/// Remove a segment's data and index files (retention). When the data path is
+/// a cold-tier symlink, the file it points at is removed too.
 pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
-  ignore(remove_file(dir + "/" + @segment.segment_file_name(base)))
+  ignore(
+    moonlog_remove_with_link(
+      @utf8.encode(dir + "/" + @segment.segment_file_name(base)),
+    ),
+  )
   ignore(remove_file(segment_index_path(dir, base)))
   ignore(remove_file(segment_keys_path(dir, base)))
   ignore(fsync_dir(dir) catch { _ => () })
@@ -1109,6 +1126,73 @@ fn contains_u64(arr : Array[UInt64], v : UInt64) -> Bool {
 /// when the file cannot be stat'ed.
 pub fn file_mtime_ns(path : String) -> Int64 {
   moonlog_mtime_ns(@utf8.encode(path))
+}
+
+///|
+/// Whether `path` itself is a symbolic link (does not follow it).
+pub fn is_symlink(path : String) -> Bool {
+  moonlog_is_symlink(@utf8.encode(path)) > 0
+}
+
+///|
+/// Create a symbolic link at `link_path` pointing at `target`. Returns true on
+/// success.
+pub fn symlink(target : String, link_path : String) -> Bool {
+  moonlog_symlink(@utf8.encode(target), @utf8.encode(link_path)) >= 0
+}
+
+///|
+/// Tier a log directory into hot/warm/cold storage: rolled segments are
+/// compressed in place (warm), and segments older than the last
+/// `warm_segments` rolled ones are copied into `cold_dir` with the main path
+/// atomically replaced by a symbolic link to the cold copy (cold). The active
+/// segment always stays hot. Because only the link changes, every reader,
+/// verifier and backup keeps working unchanged; pruning a cold segment removes
+/// its cold copy too. Returns the number of segments moved cold this run
+/// (already-migrated segments are skipped, so the command is idempotent).
+pub fn tier_log_dir(
+  dir : String,
+  cold_dir : String,
+  roll_size : Int64,
+  warm_segments : Int32,
+) -> Int32 raise @io.IoError {
+  ignore(ensure_dir(cold_dir))
+  let log = open_log_dir(dir, roll_size)
+  let n = log.segment_count()
+  ignore(compress_rolled_segments(dir, log))
+  let cut = n - 1 - warm_segments
+  let mut moved = 0
+  let mut i = 0
+  while i < n {
+    if i < cut {
+      let base = log.segments[i].base_offset
+      let name = @segment.segment_file_name(base)
+      let main_path = dir + "/" + name
+      if !is_symlink(main_path) {
+        let cold_path = cold_dir + "/" + name
+        write_file(cold_path, read_file(main_path))
+        ignore(fsync_dir(cold_dir) catch { _ => () })
+        let tmp_link = dir + "/" + name + ".tmplink"
+        if symlink(cold_path, tmp_link) {
+          let rc = moonlog_rename(
+            @utf8.encode(tmp_link),
+            @utf8.encode(main_path),
+          )
+          if rc >= 0 {
+            moved = moved + 1
+          } else {
+            ignore(remove_file(tmp_link))
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  flush_meta(dir, log)
+  for seg in log.segments {
+    seg.writer.close()
+  }
+  moved
 }
 
 ///|

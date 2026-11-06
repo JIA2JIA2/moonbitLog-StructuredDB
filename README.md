@@ -16,6 +16,7 @@
 - **消费游标**：`ConsumerCursor` 保存已提交读位置，按批 `poll`，可续读；位置可持久化到目录下的 `CURSOR` 文件。
 - **物理备份/恢复**：`backup` / `restore` 以独占锁 + 全量 flush 生成一致快照并原样拷贝段文件与元数据，offset 语义保留，恢复后的副本可无缝续写与续读；对已有备份目录重复执行 `backup` 为**增量**拷贝——备份副本比源端段文件新（源端自上次备份未被修改）即跳过，源端已删除的段自动清理，大目录备份成本降为 O(变更)。
 - **日志采集**：`ingest` 从外部日志文件采集——批量导入或持续跟踪追加（`--follow`），`lines`/`kv` 两种解析（字段提取：指定字段提升为记录键、其余字段重组为值），位点经命名游标持久化可断点续采，截断/轮转自动从头重采。
+- **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -134,6 +135,12 @@ moonlog <command> <dir> [args...]
                                 尾部、重建 MANIFEST 与全部段 sidecar，随后
                                 再校验一次并输出报告；`--dry-run` 只打印修
                                 复计划（将截断/隔离/删除什么），不改盘
+compress <dir> [rle|lzss]     原地压缩所有已 roll 段
+  tier <dir> <cold-dir> [--warm N] [--dry-run]
+                                热温冷分层：已 roll 段原地压缩（温），比最
+                                新 `--warm` 个已 roll 段更旧的段迁入
+                                cold-dir 并以 symlink 占位（冷），读/校验/
+                                备份路径全部透明；`--dry-run` 只打印计划
 stats <dir> [json]            打印逐段统计（含每段逻辑字节 disk 磁盘字节与
                               压缩汇总；可选 JSON）
 version                       打印 moonlog 版本号（与 moon.mod 同步）
@@ -393,6 +400,7 @@ u32 crc32          (仅覆盖 body)
 - M102 CI 性能门禁：ms 级 native 基准（顺序扫描/区间扫描/段恢复）与保守阈值（本地 pinned 工具链值的 5–6 倍余量）比较，仅拦截数量级回退，规避共享 runner 的 µs 级噪声
 - M103 export/import roundtrip property 测试：固定 seed 随机 put/delete 序列 × 6 轮，导出记录流重放进全新目录，断言逐记录等价（offset 连续、timestamp/kind/payload 保留）
 - M104 日志采集：CLI `ingest` 从外部日志文件批量导入（`--once`）或持续跟踪（`--follow`，半行留待下轮、截断/轮转自动重采）；`lines`/`kv` 两种解析（字段提取与格式化：`--key-field` 提升为记录键、其余字段重组为值，`--key` 常量标签）；采集位点以命名游标 `ingest-<basename>` 持久化实现断点续采；核心解析器 `parse_kv_pairs` 随 core 包提供并有单测
+- M105 热温冷分层存储：`tier_log_dir` 与 CLI `tier`——已 roll 段先原地压缩（温层），较旧的段复制进 cold 目录并以 symlink **原子替换**主路径（冷层），活跃段恒热；新增 symlink/lstat/readlink stub，`remove_segment_files` 联动清理冷副本；读/校验/备份/修复经链接透明，命令幂等并支持 `--dry-run` 计划
 
 ## 许可
 
