@@ -1569,3 +1569,67 @@ test "verify_fast agrees with verify and detects checksum damage" {
     None => panic()
   }
 }
+
+///|
+test "append_idempotent skips exact duplicates and appends changes" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+  )
+  let (added, off) = log.append_idempotent(b"k", b"v1", (1 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(added)
+  assert_eq(off, (0 : UInt64))
+  // Same content again: recognized as a duplicate delivery, nothing re-logged.
+  let (added2, off2) = log.append_idempotent(b"k", b"v1", (2 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(!added2)
+  assert_eq(off2, (0 : UInt64))
+  assert_eq(log.count(), 1)
+  // Same key, different value: a genuine update, appended.
+  let (added3, off3) = log.append_idempotent(b"k", b"v2", (3 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(added3)
+  assert_eq(off3, (1 : UInt64))
+  // Different key: appended.
+  let (added4, _) = log.append_idempotent(b"k2", b"v1", (4 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(added4)
+  assert_eq(log.count(), 3)
+  // Replaying the latest content is still a no-op.
+  let (added5, _) = log.append_idempotent(b"k", b"v2", (5 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(!added5)
+  assert_eq(log.count(), 3)
+}
+
+///|
+test "append_idempotent works across segments" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (60 : Int64),
+    base => mem_segment(base),
+  )
+  // Three alternating payloads keep every append distinct while the log rolls
+  // over several segments.
+  for i = 0; i < 6; i = i + 1 {
+    let v = if i % 3 == 0 { b"aa" } else if i % 3 == 1 { b"bb" } else { b"ccc" }
+    let (added, _) = log.append_idempotent(b"k", v, i.to_int64()) catch {
+      _ => panic()
+    }
+    assert_true(added)
+  }
+  assert_eq(log.count(), 6)
+  assert_true(log.segment_count() >= 2)
+  // Replaying the latest content is recognized across the segment boundary.
+  let (added, off) = log.append_idempotent(b"k", b"ccc", (100 : Int64)) catch {
+    _ => panic()
+  }
+  assert_true(!added)
+  assert_eq(off, (5 : UInt64))
+  assert_eq(log.count(), 6)
+}

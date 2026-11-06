@@ -6,7 +6,10 @@
 ///   moonlog <command> <dir> [args...]
 ///
 /// Commands:
-///   put <dir> <key> <value>          append a key/value record
+///   put <dir> <key> <value> [--ts <ms>] [--idempotent]
+///                                    append a key/value record; with
+///                                    --idempotent a repeated (key, value) is
+///                                    recognized and skipped
 ///   put-if <dir> <key> <expected|-> <value>
 ///                                    append only if live value == expected
 ///   put-batch <dir> <k> <v> ...      append several key/value records at once
@@ -32,17 +35,21 @@
 ///                                    optional fast fsck every N cycles
 ///   follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
 ///                                    print new records as they are appended
-///   ingest <dir> <file> [--follow] [--once] [--format lines|kv] [--key <name>]
-///                     [--key-field <name>] [--from <bytes>] [--batch N]
-///                     [--interval ms]
+///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
+///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
+///                     [--from <bytes>] [--batch N] [--interval ms]
+///                     [--idempotent]
 ///                                    parse a log file into records (batch
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
 ///                                    cursor; `--fifo` subscribes to a named
-///                                    pipe instead (writers push batches)
+///                                    pipe instead (writers push batches);
+///                                    with --idempotent replayed lines whose
+///                                    (key, value) matches the latest record
+///                                    are skipped
 ///   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
 ///             [--format lines|kv] [--key <name>] [--key-field <name>]
-///             [--ts-field <name>]
+///             [--ts-field <name>] [--idempotent]
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
 ///                                    or /push buffers into a bounded queue
 ///                                    and answers 202, or 429 + Retry-After
@@ -327,6 +334,7 @@ fn cmd_put(
   key : String,
   value : String,
   ts : String?,
+  idempotent : Bool,
 ) -> Unit raise @io.IoError {
   let timestamp = match ts {
     Some(s) =>
@@ -337,9 +345,20 @@ fn cmd_put(
   }
   run_locked(dir, true, () => {
     let log = open_log(dir)
-    let off = log.append(@utf8.encode(key), @utf8.encode(value), timestamp)
-    println("offset " + off.to_string())
-    @backend_native.flush_meta(dir, log)
+    let kb = @utf8.encode(key)
+    let vb = @utf8.encode(value)
+    let (added, off) = if idempotent {
+      log.append_idempotent(kb, vb, timestamp)
+    } else {
+      let off = log.append(kb, vb, timestamp)
+      (true, off)
+    }
+    if added {
+      println("offset " + off.to_string())
+      @backend_native.flush_meta(dir, log)
+    } else {
+      println("skipped " + off.to_string() + " (duplicate)")
+    }
     close_log(log)
   })
 }
@@ -1693,6 +1712,7 @@ fn cmd_ingest(
   key : String,
   key_field : String,
   ts_field : String?,
+  idempotent : Bool,
   from : String?,
   batch : String?,
   interval : String?,
@@ -1722,7 +1742,7 @@ fn cmd_ingest(
   }
   if fifo {
     cmd_ingest_fifo(
-      dir, file, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+      dir, file, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
     )
     return
   }
@@ -1736,6 +1756,7 @@ fn cmd_ingest(
       @backend_native.load_named_cursor(dir, cursor_name).reinterpret_as_int64()
   }
   let mut total = 0
+  let mut duplicates = 0
   let mut go = true
   while go {
     let size = @backend_native.file_size(file)
@@ -1745,10 +1766,11 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      total = total +
-        ingest_lines(
-          dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
-        )
+      let written = ingest_lines(
+        dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
+      )
+      duplicates = duplicates + (lines.length() - written)
+      total = total + written
       pos = pos + consumed
       @backend_native.save_named_cursor(
         dir,
@@ -1762,10 +1784,17 @@ fn cmd_ingest(
       go = false
     }
   }
+  let dup_note = if duplicates > 0 {
+    " (" + duplicates.to_string() + " duplicates skipped)"
+  } else {
+    ""
+  }
   println(
     "ingested " +
     total.to_string() +
-    " records (position " +
+    " records" +
+    dup_note +
+    " (position " +
     pos.to_string() +
     ", cursor " +
     cursor_name +
@@ -1805,7 +1834,9 @@ fn ingest_timestamp(
 
 ///|
 /// Append parsed lines to the log in batches of `batch_n`, flushing and
-/// persisting metadata per batch. Returns the number of records appended.
+/// persisting metadata per batch. With `idempotent`, a line whose (key, value)
+/// matches the key's latest live record is recognized as a duplicate delivery
+/// and skipped. Returns the number of records actually appended.
 fn ingest_lines(
   dir : String,
   lines : Array[Bytes],
@@ -1814,6 +1845,7 @@ fn ingest_lines(
   field_bytes : Bytes,
   ts_field_bytes : Bytes?,
   batch_n : Int32,
+  idempotent : Bool,
 ) -> Int32 raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
@@ -1824,25 +1856,29 @@ fn ingest_lines(
     } else {
       lines.length()
     }
+    let mut chunk_written = 0
     run_locked(dir, true, () => {
       let log = open_log(dir)
       let mut j = i
       while j < chunk_end {
         let (k, v) = parse_ingest_line(lines[j], format, key_bytes, field_bytes)
-        ignore(
-          log.append(
-            k,
-            v,
-            ingest_timestamp(v, ts_field_bytes, ts_base + j.to_int64()),
-          ),
-        )
+        let rec_ts = ingest_timestamp(v, ts_field_bytes, ts_base + j.to_int64())
+        if idempotent {
+          let (added, _) = log.append_idempotent(k, v, rec_ts)
+          if added {
+            chunk_written = chunk_written + 1
+          }
+        } else {
+          ignore(log.append(k, v, rec_ts))
+          chunk_written = chunk_written + 1
+        }
         j = j + 1
       }
       log.flush()
       @backend_native.flush_meta(dir, log)
       close_log(log)
     })
-    written = written + (chunk_end - i)
+    written = written + chunk_written
     i = chunk_end
   }
   written
@@ -1860,6 +1896,7 @@ fn cmd_ingest_fifo(
   field_bytes : Bytes,
   ts_field_bytes : Bytes?,
   batch_n : Int32,
+  idempotent : Bool,
 ) -> Unit raise @io.IoError {
   let mut total = 0
   while true {
@@ -1881,6 +1918,7 @@ fn cmd_ingest_fifo(
           total = total +
             ingest_lines(
               dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
+              idempotent,
             )
         }
       }
@@ -1952,6 +1990,7 @@ struct HttpQueue {
   batch : Int32
   alert_threshold : Int32
   mut alerts : Int32
+  idempotent : Bool
 }
 
 ///|
@@ -1992,7 +2031,14 @@ fn http_queue_drain(
   q.pending = q.pending - take
   ignore(
     ingest_lines(
-      dir, chunk, format, key_bytes, field_bytes, ts_field_bytes, take,
+      dir,
+      chunk,
+      format,
+      key_bytes,
+      field_bytes,
+      ts_field_bytes,
+      take,
+      q.idempotent,
     ),
   )
   if q.head > 4096 && q.head * 2 > q.lines.length() {
@@ -2127,6 +2173,7 @@ fn cmd_http(
   key : String,
   key_field : String,
   ts_field : String?,
+  idempotent : Bool,
 ) -> Unit raise @io.IoError {
   if format != "lines" && format != "kv" {
     raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
@@ -2199,6 +2246,7 @@ fn cmd_http(
     batch: batch_n,
     alert_threshold: backlog_alert_n,
     alerts: 0,
+    idempotent,
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
@@ -3265,15 +3313,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut ts : String? = (None : String?)
+      let mut idempotent = false
       let mut i = 5
       while i < args.length() {
         if args[i] == "--ts" && i + 1 < args.length() {
           ts = Some(args[i + 1])
           i = i + 1
+        } else if args[i] == "--idempotent" {
+          idempotent = true
         }
         i = i + 1
       }
-      cmd_put(args[2], args[3], args[4], ts)
+      cmd_put(args[2], args[3], args[4], ts, idempotent)
     }
   } else if cmd == "put-if" {
     if args.length() < 6 {
@@ -3396,6 +3447,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut key = "log"
       let mut key_field = "key"
       let mut ts_field : String? = (None : String?)
+      let mut idempotent = false
       let mut from : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -3429,6 +3481,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--ts-field" && i + 1 < args.length() {
           ts_field = Some(args[i + 1])
           i = i + 1
+        } else if a == "--idempotent" {
+          idempotent = true
         }
         i = i + 1
       }
@@ -3441,6 +3495,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         key,
         key_field,
         ts_field,
+        idempotent,
         from,
         batch,
         interval,
@@ -3458,6 +3513,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut key = "log"
       let mut key_field = "key"
       let mut ts_field : String? = (None : String?)
+      let mut idempotent = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -3485,6 +3541,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--ts-field" && i + 1 < args.length() {
           ts_field = Some(args[i + 1])
           i = i + 1
+        } else if a == "--idempotent" {
+          idempotent = true
         }
         i = i + 1
       }
@@ -3498,6 +3556,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         key,
         key_field,
         ts_field,
+        idempotent,
       )
     }
   } else if cmd == "bench-write" {

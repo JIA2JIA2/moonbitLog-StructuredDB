@@ -50,6 +50,7 @@ pub(all) struct Log[W, R] {
 pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, Int64)]) -> Array[UInt64] raise @io.IoError
 pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch_atomic(Self[W, R], Array[(Bytes, Bytes, Int64)], (@segment.Segment[W, R]) -> Unit) -> Array[UInt64] raise @io.IoError
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::append_idempotent(Self[W, R], Bytes, Bytes, Int64) -> (Bool, UInt64) raise @io.IoError
 pub fn[W, R] Log::build_key_index(Self[W, R]) -> KeyIndex
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact(Self[W, R], on_drop~ : (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compact_expired(Self[W, R], Int64, Int64, on_drop~ : (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError

@@ -202,6 +202,35 @@ pub fn[W : @io.LogWriter, R] Log::append_batch(
 }
 
 ///|
+/// Idempotent append: when the latest live record for `key` already carries
+/// the exact same `value`, nothing is written and the existing offset is
+/// returned with `false` — a repeated delivery is recognized instead of being
+/// re-logged. Any other content (same key with a new value, a new key, or a
+/// record after a tombstone) is appended as usual and returned with `true`.
+/// The membership check rides the incrementally maintained key index, so it is
+/// O(1) per call on the hot path.
+pub fn[W : @io.LogWriter, R : @io.LogReader] Log::append_idempotent(
+  self : Log[W, R],
+  key : Bytes,
+  value : Bytes,
+  timestamp : Int64,
+) -> (Bool, UInt64) raise @io.IoError {
+  let index = self.build_key_index()
+  match index.latest(key) {
+    Some(off) => {
+      let prev = self.get(off) catch { _ => None }
+      match prev {
+        Some(p) => if p.value == value { return (false, off) }
+        None => ()
+      }
+    }
+    None => ()
+  }
+  let off = self.append(key, value, timestamp)
+  (true, off)
+}
+
+///|
 /// Append several records atomically: if any append fails, every record from
 /// this batch is discarded. Segments created by the batch are handed to
 /// `on_drop` (so the caller can reclaim their files), the previously active
