@@ -112,13 +112,20 @@ moonlog <command> <dir> [args...]
   cursor-list <dir>             列出全部命名消费游标位置
   cursor-drop <dir> <name>      删除命名消费游标位置
   follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
+            [--match <text>] [--level-min <lv>] [--service <svc>] [--flush]
                                 持续打印新追加的记录（`-` 从持久化游标续读，
                                 `tail` 从当前末尾开始；`--commit` 每批后提交
                                 游标，`--name` 指定命名游标以支持多消费者各
                                 自 follow/提交；`--json` 以单行 JSON 输出
                                 （UTF-8 文本，与 export-jsonl 同构）；`--once`
                                 拉取一轮即退出；轮询间隔可用
-                                `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
+                                `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）；
+                                live-debug 过滤（4.5）：`--match`（key/value
+                                子串）、`--level-min`（严重度下界，未知级别
+                                排除）、`--service`（记录键）——只收窄打印
+                                流，游标照常推进（被过滤记录视为已消费）；
+                                `--flush` 逐条刷新 stdout（管道/重定向观测
+                                实时输出）
   ingest <dir> <file> [--follow] [--once] [--fifo]
                     [--format lines|kv|json|template] [--template <tpl>]
                     [--key <name>] [--key-field <name>] [--value-field <name>]
@@ -589,6 +596,9 @@ u32 crc32          (仅覆盖 body)
 - M125 全文检索通配符与中文验证（4.1）：core 新增 `wildcard_contains`（子串语义通配匹配——`*` 任意序列/`?` 单字节/字面字符 ASCII 折叠，greedy 双指针带回溯的经典算法、模式包裹 `*` 实现子串语义，无正则引擎；UTF-8 字节级参与故中文模式字面可用，+2 单测含中文模式）与 `search --wildcard`（线性路径的匹配器替换，按 `--field` 选择 key/value/both；与 `--inverted` 互斥报错）。验收"中文与英文关键词均可命中"：中文由线性子串路径天然精确命中（冒烟 `数据库`/`连接失败`），英文线性+倒排双路径回归；通配符冒烟 `data*se`/`*TIMEOUT`+ignore-case/`查询*错误`/`查询??????错误`（字节级 `?` 的中文演示）与互斥报错全部正确。开发注记：wc_match 初版循环未先判 pattern 耗尽导致 pattern.at(p) 越界 abort（经典通配算法的 pattern-exhausted 分支须走 `*` 回溯）；子串包裹下 `?` 的精确单字节不可用 contains 否定（尾星兜底吸收）——精确性用 `err??r` 类模式断言；**python 多替换脚本对同文件原子应用**是规避并行 edit 踩踏的可靠手段（fmt 重排过的锚文本须先 cat 实际行再写替换对）
 - M126 结构化过滤范围与下推（4.2）：`query` 新增 `--level-min`/`--level-max`（core 既有 `level_rank` 五级有序；范围过滤激活时要求已知 level——未知级别被排除，与字段列下推语义一致，冒烟曾暴露 linear 保留/indexed 排除的不一致后统一）；**条件下推到存储层**——①时间界下推：`query` 两条路径（线性重构为段循环、indexed 段循环）先按 `seg.min_ts`/`seg.max_ts` 判与 [since, until] 不相交则整段跳过（不解码）；②等值/范围下推：`idx_sel` 从单 `(field, value)` 扩展为 `(field, values[], also_key)`——level 范围展开为五级枚举区间内值的字段列 postings **并集**（矛盾区间空集即零结果），service/host/trace_id 等值转列表形态，全条件 AND 精滤不变。实测：`--level-min warn` linear/indexed 一致 3 条、`--level-min warn --level-max error` 一致 2 条（fatal 排除）、多维组合（level-min+service+time 窗口）一致 2 条、时间窗只覆盖单桶时另一桶数据不出现（下推跳段）、`--level bogus` 报错、宽窗口回归（修正冒烟脚本的时钟偏移——两次运行的 NOW-3d 不同导致窗口错位，非代码问题）。开发注记：`--indexed` 的 level 范围下推在数据含未知 level（verbose）时与线性路径语义不一致曾暴露（展开枚举不含未知值），统一为"范围过滤要求已知 level"；冒烟时间窗口要用宽界或数据实际 ts（时钟随运行推进）
 - M127 强制时间范围（4.3）：`query` 新增**禁止无边界全表扫描**语义——无显式 `--since` 时自动降级到默认时间窗（`query_window_ms`：最近 24h，env `MOONLOG_QUERY_WINDOW_MS` 可调）并输出 `INFO query scoped to the last ...s` 提示行；`--require-time` 时无 `--since` 直接报错（附 `--since 0` 指引）；`--since 0` 是显式值不受两者影响（拒绝的是*无*时间范围的查询）。默认窗经 M126 的段级 `min_ts/max_ts` 时间下推只扫窗口内段——降级窗与下推闭环即"避免无边界全表扫描"的实意。范围决策：聚焦 `query`（结构化查询主入口）；`search` 保持线性定位（`--limit`/`--from/--to` 兜底）。实测：默认窗命中新记录且 D1/D3 旧桶被下推跳过（linear/indexed 一致 1 条）、`--since 0` 全表 5 条、`--require-time` 拒绝（含指引）、`--require-time --since 0` 正常、1h 窗排除 1 天前数据。开发注记：`query_window_ms` 返回 Int64 以与 `now_ms()` 运算（follow_interval_ms 的 Int32 是为 sleep_ms 服务）；冒烟数据超出默认窗导致 0 matches 是正确行为（建库时刻 + 1d 距今超 24h）——用"现在"写入的记录验证窗内命中
+- M128 上下文检索同请求关联（4.4）：`context` 新增 `--trace-id <id|auto>` 与 `--service <svc>` 关联过滤——上下文只取与锚点同 trace（`auto` 从锚点记录自身提取 trace_id）或同服务的记录，**不匹配的交错记录跳过且不占名额**（offset 序连续可读），实现改为流式单遍扫描（锚点前匹配记录的环形缓冲 + 锚点后计数早停，替代 M106 的 clamp 窗口——无关联选项时行为等价 M106 物理前后 N 条）；锚点越界从静默空输出改为报错。实测：A/B 两请求物理交错入库（各 4 条），锚定 reqA step3 `--trace-id auto --before 2 --after 2` 输出 reqA 完整序列 step1-4（reqB 全部过滤、offset 序）；显式 `--trace-id reqB` 还原 reqB 序列；`--service` 附加同服务条件（svc2 的 reqC 记录被排除）；无关联选项回归 M106 物理上下文（7 条窗口）；锚点越界 `offset out of range` 报错。开发注记：流式上下文算法的环形缓冲用 `Array::remove(0)` 淘汰最老记录；关联判定在 trace_filter/service_filter 均缺省时完全短路（不 parse value，保持无关联路径零开销）；锚点存在性检查统一前置（auto 提取与越界报错共用一次 get）
+- M129 Live tail 过滤与延迟证据（4.5）：`follow` 新增 live-debug 过滤——`--match <text>`（key/value 子串，复用 match_needle）、`--level-min <level>`（core `level_rank` 严重度下界，未知级别排除与 query 语义一致，非法 level 报错）、`--service <svc>`（记录键）：**只收窄打印流，游标照常推进**（被过滤记录视为已消费，`--commit` 不卡住）；新增 `--flush`（每条打印后 `fflush(stdout)`——新增 stub `moonlog_fflush_stdout` + `backend_native.flush_stdout`，C 运行时对管道/文件全缓冲是 live tail 管道与重定向观测的硬阻塞）。**端到端延迟证据**：约定口径 = 发现延迟 ≤ 轮询间隔（默认 200ms，`MOONLOG_FOLLOW_INTERVAL` 可调）+ 一轮处理；实测（`--flush` + bash 观测、含 put 进程开销）记录级 108-196ms、最差 <600ms——**远低于秒级约定**。实测过滤：`--level-min error` 2 条（info 排除）、`--match db` 2 条、`--service orders` 2 条（svcB 排除）、过滤 + `--commit` 游标到 10 后二次 follow 0 条不重放。开发注记：MoonBit println 走 C stdio——重定向到文件时全缓冲，stdbuf 对（可能的）静态链接二进制无效，观测 live tail 必须进程内 flush（`--flush`）或依赖进程退出的隐式 flush；bash grep 轮询观测的延迟含 put 进程启动开销（保守上界），CLOCK_REALTIME 回拨可产生负值样本（rec5 -173ms）——取中位/多数样本口径
+- **Live tail**（4.5）：实时流式跟踪由 `follow <dir> tail` 承载（200ms 轮询、游标持久化、`--json`，M104 前既有），本子项补**发布观察/线上调试的过滤与延迟证据**——`follow --match <text>`（key/value 子串）、`--level-min <level>`（严重度下界，未知级别排除，与 query 语义一致）、`--service <svc>`（记录键）：只收窄打印流、**游标照常推进**（被过滤记录视为已消费，--commit 不卡住）；`--flush` 逐条刷新 stdout（C 运行时对管道/文件全缓冲，live tail 管道与重定向观测必需）。**端到端延迟**：约定口径 = 发现延迟 ≤ 轮询间隔（默认 200ms）+ 一轮处理时间；实测（`--flush` + bash 观测，含 put 进程启动开销）记录级 108-196ms、最差 <600ms——**远低于秒级约定**，且 `MOONLOG_FOLLOW_INTERVAL` 可调更紧。实测：三维度过滤（error 级 2 条/db 子串 2 条/orders 服务 2 条）各自正确、过滤 + `--commit` 后游标推进到最新（二次 follow 0 条不重放）、`--level bogus` 报错。
 
 ## 许可
 

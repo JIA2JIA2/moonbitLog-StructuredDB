@@ -521,3 +521,7 @@ MOONBIT_FFI_EXPORT
 int32_t moonlog_shutdown_requested(void) {
   return moonlog_shutdown_flag ? 1 : 0;
 }
+MOONBIT_FFI_EXPORT
+int32_t moonlog_fflush_stdout(void) {
+  return fflush(stdout);
+}

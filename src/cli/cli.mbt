@@ -48,8 +48,14 @@
 ///   serve <dir> <max-segments> [ttl] [--every ms] [--fsck-every N] [--once]
 ///                                    run maintenance periodically, with an
 ///                                    optional fast fsck every N cycles
-///   follow <dir> [start|-|tail] [--once] [--commit] [--json] [--name <cursor>]
+///   follow <dir> [start|-|tail] [--once] [--commit] [--json]
+///            [--name <cursor>] [--match <text>] [--level-min <lv>]
+///            [--service <svc>]
 ///                                    print new records as they are appended
+///                                    (live tail); the filters narrow the
+///                                    printed stream without moving the
+///                                    cursor — end-to-end latency is bounded
+///                                    by the poll interval (default 200ms)
 ///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
 ///                     [--from <bytes>] [--batch N] [--interval ms]
@@ -2063,7 +2069,15 @@ fn follow_interval_ms() -> Int32 {
 /// past it; run only one committing follower per cursor at a time. With
 /// `--json`, records print as single-line JSON objects (UTF-8 text assumed)
 /// instead of the plain form. With `--once`, a single pass is made and the
-/// command returns (for scripts and tests).
+/// command returns (for scripts and tests). Live-debug filters (4.5) narrow
+/// what is printed without changing the cursor: `--match <text>` keeps
+/// records whose key or value contains the substring, `--level-min <level>`
+/// keeps records with at least that severity rank (unknown levels are
+/// excluded, same as query), `--service <svc>` keeps records with that key.
+/// End-to-end latency is bounded by the poll interval (default 200ms,
+/// `MOONLOG_FOLLOW_INTERVAL`); `--flush` makes every printed record hit
+/// stdout immediately (the C runtime buffers pipes/files) so pipelines and
+/// redirect targets observe records in real time.
 fn cmd_follow(
   dir : String,
   start : String,
@@ -2071,6 +2085,10 @@ fn cmd_follow(
   commit : Bool,
   json : Bool,
   name : String?,
+  match_text : String?,
+  level_min : String?,
+  service : String?,
+  flush : Bool,
 ) -> Unit raise @io.IoError {
   let mut from : UInt64 = (0 : UInt64)
   if start == "tail" {
@@ -2091,6 +2109,26 @@ fn cmd_follow(
   } else {
     from = parse_offset(start)
   }
+  // 4.5 live-debug filters: they narrow the printed stream only — skipped
+  // records are consumed too, so `--commit` cursors keep advancing.
+  let match_b : Bytes? = match match_text {
+    Some(t) => Some(@utf8.encode(t))
+    None => None
+  }
+  let service_b : Bytes? = match service {
+    Some(sv) => Some(@utf8.encode(sv))
+    None => None
+  }
+  let min_rank : Int32? = match level_min {
+    Some(l) => {
+      let r = @core.level_rank(@utf8.encode(l))
+      if r < 0 {
+        raise @io.IoError::Invalid("invalid level: " + l)
+      }
+      Some(r)
+    }
+    None => None
+  }
   let interval = follow_interval_ms()
   let mut fetched = 0
   let mut go = true
@@ -2105,13 +2143,54 @@ fn cmd_follow(
     if next > from {
       let recs = log.scan_range(from, next)
       for rec in recs {
-        if json {
-          print_json_record(rec)
-        } else {
-          print_record(rec)
+        let mut keep = true
+        match match_b {
+          Some(nb) =>
+            if !match_needle(rec.key, nb, false) &&
+              !match_needle(rec.value, nb, false) {
+              keep = false
+            }
+          None => ()
+        }
+        if keep {
+          match service_b {
+            Some(sb) => if rec.key != sb { keep = false }
+            None => ()
+          }
+        }
+        if keep {
+          match min_rank {
+            Some(r) => {
+              let mut lv : Bytes? = None
+              for pair in @core.parse_kv_pairs(rec.value) {
+                if pair.0 == b"level" {
+                  lv = Some(pair.1)
+                }
+              }
+              let lr = match lv {
+                Some(l) => @core.level_rank(l)
+                None => -1
+              }
+              // A level filter requires a known level (same as query).
+              if lr < 0 || lr < r {
+                keep = false
+              }
+            }
+            None => ()
+          }
+        }
+        if keep {
+          if json {
+            print_json_record(rec)
+          } else {
+            print_record(rec)
+          }
+          if flush {
+            @backend_native.flush_stdout()
+          }
+          fetched = fetched + 1
         }
       }
-      fetched = fetched + recs.length()
       from = next
       if commit {
         match name {
@@ -4854,6 +4933,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let mut commit = false
     let mut json = false
     let mut name : String? = (None : String?)
+    let mut match_text : String? = (None : String?)
+    let mut level_min : String? = (None : String?)
+    let mut service : String? = (None : String?)
+    let mut flush = false
     let mut i = 3
     while i < args.length() {
       let a = args[i]
@@ -4866,12 +4949,34 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       } else if a == "--name" && i + 1 < args.length() {
         name = Some(args[i + 1])
         i = i + 1
+      } else if a == "--match" && i + 1 < args.length() {
+        match_text = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--level-min" && i + 1 < args.length() {
+        level_min = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--service" && i + 1 < args.length() {
+        service = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--flush" {
+        flush = true
       } else {
         start = a
       }
       i = i + 1
     }
-    cmd_follow(args[2], start, once, commit, json, name)
+    cmd_follow(
+      args[2],
+      start,
+      once,
+      commit,
+      json,
+      name,
+      match_text,
+      level_min,
+      service,
+      flush,
+    )
   } else if cmd == "ingest" {
     if args.length() < 4 {
       println(USAGE)

@@ -69,6 +69,17 @@ extern "C" fn moonlog_remove_with_link(path : Bytes) -> Int32 = "moonlog_remove_
 extern "C" fn moonlog_run_command(cmd : Bytes) -> Int32 = "moonlog_run_command"
 
 ///|
+extern "C" fn moonlog_fflush_stdout() -> Int32 = "moonlog_fflush_stdout"
+
+///|
+/// Flush C stdout — live tail prints through the C runtime, which buffers
+/// when stdout is a pipe or file; `follow --flush` calls this per record so
+/// pipelines and redirect targets see records in real time.
+pub fn flush_stdout() -> Unit {
+  ignore(moonlog_fflush_stdout())
+}
+
+///|
 extern "C" fn moonlog_tcp_listen(port : Int32) -> Int32 = "moonlog_tcp_listen"
 
 ///|
