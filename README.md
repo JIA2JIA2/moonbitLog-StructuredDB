@@ -33,6 +33,7 @@
 - **全文检索：通配符与中文**（4.1）：`search --wildcard`——`*` 匹配任意字节序列、`?` 精确匹配单字节（字节级：中文一字 3 个 UTF-8 字节，可用 `查询??????错误` 类模式或 `*` 跨汉字）、其余字符字面匹配（`--ignore-case` 折叠 ASCII）；**子串语义**（模式包裹 `*` 后做 greedy 回溯匹配，无正则引擎）；与 `--inverted` 互斥（词级倒排 vs 通配子串）。**中文关键词**由线性子串路径天然命中（UTF-8 字节级精确匹配，无需分词——"数据库"精确命中含该词的记录，短语同理），倒排索引面向 ASCII 词（CJK 不产 token，既有定位）。实测：中文关键词（`数据库`/`连接失败`）与英文关键词（线性+倒排回归）均命中；通配符 `data*se`/`*TIMEOUT`（+ignore-case）/`查询*错误`/`查询??????错误` 全语义正确；`--wildcard --inverted` 明确报错。
 - **结构化过滤：范围与下推**（4.2）：`query` 新增 `--level-min`/`--level-max`——按严重度有序范围过滤（core `level_rank` 五级 debug<info<warn<error<fatal，与 `--level` 精确可 AND 组合；**范围过滤要求已知 level，未知级别被排除**——与字段列下推语义一致）；**条件下推到存储层**：①时间界 `--since`/`--until` 经段级 `min_ts`/`max_ts` **跳过不相交段**（不解码段数据，线性与 indexed 路径均生效）；②`--indexed` 的下推从单等值扩展为**值列表**——level 范围展开为五级枚举中满足区间的值的字段列 postings 并集（矛盾区间得空候选集即零结果），service/host/trace_id 等值同样走列表形态。实测：`--level-min warn` linear/indexed 一致（3 条）、`--level-min warn --level-max error` 一致（2 条，fatal 排除）、`--level-min warn --service payments --since/--until` 多维组合一致（2 条）、时间窗只覆盖单桶时另一桶被跳过、`--level bogus` 报错。
 - **强制时间范围**（4.3）：`query` **禁止无边界全表扫描**——无显式 `--since` 时自动**降级**到默认时间窗（最近 24h，`MOONLOG_QUERY_WINDOW_MS` 可调）并输出 INFO 提示行；`--require-time` 时无 `--since` 的查询被**拒绝**（报错并指引）；`--since 0` 是显式全表（不受降级/拒绝影响）。默认窗经 4.2 的段级时间下推只扫窗口内段（窗外段不解码）——遗忘时间界的查询天然受限。范围决策：聚焦结构化查询主入口 `query`；`search` 的全文线性扫描已有 `--limit`/`--from/--to` 兜底（README 定位）。实测：默认窗命中新记录且旧桶被下推跳过（linear/indexed 一致）、`--since 0` 显式全表 5 条、`--require-time` 拒绝、`MOONLOG_QUERY_WINDOW_MS=3600000` 1h 窗排除 1 天前数据。
+- **上下文检索：同请求关联**（4.4）：`context` 新增 `--trace-id <id|auto>` 与 `--service <svc>` 关联过滤——上下文只取与锚点**同 trace（`auto` 从锚点记录自身提取 trace_id）或同服务**的记录，**不匹配的交错记录跳过且不占名额**（offset 序连续可读）——两个请求物理交错的日志流中，锚定任一请求的记录即可还原该请求的完整现场；无关联选项时保持 M106 的物理前后 N 条语义。实测：A/B 两请求交错入库，锚定 reqA 任一记录 `--trace-id auto --before 2 --after 2` 输出 reqA 完整序列（reqB 全部过滤）、显式 `--trace-id reqB` 还原 reqB、`--service` 附加同服务条件、无关联回归 M106、锚点越界报错。
 - **热温冷分层与归档**（3.6）：分层本体由 `tier` 承载（热=活跃段、温=已 roll 段 LZSS 压缩、冷=旧段迁独立 cold-dir + symlink 原子替换，M105）——cold-dir 可指向任意更廉价存储路径/设备，**跨层查询对用户完全透明**（scan/search/query/aggregate/fsck/backup/prune 经链接无感）；新增 `archive <dir> <file> [--list] [--extract --into <dir>]`——把目录数据文件（MANIFEST + 段 + sidecar）打包为**单一自包含归档文件**（`MLAR` 容器：file 表 + 内容 + 尾部 CRC32），单文件 PUT 即可上传任意对象存储（S3/OSS/OBS），`--extract` 解包到空目录后即可直接打开查询（跨层数据完整）；归档应针对**主目录**（symlink 穿透读取冷段数据），cold-dir 只含段本体不可独立恢复。实测：三桶 90 条 → tier 后热层少 2 段（温层 compressed=true、1 段迁冷）且 scan/aggregate/query 对冷段数据全部正常（透明）；归档 10 文件 9085B → 解包恢复副本 scan 90 条、冷段数据可查；CRC 破坏拒绝。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
@@ -270,8 +271,14 @@ query <dir> [--level <lv>] [--service <svc>] [--host <h>]
                               输出；无 schema 的旧记录仍可按 key/
                               contains 过滤
 context <dir> <offset> [--before N] [--after N]
+              [--trace-id <id|auto>] [--service <svc>]
                               上下文检索：打印目标 offset 前后各 N 条（默认
-                              3/3，自动 clamp 到日志边界并跨段）
+                              3/3，自动 clamp 到日志边界并跨段）；
+                              `--trace-id auto` 从锚点记录提取 trace_id、
+                              `--trace-id <id>`/`--service <svc>` 显式指
+                              定——关联模式下上下文只含匹配记录（交错请
+                              求的日志跳过且不占名额，offset 序还原同一
+                              请求的完整现场）；锚点越界报错
 aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
                  [--match <text>] [--top N] [--json]
                               多维聚合统计：按 key/value/kind/UTC 小时/键前

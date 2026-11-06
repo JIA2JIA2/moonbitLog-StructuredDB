@@ -81,7 +81,12 @@
 ///                                    full-text search (linear scan) over keys
 ///                                    and/or values
 ///   context <dir> <offset> [--before N] [--after N]
-///                                    print the records around one offset
+///                                    [--trace-id <id|auto>] [--service <svc>]
+///                                    print the records around one offset; with
+///                                    correlation options only records sharing
+///                                    the trace (auto = extracted from the
+///                                    anchor) or service are part of the
+///                                    context, skipping interleaved traffic
 ///   aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
 ///                    [--match <text>] [--top N] [--json]
 ///                                    multi-dimensional count aggregation
@@ -3655,6 +3660,8 @@ fn cmd_context(
   offset : String,
   before : String?,
   after : String?,
+  trace_id : String?,
+  service : String?,
 ) -> Unit raise @io.IoError {
   let target = parse_offset(offset)
   let b = match before {
@@ -3673,18 +3680,115 @@ fn cmd_context(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
-    let next = log.next_offset()
-    let bu = b.to_uint64()
-    let au = (a + 1).to_uint64()
-    let lo = if target > bu { target - bu } else { (0 : UInt64) }
-    let hi = if target + au < next { target + au } else { next }
-    let mut count = 0
-    log.for_each_while(lo, hi, rec => {
-      print_record(rec)
-      count = count + 1
+    if target >= log.next_offset() {
+      raise @io.IoError::Invalid("offset out of range: " + offset)
+    }
+    // Correlation predicate (4.4): explicit values, or `--trace-id auto`
+    // extracted from the anchor record's own trace_id field.
+    let trace_filter : Bytes? = match trace_id {
+      Some(t) =>
+        if t == "auto" {
+          let anchor = log.get(target) catch { _ => None }
+          match anchor {
+            Some(rec) => {
+              let mut tv : Bytes? = None
+              for pair in @core.parse_kv_pairs(rec.value) {
+                if pair.0 == b"trace_id" {
+                  tv = Some(pair.1)
+                }
+              }
+              tv
+            }
+            None => None
+          }
+        } else {
+          Some(@utf8.encode(t))
+        }
+      None => None
+    }
+    let service_filter : Bytes? = match service {
+      Some(sv) => Some(@utf8.encode(sv))
+      None => None
+    }
+    let correlating = match trace_filter {
+      Some(_) => true
+      None =>
+        match service_filter {
+          Some(_) => true
+          None => false
+        }
+    }
+    let before_n = b
+    let after_n = a
+    let ring : Array[@core.Record] = []
+    let mut out_after = 0
+    let mut printed = 0
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if rec.offset == target {
+        for r in ring {
+          print_record(r)
+          printed = printed + 1
+        }
+        print_record(rec)
+        printed = printed + 1
+        return true
+      }
+      let mut m = true
+      if correlating {
+        let mut rtv : Bytes? = None
+        let mut rsv : Bytes? = None
+        for pair in @core.parse_kv_pairs(rec.value) {
+          if pair.0 == b"trace_id" {
+            rtv = Some(pair.1)
+          }
+          if pair.0 == b"service" {
+            rsv = Some(pair.1)
+          }
+        }
+        match trace_filter {
+          Some(tv) =>
+            match rtv {
+              Some(v) => if v != tv { m = false }
+              None => m = false
+            }
+          None => ()
+        }
+        if m {
+          match service_filter {
+            Some(sv) =>
+              if rec.key != sv &&
+                (match rsv {
+                  Some(v) => v != sv
+                  None => true
+                }) {
+                m = false
+              }
+            None => ()
+          }
+        }
+      }
+      if rec.offset < target {
+        // Before the anchor: keep the last `before_n` matching records.
+        if m {
+          ring.push(rec)
+          if ring.length() > before_n {
+            ignore(ring.remove(0))
+          }
+        }
+      } else {
+        // After the anchor: print the first `after_n` matching records.
+        if m && out_after < after_n {
+          print_record(rec)
+          printed = printed + 1
+          out_after = out_after + 1
+        }
+        if out_after >= after_n {
+          return false
+        }
+      }
       true
     })
-    println("(" + count.to_string() + " records)")
+    println("(" + printed.to_string() + " records)")
     close_log(log)
   })
 }
@@ -5232,6 +5336,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut before : String? = (None : String?)
       let mut after : String? = (None : String?)
+      let mut trace_id : String? = (None : String?)
+      let mut service : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -5241,10 +5347,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--after" && i + 1 < args.length() {
           after = Some(args[i + 1])
           i = i + 1
+        } else if a == "--trace-id" && i + 1 < args.length() {
+          trace_id = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
-      cmd_context(args[2], args[3], before, after)
+      cmd_context(args[2], args[3], before, after, trace_id, service)
     }
   } else if cmd == "aggregate" {
     if args.length() < 3 {
