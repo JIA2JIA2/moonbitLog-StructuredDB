@@ -8,19 +8,37 @@ import {
 // Values
 pub fn body_len_at(Bytes, Int32) -> Int32 raise DecodeError
 
+pub fn bytes_contains(Bytes, Bytes) -> Bool
+
+pub fn bytes_contains_ci(Bytes, Bytes) -> Bool
+
 pub fn crc32(Bytes) -> UInt32
 
 pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
 
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
 
+pub fn format_utc(Int64, String) -> String
+
 pub fn lz_compress(Bytes) -> Bytes
 
 pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError
 
+pub fn normalize_log_template(Bytes) -> Bytes
+
+pub fn parse_kv_pairs(Bytes) -> Array[(Bytes, Bytes)]
+
+pub fn parse_rbac_line(Bytes) -> RbacRole?
+
+pub fn rbac_allows(RbacRole, Bytes) -> Bool
+
+pub fn rbac_find(Array[RbacRole], Bytes) -> RbacRole?
+
 pub fn rle_compress(Bytes) -> Bytes
 
 pub fn rle_decompress(Bytes, Int64) -> Bytes raise MetaError
+
+pub fn shell_quote(String) -> String
 
 pub fn slice(Bytes, Int32, Int32) -> Bytes
 
@@ -38,6 +56,12 @@ pub(all) suberror MetaError {
 }
 
 // Types and methods
+pub(all) struct RbacRole {
+  name : Bytes
+  token : Bytes
+  allow : Array[Bytes]
+}
+
 pub(all) struct Record {
   offset : UInt64
   timestamp : Int64
