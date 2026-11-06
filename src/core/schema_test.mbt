@@ -18,7 +18,9 @@ test "schema_from_fields extracts six fields with alias and first-wins" {
   )
   let f = @core.schema_from_fields(fields, (7 : Int64))
   match f.ts {
-    Some(t) => assert_eq(t, (1000 : Int64))
+    // "1000" is below the 1e11 threshold, so normalize_ts reads it as
+    // 1000 seconds → 1,000,000 ms.
+    Some(t) => assert_eq(t, (1000000 : Int64))
     None => panic()
   }
   match f.level {

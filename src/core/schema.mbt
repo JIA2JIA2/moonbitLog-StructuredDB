@@ -61,8 +61,10 @@ pub(all) struct SchemaFields {
 ///|
 /// Extract the six canonical fields from a parsed field set. Timestamp values
 /// are parsed as epoch milliseconds; an unparsable value falls back to
-/// `fallback`. Implemented as six independent first-match lookups over the
-/// field list (no shared loop state, no mutable struct fields).
+/// `fallback`. Timestamps go through `normalize_ts` (any numeric precision
+/// or ISO-8601 zone offset). Implemented as six independent first-match
+/// lookups over the field list (no shared loop state, no mutable struct
+/// fields).
 pub fn schema_from_fields(
   fields : Array[(Bytes, Bytes)],
   fallback : Int64,
@@ -78,8 +80,7 @@ pub fn schema_from_fields(
     None
   }
   let ts_opt : Int64? = match first_value(ts_names) {
-    Some(v) =>
-      Some(@string.parse_int64(@utf8.decode_lossy(v)) catch { _ => fallback })
+    Some(v) => Some(normalize_ts(v, fallback))
     None => None
   }
   {

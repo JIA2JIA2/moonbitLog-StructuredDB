@@ -139,6 +139,7 @@ struct IngestOptions {
   sampling : @core.SamplingConfig?
   from_bytes : Int64?
   schema : Bool
+  clock_skew_ms : Int64
 }
 
 ///|
@@ -1836,7 +1837,9 @@ fn cmd_ingest(
 
 ///|
 /// Record timestamp for a parsed field set: the `--ts-field` value when
-/// present and parsable, else the fallback (arrival order based).
+/// present and parsable — through `normalize_ts`, so any numeric precision
+/// (s/ms/µs/ns) or ISO-8601 zone offset is accepted — else the fallback
+/// (arrival order based).
 fn ingest_timestamp(
   fields : Array[(Bytes, Bytes)],
   opts : IngestOptions,
@@ -1847,11 +1850,7 @@ fn ingest_timestamp(
       let mut found : Int64? = None
       for pair in fields {
         if pair.0 == fb {
-          found = Some(
-            @string.parse_int64(bytes_to_string(pair.1)) catch {
-              _ => fallback
-            },
-          )
+          found = Some(@core.normalize_ts(pair.1, fallback))
         }
       }
       match found {
@@ -1925,10 +1924,13 @@ fn ingest_lines(
           None => true
         }
         if keep {
-          let rec_ts = match schema_ts {
+          let raw_ts = match schema_ts {
             Some(t) => t
             None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
           }
+          // 2.3 clock-skew correction: a fixed offset (ms) applied to every
+          // record timestamp, compensating a slow/fast source clock.
+          let rec_ts = raw_ts + opts.clock_skew_ms
           if opts.idempotent {
             let (added, _) = log.append_idempotent(k, v, rec_ts)
             if added {
@@ -2481,7 +2483,10 @@ fn cmd_search(
 /// field; `--level`, `--host` and `--trace-id` match parsed fields;
 /// `--contains` matches the raw value as an ASCII case-insensitive substring;
 /// `--since`/`--until` bound the record timestamp (epoch ms, inclusive);
-/// `--limit` stops early. Output is the standard record line, or JSON with
+/// `--limit` stops early. With `--sort-by-time`, matches are collected and
+/// printed ordered by event time (ties keep offset order) instead of the
+/// arrival (offset) order — the standard answer to out-of-order delivery.
+/// Output is the standard record line, or JSON with
 /// `--json`. Non-schema records still match `--service` via the key and
 /// `--contains` via the value, so mixed directories stay queryable.
 fn cmd_query(
@@ -2494,6 +2499,7 @@ fn cmd_query(
   since : String?,
   until : String?,
   limit : String?,
+  sort_by_time : Bool,
   json : Bool,
 ) -> Unit raise @io.IoError {
   let level_b : Bytes? = match level {
@@ -2544,6 +2550,7 @@ fn cmd_query(
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let mut hits = 0
+    let collected : Array[@core.Record] = []
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
       let mut hit = true
       match since_ts {
@@ -2568,7 +2575,9 @@ fn cmd_query(
         )
       }
       if hit {
-        if json {
+        if sort_by_time {
+          collected.push(rec)
+        } else if json {
           print_json_record(rec)
         } else {
           print_record(rec)
@@ -2577,6 +2586,34 @@ fn cmd_query(
       }
       max_hits < 0 || hits < max_hits
     })
+    if sort_by_time {
+      collected
+      .mut_view()
+      .sort_by(fn(a, b) {
+        let c = a.timestamp.compare(b.timestamp)
+        if c < 0 {
+          -1
+        } else if c > 0 {
+          1
+        } else {
+          let d = a.offset.compare(b.offset)
+          if d < 0 {
+            -1
+          } else if d > 0 {
+            1
+          } else {
+            0
+          }
+        }
+      })
+      for rec in collected {
+        if json {
+          print_json_record(rec)
+        } else {
+          print_record(rec)
+        }
+      }
+    }
     println("(" + hits.to_string() + " matches)")
     close_log(log)
   })
@@ -3691,6 +3728,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut template : String? = (None : String?)
       let mut idempotent = false
       let mut schema = false
+      let mut clock_skew : String? = (None : String?)
       let mut from_str : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -3754,6 +3792,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--schema" {
           schema = true
+        } else if a == "--clock-skew" && i + 1 < args.length() {
+          clock_skew = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -3776,6 +3817,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           )
         None => None
       }
+      let skew_ms : Int64 = match clock_skew {
+        Some(s) =>
+          @string.parse_int64(s) catch {
+            _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
+          }
+        None => 0
+      }
       let opts : IngestOptions = {
         format,
         key_bytes: @utf8.encode(key),
@@ -3794,6 +3842,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         sampling,
         from_bytes,
         schema,
+        clock_skew_ms: skew_ms,
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -3813,6 +3862,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut template : String? = (None : String?)
       let mut idempotent = false
       let mut schema = false
+      let mut clock_skew : String? = (None : String?)
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
       let mut sample_rate : String? = (None : String?)
@@ -3870,6 +3920,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--schema" {
           schema = true
+        } else if a == "--clock-skew" && i + 1 < args.length() {
+          clock_skew = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -3882,6 +3935,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
             _ => raise @io.IoError::Invalid("invalid batch: " + s)
           }
         None => 256
+      }
+      let skew_ms : Int64 = match clock_skew {
+        Some(s) =>
+          @string.parse_int64(s) catch {
+            _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
+          }
+        None => 0
       }
       let opts : IngestOptions = {
         format,
@@ -3901,6 +3961,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         sampling,
         from_bytes: None,
         schema,
+        clock_skew_ms: skew_ms,
       }
       cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
     }
@@ -3971,6 +4032,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
       let mut limit : String? = (None : String?)
+      let mut sort_by_time = false
       let mut json = false
       let mut i = 3
       while i < args.length() {
@@ -3999,6 +4061,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--limit" && i + 1 < args.length() {
           limit = Some(args[i + 1])
           i = i + 1
+        } else if a == "--sort-by-time" {
+          sort_by_time = true
         } else if a == "--json" {
           json = true
         }
@@ -4014,6 +4078,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         since,
         until,
         limit,
+        sort_by_time,
         json,
       )
     }

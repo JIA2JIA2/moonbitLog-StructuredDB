@@ -35,9 +35,13 @@ pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError
 
 pub fn normalize_log_template(Bytes) -> Bytes
 
+pub fn normalize_ts(Bytes, Int64) -> Int64
+
 pub fn parse_by_template(Bytes, Bytes) -> Array[(Bytes, Bytes)]?
 
 pub fn parse_http_request(Bytes) -> HttpRequest?
+
+pub fn parse_iso8601_ms(Bytes, Int64) -> Int64
 
 pub fn parse_kv_pairs(Bytes) -> Array[(Bytes, Bytes)]
 
