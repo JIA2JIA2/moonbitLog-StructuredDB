@@ -59,6 +59,11 @@
 ///                    [--min-windows N] [--notify-file <path>] [--webhook <url>]
 ///                                    baseline anomaly detection (mean/stddev
 ///                                    z-score per window)
+///   rbac <dir> init <token> | add <name> <token> <allow> | list
+///            | remove <name> | check <command>
+///                                    manage RBAC roles; once an RBAC file
+///                                    exists every command needs a
+///                                    MOONLOG_TOKEN role that allows it
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
@@ -104,7 +109,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.1"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|alert|baseline|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|search|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -2478,6 +2483,193 @@ fn cmd_baseline(
 }
 
 ///|
+/// Load the RBAC rules from `<dir>/RBAC` (empty when the file is missing or
+/// unreadable).
+fn load_rbac_rules(dir : String) -> Array[@core.RbacRole] {
+  let data = @backend_native.read_file(dir + "/RBAC")
+  let rules : Array[@core.RbacRole] = []
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        match @core.parse_rbac_line(line) {
+          Some(r) => rules.push(r)
+          None => ()
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  rules
+}
+
+///|
+/// Whether `cmd` may run against `dir`: unrestricted when no RBAC file exists
+/// (the local CLI default), otherwise MOONLOG_TOKEN must match a role whose
+/// allow list contains the command (or `*`).
+fn rbac_check(dir : String, cmd : String) -> Bool {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return true
+  }
+  let rules = load_rbac_rules(dir)
+  let token = match @env.get_env_var("MOONLOG_TOKEN") {
+    Some(t) => @utf8.encode(t)
+    None => b""
+  }
+  match @core.rbac_find(rules, token) {
+    Some(role) => @core.rbac_allows(role, @utf8.encode(cmd))
+    None => false
+  }
+}
+
+///|
+/// Append a denial to the directory's audit log (`AUDIT.log`) when RBAC is in
+/// force, so unrestricted directories stay untouched.
+fn record_denied(dir : String, cmd : String) -> Unit {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return
+  }
+  let path = dir + "/AUDIT.log"
+  let existing = @backend_native.read_file(path)
+  let line = "{\"ts\":" +
+    now_ms().to_string() +
+    ",\"command\":\"" +
+    json_escape_str(cmd) +
+    "\",\"decision\":\"deny\"}\n"
+  ignore(
+    @backend_native.write_file(path, existing + @utf8.encode(line)) catch {
+      _ => ()
+    },
+  )
+}
+
+///|
+/// Mask a token for display: keep at most the last four characters.
+fn mask_token(token : String) -> String {
+  let n = token.length()
+  if n <= 4 {
+    "****"
+  } else {
+    "****" + token[n - 4:n].to_owned()
+  }
+}
+
+///|
+/// Join an allow list back into `a,b,c` text.
+fn allow_text(allow : Array[Bytes]) -> String {
+  let sb = StringBuilder()
+  let mut first = true
+  for a in allow {
+    if !first {
+      sb.write_string(",")
+    }
+    first = false
+    sb.write_string(bytes_to_string(a))
+  }
+  sb.to_string()
+}
+
+///|
+/// Manage the directory's RBAC rules. `init <token>` bootstraps an admin role;
+/// `add <name> <token> <allow>` appends a role (allow is a comma list or `*`);
+/// `list` prints roles with masked tokens; `remove <name>` deletes one;
+/// `check <command>` reports whether the current MOONLOG_TOKEN may run it.
+fn cmd_rbac(
+  dir : String,
+  sub : String,
+  args : Array[String],
+  start : Int32,
+) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  if sub == "init" {
+    if args.length() <= start {
+      raise @io.IoError::Invalid("usage: rbac <dir> init <token>")
+    }
+    let token = args[start]
+    let path = dir + "/RBAC"
+    if @backend_native.file_exists(path) {
+      raise @io.IoError::Invalid("RBAC already initialized: " + path)
+    }
+    @backend_native.write_file(
+      path,
+      @utf8.encode("role=admin token=" + token + " allow=*\n"),
+    )
+    println("rbac initialized: admin role created (token hidden)")
+  } else if sub == "add" {
+    if args.length() < start + 3 {
+      raise @io.IoError::Invalid("usage: rbac <dir> add <name> <token> <allow>")
+    }
+    let name = args[start]
+    let token = args[start + 1]
+    let allow = args[start + 2]
+    let path = dir + "/RBAC"
+    let existing = @backend_native.read_file(path)
+    @backend_native.write_file(
+      path,
+      existing +
+      @utf8.encode(
+        "role=" + name + " token=" + token + " allow=" + allow + "\n",
+      ),
+    )
+    println("role added: " + name)
+  } else if sub == "list" {
+    let rules = load_rbac_rules(dir)
+    for r in rules {
+      println(
+        "role=" +
+        bytes_to_string(r.name) +
+        " allow=" +
+        allow_text(r.allow) +
+        " token=" +
+        mask_token(bytes_to_string(r.token)),
+      )
+    }
+    println("(" + rules.length().to_string() + " roles)")
+  } else if sub == "remove" {
+    if args.length() <= start {
+      raise @io.IoError::Invalid("usage: rbac <dir> remove <name>")
+    }
+    let name = @utf8.encode(args[start])
+    let rules = load_rbac_rules(dir)
+    let buf = @buffer.Buffer::Buffer()
+    for r in rules {
+      if r.name != name {
+        buf.write_bytes(
+          @utf8.encode(
+            "role=" +
+            bytes_to_string(r.name) +
+            " token=" +
+            bytes_to_string(r.token) +
+            " allow=" +
+            allow_text(r.allow) +
+            "\n",
+          ),
+        )
+      }
+    }
+    @backend_native.write_file(dir + "/RBAC", buf.to_bytes())
+    println("role removed: " + args[start])
+  } else if sub == "check" {
+    if args.length() <= start {
+      raise @io.IoError::Invalid("usage: rbac <dir> check <command>")
+    }
+    let command = args[start]
+    if rbac_check(dir, command) {
+      println("allowed: " + command)
+    } else {
+      println("denied: " + command)
+    }
+  } else {
+    raise @io.IoError::Invalid(
+      "unknown rbac action: " + sub + " (init|add|list|remove|check)",
+    )
+  }
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -2490,6 +2682,21 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   }
   if args.length() < 3 {
     println(USAGE)
+    return
+  }
+  // RBAC enforcement: once a directory has an RBAC file, every command except
+  // `rbac init` (bootstrapping) and `rbac check` (pure diagnosis) requires a
+  // MOONLOG_TOKEN role that allows it.
+  let bootstrapping = cmd == "rbac" &&
+    args.length() > 3 &&
+    (args[3] == "init" || args[3] == "check")
+  if !bootstrapping && !rbac_check(args[2], cmd) {
+    record_denied(args[2], cmd)
+    println(
+      "permission denied: '" +
+      cmd +
+      "' requires MOONLOG_TOKEN with a permitted role",
+    )
     return
   }
   if cmd == "put" {
@@ -3087,6 +3294,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       cmd_import(args[2], args[3])
+    }
+  } else if cmd == "rbac" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_rbac(args[2], args[3], args, 4)
     }
   } else {
     println(USAGE)

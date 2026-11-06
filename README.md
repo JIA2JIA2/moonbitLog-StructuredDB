@@ -20,6 +20,7 @@
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
 - **告警监控**：**阈值告警** `alert`（按 UTC 窗口计数对比阈值）；**异常基线检测** `baseline`（窗口计数的均值/标准差 z-score，超 sigma 标记异常）；**多渠道通知分发**（stdout / `--notify-file` JSONL 追加 / `--webhook` 经 curl POST 且失败降级不中断）。
+- **运维管理与 RBAC**：`rbac` 以 `<dir>/RBAC` 规则文件（`role=<name> token=<token> allow=<cmds|*>`）控制命令访问——文件存在时除 `rbac init`/`rbac check` 外均需 `MOONLOG_TOKEN` 且角色允许该命令，拒绝事件写入 `AUDIT.log`；无 RBAC 文件时保持开放（向后兼容）。定位说明：本地 CLI 的**防误操作与审计**手段，进程可绕过文件，不构成多租户强隔离。
 - **修复模式**：`fsck --fix`（`repair_log_dir`）隔离整段校验失败的段（改名 `.corrupt` 保留证据）、截断损坏尾部、重建缺失/损坏的 MANIFEST 与段 sidecar。
 - **尾随读**：`follow` 持续打印新追加的记录（`tail -f` 语义），支持从持久化游标续读并 `--commit` 自动提交。
 - **自动维护**：`serve` 周期性执行 maintain 管线（段合并 + 冗余回收 + 可选过期折叠）。
@@ -179,6 +180,12 @@ baseline <dir> [--match <text>] [--window minute|hour|day] [--sigma N]
                               异常基线检测：按窗口计数计算均值/标准差，
                               |z-score| > sigma（默认 3）且窗口数达标即标记
                               异常，可走文件/webhook 通知
+rbac <dir> init <token> | add <name> <token> <allow> | list
+         | remove <name> | check <command>
+                              管理目录 RBAC 规则（`<dir>/RBAC`）；文件一旦存
+                              在，除 `rbac init` 与 `rbac check`（诊断）外所
+                              有命令需提供 MOONLOG_TOKEN 且角色 allow 列表
+                              含该命令（或 `*`），拒绝事件追加到 `AUDIT.log`
 version                       打印 moonlog 版本号（与 moon.mod 同步）
 ```
 
@@ -440,6 +447,7 @@ u32 crc32          (仅覆盖 body)
 - M106 日志检索：全文检索 CLI `search`（流式线性扫描 key/value 子串，`--field`/`--ignore-case`/`--limit`/`--from`/`--to`，无倒排索引、成本 O(records)，文档注明定位）与上下文关联检索 `context`（按 offset 打印前后 N 条，自动 clamp 边界并跨段）；新增 core 子串匹配器 `bytes_contains`/`bytes_contains_ci` 并有单测
 - M107 日志分析：`aggregate` 多维聚合（`--by key|value|kind|hour|prefix:N`、`--kv-field` 字段维度、`--match` 过滤、`--top`、`--json`）；`cluster` 错误聚类（core `normalize_log_template` 将数字/hex/引号串折叠为占位符后按模板计数）；`trend` 趋势直方图（core `format_utc` 的 UTC 分钟/小时/天标签 + 文本条）；顺带修复 `ensure_dir` 不支持父目录的缺陷（改为逐级递归创建，此前冒烟均手工 `mkdir -p` 而未暴露）
 - M108 告警监控：`alert` 阈值告警（UTC 窗口计数 vs `--threshold`，`--json` 事件）与 `baseline` 异常基线检测（窗口计数均值/标准差 z-score，`--sigma`/`--min-windows`）；多渠道通知分发（stdout + `--notify-file` JSONL 追加 + `--webhook` 经 `curl` POST，`shell_quote` 防注入、投递失败降级告警不中断，新增 `moonlog_run_command` stub）；配套为告警提供真实时间维度：`put --ts` 与 `ingest --ts-field`（kv 采集时从日志字段提取 timestamp）
+- M109 运维管理 RBAC：core 新增 `RbacRole`/`parse_rbac_line`/`rbac_allows`/`rbac_find`（Bytes 模型 + 单测），CLI 以 `<dir>/RBAC` 规则文件（`role=.. token=.. allow=cmds|*`）控制访问——文件存在时除 `rbac init`/`rbac check` 外所有命令需 `MOONLOG_TOKEN` 且角色允许，拒绝事件追加 `AUDIT.log`；`rbac init/add/list/remove/check` 管理命令（`list` 隐藏 token 尾部）；无 RBAC 文件保持开放向后兼容。TTL 清理（prune/compact-expired/retain_before/`--ttl`）与导出归档（export/export-jsonl/import/backup）此前已覆盖
 
 ## 许可
 
