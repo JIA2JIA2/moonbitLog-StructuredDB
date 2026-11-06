@@ -1633,3 +1633,61 @@ test "append_idempotent works across segments" {
   assert_eq(off, (5 : UInt64))
   assert_eq(log.count(), 6)
 }
+
+///|
+test "time partition rolls a new segment per bucket" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+    partition_ms=86_400_000,
+  )
+  // Same day (bucket 0): one segment despite a large roll_size.
+  ignore(log.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"b", 86_400_000L - 1L) catch { _ => panic() })
+  assert_eq(log.segment_count(), 1)
+  // Crossing into the next day rolls automatically.
+  ignore(log.append(b"k", b"c", 86_400_000L) catch { _ => panic() })
+  assert_eq(log.segment_count(), 2)
+  // A late arrival from the first bucket opens its own segment again.
+  ignore(log.append(b"k", b"d", (100 : Int64)) catch { _ => panic() })
+  assert_eq(log.segment_count(), 3)
+  // Hour granularity is finer than day.
+  let hlog : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+    partition_ms=3_600_000,
+  )
+  ignore(hlog.append(b"k", b"a", (0 : Int64)) catch { _ => panic() })
+  ignore(hlog.append(b"k", b"b", 3_599_999L) catch { _ => panic() })
+  assert_eq(hlog.segment_count(), 1)
+  ignore(hlog.append(b"k", b"c", 3_600_000L) catch { _ => panic() })
+  assert_eq(hlog.segment_count(), 2)
+  assert_eq(@log.time_bucket(86_400_000L + 123L, 86_400_000L), 86_400_000L)
+  assert_eq(@log.time_bucket(-5L, 86_400_000L), 0L)
+  assert_eq(@log.time_bucket(123L, 0L), 0L)
+}
+
+///|
+test "time partition restores the active bucket after recover" {
+  let log : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::new(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+    partition_ms=86_400_000,
+  )
+  ignore(log.append(b"k", b"a", (1000 : Int64)) catch { _ => panic() })
+  ignore(log.append(b"k", b"b", (2000 : Int64)) catch { _ => panic() })
+  assert_eq(log.segment_count(), 1)
+  // Reopen over the same segments: same-bucket appends continue in place,
+  // a new bucket still rolls.
+  let log2 : @log.Log[@backend_mem.MemLog, @backend_mem.MemLog] = @log.Log::recover(
+    (1_000_000 : Int64),
+    base => mem_segment(base),
+    log.segments,
+    partition_ms=86_400_000,
+  )
+  ignore(log2.append(b"k", b"c", (3000 : Int64)) catch { _ => panic() })
+  assert_eq(log2.segment_count(), 1)
+  ignore(log2.append(b"k", b"d", 86_400_000L + 1L) catch { _ => panic() })
+  assert_eq(log2.segment_count(), 2)
+  assert_eq(log2.count(), 4)
+}

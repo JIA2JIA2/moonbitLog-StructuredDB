@@ -26,16 +26,33 @@ pub impl Eq for SyncPolicy with fn equal(self, other : SyncPolicy) -> Bool {
 pub extend SyncPolicy with Eq::{equal, not_equal}
 
 ///|
+/// Align a timestamp to the start of its partition bucket, the epoch-ms
+/// interval `[k*unit_ms, (k+1)*unit_ms)`. Timestamps before the epoch and
+/// non-positive units clamp to zero (same convention as `format_utc`).
+pub fn time_bucket(ts : Int64, unit_ms : Int64) -> Int64 {
+  if ts < 0 || unit_ms <= 0 {
+    0
+  } else {
+    ts / unit_ms * unit_ms
+  }
+}
+
+///|
 /// Multi-segment append-only log. Records receive globally monotonic offsets;
 /// when the active segment grows past `roll_size` bytes a new segment is
 /// created and subsequent records go there. Segments are never modified once
-/// rolled over.
+/// rolled over. With `partition_ms` > 0 (time partitioning, 3.1) the append
+/// path additionally rolls to a fresh segment whenever a record's time bucket
+/// (day / hour) differs from the active segment's bucket, so each bucket gets
+/// its own segment run that retention can drop as a unit.
 pub(all) struct Log[W, R] {
   mut segments : Array[@segment.Segment[W, R]]
   roll_size : Int64
   mut next_offset : UInt64
   make : MakeSegment[W, R]
   sync : SyncPolicy
+  partition_ms : Int64
+  mut active_bucket : Int64
   mut index_cache : KeyIndex?
   mut index_builds : Int32
   mut cursor_guard : UInt64?
@@ -46,12 +63,15 @@ pub fn[W, R] Log::new(
   roll_size : Int64,
   make : MakeSegment[W, R],
   sync~ : SyncPolicy = SyncPolicy::Never,
+  partition_ms~ : Int64 = 0,
 ) -> Log[W, R] {
   {
     segments: [],
-    roll_size,
     next_offset: 0,
     make,
+    roll_size,
+    partition_ms,
+    active_bucket: -1,
     sync,
     index_cache: None,
     index_builds: 0,
@@ -63,15 +83,27 @@ pub fn[W, R] Log::new(
 /// Assemble a log from already-opened, already-recovered segments in
 /// increasing `base_offset` order. The next offset continues from the last
 /// segment so that subsequent appends remain contiguous.
-pub fn[W, R] Log::recover(
+pub fn[W, R : @io.LogReader] Log::recover(
   roll_size : Int64,
   make : MakeSegment[W, R],
   segments : Array[@segment.Segment[W, R]],
   sync~ : SyncPolicy = SyncPolicy::Never,
+  partition_ms~ : Int64 = 0,
 ) -> Log[W, R] {
   let mut next : UInt64 = (0 : UInt64)
   if segments.length() > 0 {
     next = segments[segments.length() - 1].next_offset
+  }
+  // Restore the active bucket from the first record of the last segment so
+  // partitioned writes keep filling the same bucket after a reopen.
+  let mut bucket : Int64 = -1
+  if partition_ms > 0 && segments.length() > 0 {
+    let active = segments[segments.length() - 1]
+    let first = active.get(active.base_offset) catch { _ => None }
+    match first {
+      Some(rec) => bucket = time_bucket(rec.timestamp, partition_ms)
+      None => ()
+    }
   }
   {
     segments,
@@ -79,6 +111,8 @@ pub fn[W, R] Log::recover(
     next_offset: next,
     make,
     sync,
+    partition_ms,
+    active_bucket: bucket,
     index_cache: None,
     index_builds: 0,
     cursor_guard: None,
@@ -137,15 +171,31 @@ pub fn[W : @io.LogWriter, R] Log::append(
   timestamp : Int64,
   kind~ : @core.RecordKind = @core.RecordKind::Put,
 ) -> UInt64 raise @io.IoError {
+  let my_bucket = if self.partition_ms > 0 {
+    time_bucket(timestamp, self.partition_ms)
+  } else {
+    self.active_bucket
+  }
   let need_new = if self.segments.length() == 0 {
     true
   } else {
     let active = self.segments[self.segments.length() - 1]
-    active.record_count > 0 && active.size >= self.roll_size
+    (active.record_count > 0 && active.size >= self.roll_size) ||
+    (
+      self.partition_ms > 0 &&
+      active.record_count > 0 &&
+      my_bucket != self.active_bucket
+    )
   }
   if need_new {
     let seg = (self.make)(self.next_offset)
     self.segments.push(seg)
+    self.active_bucket = my_bucket
+  } else if self.partition_ms > 0 {
+    let active = self.segments[self.segments.length() - 1]
+    if active.record_count == 0 {
+      self.active_bucket = my_bucket
+    }
   }
   let active = self.segments[self.segments.length() - 1]
   let offset = active.append(key, value, timestamp, kind~)

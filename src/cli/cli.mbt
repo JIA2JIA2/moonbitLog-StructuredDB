@@ -143,6 +143,7 @@ struct IngestOptions {
   mask : Bool
   mask_extra : Array[Bytes]
   meta_bytes : Bytes?
+  partition_ms : Int64
 }
 
 ///|
@@ -152,7 +153,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -216,9 +217,28 @@ fn min_cursor_guard(dir : String) -> UInt64? {
 }
 
 ///|
-fn open_log(dir : String) -> CliLog raise @io.IoError {
+
+///|
+/// Partition unit in ms for `--partition day|hour` (0 = time partitioning off).
+fn parse_partition(s : String) -> Int64 raise @io.IoError {
+  if s == "day" {
+    (86_400_000 : Int64)
+  } else if s == "hour" {
+    (3_600_000 : Int64)
+  } else {
+    raise @io.IoError::Invalid("invalid partition: " + s + " (day|hour)")
+  }
+}
+
+///|
+fn open_log(dir : String, partition~ : Int64 = 0) -> CliLog raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  let log = @backend_native.open_log_dir(dir, ROLL_SIZE, sync=desired_sync())
+  let log = @backend_native.open_log_dir(
+    dir,
+    ROLL_SIZE,
+    sync=desired_sync(),
+    partition_ms=partition,
+  )
   log.set_cursor_guard(min_cursor_guard(dir))
   log
 }
@@ -356,6 +376,7 @@ fn cmd_put(
   value : String,
   ts : String?,
   idempotent : Bool,
+  partition : Int64,
 ) -> Unit raise @io.IoError {
   let timestamp = match ts {
     Some(s) =>
@@ -365,7 +386,7 @@ fn cmd_put(
     None => now_ms()
   }
   run_locked(dir, true, () => {
-    let log = open_log(dir)
+    let log = open_log(dir, partition~)
     let kb = @utf8.encode(key)
     let vb = @utf8.encode(value)
     let (added, off) = if idempotent {
@@ -587,6 +608,153 @@ fn cmd_recover(dir : String) -> Unit raise @io.IoError {
       " next_offset " +
       log.next_offset().to_string(),
     )
+    close_log(log)
+  })
+}
+
+///|
+/// One partition bucket in the `partitions` view.
+struct PartitionStat {
+  mut segments : Int32
+  mut records : Int32
+  mut bytes : Int64
+  mut min_ts : Int64
+  mut max_ts : Int64
+}
+
+///|
+/// Time-partition view (3.1): group segments by the time bucket of their
+/// first record at `--unit day|hour` granularity and report each partition's
+/// segment/record/byte totals and UTC span. Retention (prune-before /
+/// prune-expired) drops whole segments, so with partitioned writes a bucket
+/// can be discarded as a unit; the prune only touches the dropped files and
+/// readers on the shared lock are never blocked by it.
+fn cmd_partitions(
+  dir : String,
+  unit : String,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  let unit_ms = match unit {
+    "day" => (86_400_000 : Int64)
+    "hour" => (3_600_000 : Int64)
+    _ => raise @io.IoError::Invalid("invalid unit: " + unit + " (day|hour)")
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let parts : Array[(Int64, PartitionStat)] = []
+    for seg in log.segments {
+      let first = seg.get(seg.base_offset) catch { _ => None }
+      match first {
+        Some(rec) => {
+          let b = @log.time_bucket(rec.timestamp, unit_ms)
+          let last = seg.get(seg.next_offset - (1 : UInt64)) catch { _ => None }
+          let mut p_max = rec.timestamp
+          match last {
+            Some(l) => p_max = l.timestamp
+            None => ()
+          }
+          let mut stat : PartitionStat? = None
+          for pair in parts {
+            if pair.0 == b {
+              stat = Some(pair.1)
+            }
+          }
+          match stat {
+            Some(p) => {
+              p.segments = p.segments + 1
+              p.records = p.records + seg.record_count
+              p.bytes = p.bytes + seg.size
+              if rec.timestamp < p.min_ts {
+                p.min_ts = rec.timestamp
+              }
+              if p_max > p.max_ts {
+                p.max_ts = p_max
+              }
+            }
+            None =>
+              parts.push(
+                (
+                  b,
+                  {
+                    segments: 1,
+                    records: seg.record_count,
+                    bytes: seg.size,
+                    min_ts: rec.timestamp,
+                    max_ts: p_max,
+                  },
+                ),
+              )
+          }
+        }
+        None => ()
+      }
+    }
+    parts
+    .mut_view()
+    .sort_by(fn(a, c) {
+      let d = a.0.compare(c.0)
+      if d < 0 {
+        -1
+      } else if d > 0 {
+        1
+      } else {
+        0
+      }
+    })
+    let label = fn(ms : Int64) -> String {
+      @core.format_utc(ms, if unit == "day" { "day" } else { "hour" })
+    }
+    if json {
+      let out = StringBuilder()
+      out.write_string("{\"unit\":\"" + unit + "\",\"partitions\":[")
+      let mut first_p = true
+      for pair in parts {
+        let (b, p) = pair
+        if !first_p {
+          out.write_string(",")
+        }
+        first_p = false
+        out.write_string(
+          "{\"bucket\":\"" +
+          label(b) +
+          "\",\"start_ms\":" +
+          b.to_string() +
+          ",\"segments\":" +
+          p.segments.to_string() +
+          ",\"records\":" +
+          p.records.to_string() +
+          ",\"bytes\":" +
+          p.bytes.to_string() +
+          ",\"min_ts\":" +
+          p.min_ts.to_string() +
+          ",\"max_ts\":" +
+          p.max_ts.to_string() +
+          "}",
+        )
+      }
+      out.write_string("]}")
+      println(out.to_string())
+    } else {
+      for pair in parts {
+        let (b, p) = pair
+        println(
+          label(b) +
+          "  segments=" +
+          p.segments.to_string() +
+          " records=" +
+          p.records.to_string() +
+          " bytes=" +
+          p.bytes.to_string() +
+          "  span=" +
+          @core.format_utc(p.min_ts, "minute") +
+          ".." +
+          @core.format_utc(p.max_ts, "minute"),
+        )
+      }
+      println(
+        "(" + parts.length().to_string() + " partitions, unit " + unit + ")",
+      )
+    }
     close_log(log)
   })
 }
@@ -1913,7 +2081,7 @@ fn ingest_lines(
     let mut chunk_written = 0
     let mut chunk_sampled = 0
     run_locked(dir, true, () => {
-      let log = open_log(dir)
+      let log = open_log(dir, partition=opts.partition_ms)
       let mut j = i
       while j < chunk_end {
         let (raw_k, raw_v, fields) = parse_ingest_line(lines[j], opts)
@@ -3679,6 +3847,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut ts : String? = (None : String?)
       let mut idempotent = false
+      let mut partition_str : String? = (None : String?)
       let mut i = 5
       while i < args.length() {
         if args[i] == "--ts" && i + 1 < args.length() {
@@ -3686,10 +3855,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if args[i] == "--idempotent" {
           idempotent = true
+        } else if args[i] == "--partition" && i + 1 < args.length() {
+          partition_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
-      cmd_put(args[2], args[3], args[4], ts, idempotent)
+      let partition = match partition_str {
+        Some(s) => parse_partition(s)
+        None => 0
+      }
+      cmd_put(args[2], args[3], args[4], ts, idempotent, partition)
     }
   } else if cmd == "put-if" {
     if args.length() < 6 {
@@ -3749,6 +3925,25 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "stats" {
     let json = args.length() > 3 && args[3] == "json"
     cmd_stats(args[2], json)
+  } else if cmd == "partitions" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut unit = "day"
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--unit" && i + 1 < args.length() {
+          unit = args[i + 1]
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        }
+        i = i + 1
+      }
+      cmd_partitions(args[2], unit, json)
+    }
   } else if cmd == "fsck" {
     let mut fast = false
     let mut fix = false
@@ -3820,6 +4015,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut mask = false
       let mut mask_fields : String? = (None : String?)
       let mut meta_str : String? = (None : String?)
+      let mut partition_str : String? = (None : String?)
       let mut from_str : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
@@ -3894,6 +4090,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--meta" && i + 1 < args.length() {
           meta_str = Some(args[i + 1])
           i = i + 1
+        } else if a == "--partition" && i + 1 < args.length() {
+          partition_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -3951,6 +4150,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           Some(s) => Some(parse_meta_pairs(s))
           None => None
         },
+        partition_ms: match partition_str {
+          Some(s) => parse_partition(s)
+          None => 0
+        },
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -3974,6 +4177,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut mask = false
       let mut mask_fields : String? = (None : String?)
       let mut meta_str : String? = (None : String?)
+      let mut partition_str : String? = (None : String?)
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
       let mut sample_rate : String? = (None : String?)
@@ -4042,6 +4246,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--meta" && i + 1 < args.length() {
           meta_str = Some(args[i + 1])
           i = i + 1
+        } else if a == "--partition" && i + 1 < args.length() {
+          partition_str = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -4089,6 +4296,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         meta_bytes: match meta_str {
           Some(s) => Some(parse_meta_pairs(s))
           None => None
+        },
+        partition_ms: match partition_str {
+          Some(s) => parse_partition(s)
+          None => 0
         },
       }
       cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)

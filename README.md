@@ -25,6 +25,7 @@
 - **时间规范化**（2.3）：采集端时间值经 core `normalize_ts` 归一到 epoch 毫秒——纯数字按位数识别精度（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），其余按 ISO-8601 解析（`Z`/`±HH:MM`/`±HHMM` 时区、`T` 或空格分隔、小数秒截断到毫秒；core `parse_iso8601_ms` 正向 days-from-civil 与 `format_utc` 互逆，单测覆盖）——**跨时区（`+08:00`/`Z`/`-05:00`）同事件归一到同一时间戳**；`ingest`/`http` 增加 `--clock-skew <ms>` 补偿采集端时钟偏移；append-only 保留到达序，`query --sort-by-time` 按**事件时间**排序输出（tie 保持 offset 序）——实测三时区乱序到达后输出正确事件序，秒/毫秒/ISO 三种写法归一为同一值。展示层统一 UTC。
 - **脱敏与字段富化**（2.4）：`ingest`/`http` 的 `--mask` 在**写入前**对每条 value 做单遍扫描掩码（core `mask_sensitive`，无正则引擎、未命中字节逐个保真）——敏感字段名（`token`/`password`/`secret`/`api_key`/`authorization`/`session`/`cookie` 等内置词表 + `--mask-fields` 自定义，ASCII 忽略大小写）值段整体 `[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀双点）→ `[REDACTED]`；11 位手机号（1[3-9]）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`（UUID 段、纳秒时间戳不误伤）；`--meta env=prod,region=cn-north,version=x` 在写入前为每条记录追加部署元数据（环境/版本/地域富化）。掩码作用于幂等去重之前，重复投递判定一致。实测：手机号/证件号/令牌/长 hex 掩码后 `search` 零明文残留（kv、schema、lines、HTTP 四条路径）。
 - **热温冷分层存储**：`tier` 将已 roll 段原地压缩（温层），把更旧的段迁入独立目录并以 symlink 原子占位（冷层）——活跃段恒为热层；读、校验、修复、备份经链接透明工作，段被回收时冷副本联动删除（依赖 POSIX symlink）。
+- **按时间分区**（3.1）：`put`/`ingest`/`http` 的 `--partition day|hour` 开启时间分区——append 路径在记录的时间桶（core `time_bucket`，epoch 对齐）与活跃段桶不同时**自动滚动创建新段**，同桶数据聚成段运行（迟到数据开自己的段）；单段大小仍受 `roll_size` 控制，分区+段两层大小可控；`partitions` 命令按 `--unit day|hour` 展示分区视图（每分区段数/记录数/字节/UTC span，可选 JSON）；过期清理沿用整段回收（`prune-before`/`prune-expired`）——分区对齐时即整分区淘汰，清理只触碰被回收的段文件，读者（共享锁）永不被阻塞。实测：put/ingest 跨天自动切段、schema+partition 组合按归一后事件时间分桶、prune 与并发读者互不阻塞。
 - **日志检索**：结构化键查询（`get_many`/`get_latest`/`scan_prefix`/`scan_key_range`）；**全文检索** `search`（线性扫描 key/value 子串，支持字段选择、ASCII 忽略大小写、limit、offset 区间）；**上下文关联检索** `context`（按 offset 取前后 N 条，自动 clamp 并跨段）。
 - **日志分析**：**多维聚合统计** `aggregate`（key/value/kind/UTC 时间/键前缀/`--kv-field` 字段维度，top-N，可选 JSON）；**错误自动聚类** `cluster`（数字/十六进制/引号串归一化为模板后按形态计数，变量内容自动折叠）；**趋势可视化** `trend`（UTC 分钟/小时/天分桶 + 文本直方图）。
 - **告警监控**：**阈值告警** `alert`（按 UTC 窗口计数对比阈值）；**异常基线检测** `baseline`（窗口计数的均值/标准差 z-score，超 sigma 标记异常）；**多渠道通知分发**（stdout / `--notify-file` JSONL 追加 / `--webhook` 经 curl POST 且失败降级不中断）。
@@ -67,7 +68,9 @@ moon coverage report -f summary               # 覆盖率摘要
 ```
 moonlog <command> <dir> [args...]
 
-  put <dir> <key> <value>       追加一条 key/value 记录
+  put <dir> <key> <value> [--ts <ms>] [--idempotent] [--partition day|hour]
+                                追加一条 key/value 记录（`--partition` 开启
+                                按天/小时时间分区，跨桶自动滚动新段）
   put-if <dir> <key> <expected|-> <value>
                                 仅当 live 值等于 expected（`-` 要求不存在）才追加
   put-batch <dir> <k> <v> ...   一次追加多组 key/value 记录
@@ -111,7 +114,7 @@ moonlog <command> <dir> [args...]
                     [--level-field <name>] [--sample-rate 0-100]
                     [--include <text>] [--exclude <text>] [--schema]
                     [--clock-skew <ms>] [--mask] [--mask-fields <csv>]
-                    [--meta <csv>]
+                    [--meta <csv>] [--partition day|hour]
                                 采集外部日志文件：每行按格式解析为字段并写入
                                 （`lines` 默认整行为 value；`kv` 解析空格分
                                 隔 name=value 对；`json` 解析顶层 JSON 对象
@@ -132,6 +135,9 @@ moonlog <command> <dir> [args...]
                                  长 hex→[REDACTED]；`--mask-fields` 追加敏
                                  感字段名）；`--meta k=v,k2=v2` 为每条记录
                                  追加部署元数据（环境/版本/地域富化，2.4）；
+                                 `--partition day|hour` 按时间分区（跨桶自
+                                 动滚动新段，旧分区可经 prune-before 整段
+                                 淘汰，3.1）；
                                 `--once` 导入到当前末尾即退出，`--follow` 持
                                 续跟踪追加（半行留待下轮、截断/轮转自动从零
                                 重采）；`--fifo` 改为订阅命名管道（写者推送
@@ -143,6 +149,7 @@ moonlog <command> <dir> [args...]
             [--format lines|kv] [--key <name>] [--key-field <name>]
             [--ts-field <name>] [--schema] [--clock-skew <ms>]
             [--mask] [--mask-fields <csv>] [--meta <csv>]
+            [--partition day|hour]
                                 在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
                                 或 `/push` 先进入**有界队列**（`--queue` 行
                                 数上限，默认 10000）并返回 202；队列满时返回
@@ -193,6 +200,12 @@ compress <dir> [rle|lzss]     原地压缩所有已 roll 段
                                 备份路径全部透明；`--dry-run` 只打印计划
 stats <dir> [json]            打印逐段统计（含每段逻辑字节 disk 磁盘字节与
                               压缩汇总；可选 JSON）
+partitions <dir> [--unit day|hour] [--json]
+                              时间分区视图：按段首记录的时间桶分组展示每
+                              分区的段数/记录数/字节与 UTC span；分区写
+                              入（--partition）后旧分区可经 prune-before/
+                              prune-expired 整段淘汰，清理只触碰被回收
+                              的段文件，读者（共享锁）不被阻塞
 search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
                     [--from off] [--to off]
                               全文检索（线性扫描，无倒排索引）：在 key 和/
@@ -515,6 +528,7 @@ u32 crc32          (仅覆盖 body)
 - M116 统一 Schema（2.2）：core 新增 `canonical_field`/`SchemaFields`/`schema_from_fields`/`schema_value`/`schema_matches`（六槽位别名映射 + 4 个单测）；`ingest`/`http` 增加 `--schema`——解析字段按六大基础字段（时间戳/级别/服务名/主机/trace_id/消息，接受常用别名 `@timestamp`/`severity`/`service_name`/`app`/`hostname`/`traceId`/`msg` 等）归一，**服务名提升为记录键**、标准字段按固定顺序重组 value、时间戳取自解析值，异构服务入库口径一致（实测 `severity=… service_name=… traceId=… @timestamp=…` 与 `level=… service=… trace_id=… timestamp=…` 两种命名习惯归一为同一 shape）；新增 `query` 联合过滤命令（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND + `--since`/`--until` 时间窗 + `--limit`/`--json`，流式线性扫描），跨服务联查实测 `--trace-id t9` 命中 orders 与 inventory 两条异构来源记录；HTTP 推送经队列异步落库同样按 schema 归一（curl POST `severity=fatal service=gateway …` → `query --service gateway` 可查）。开发注记：初版 `SchemaFields` 以 mut 字段 + 循环赋值实现触发 native SIGABRT，重构为六个独立 first-match 查找后消除；定位中确认测试内 panic 断言在 native 以 SIGABRT 呈现（此前所谓工具链深坑，实为断言失败路径的表象）
 - M117 时间规范化（2.3）：core 新增 `normalize_ts`/`parse_iso8601_ms`（+3 单测）——纯数字按位数缩放（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），ISO-8601 解析 `Z`/`±HH:MM`/`±HHMM` 时区、`T`/空格分隔、小数秒截断毫秒（正向 days-from-civil 与 `format_utc` 的 days-to-civil 互逆，无日历库）；`ingest_timestamp` 与 schema 六字段的 ts 提取改走 `normalize_ts`（此前只认纯数字毫秒：秒级值错 1000 倍、ISO8601 直接回退到达序）；`ingest`/`http` 增加 `--clock-skew <ms>`（固定偏移补偿采集端时钟慢/快，作用于全部记录时间戳含到达序回退值）；`query` 增加 `--sort-by-time`（物化命中后按事件时间排序、tie 保 offset 序，处理乱序到达）。实测：`2026-11-06T20:00:00+08:00`/`12:00:00Z` 同事件归一为同一 1793966400000；四条三时区乱序到达 `--sort-by-time` 输出正确事件序；秒/毫秒/ISO 三写法同值；`--clock-skew 5000` 精确 +5s；trend 的 UTC 小时桶往返正确。开发注记：MoonBit 链式算术表达式中的裸数字字面量会被定型为 Int 向左传播（如 `(153 * mp + 2) / 5 + d - 1` 整条变 Int），days-from-civil 需对字面量逐个 `(: Int64)` 标注
 - M118 脱敏与字段富化（2.4）：core 新增 `mask_sensitive`（+3 单测）——单遍扫描逐字节保真、无正则引擎：敏感字段名值段（内置词表 password/passwd/pwd/secret/secret_key/token/api_key/apikey/access_key/authorization/auth/credential(s)/session/session_id/sessionid/cookie/private_key + `--mask-fields` 自定义，ASCII 忽略大小写、词边界判定）→ `name=[REDACTED]`；`Bearer <token>`（≥8 字符）与 JWT（`eyJ` 前缀 + 双点 token run）→ `[REDACTED]`；11 位手机号（1[3-9] 开头、数字边界）保留 3+4（`138****5678`）；15 位/17 位+X 证件号保留前 3 后 4；≥20 位连续 hex（md5/sha1/sha256）→ `[REDACTED]`，UUID 分段与 19 位纳秒时间戳不误伤；CLI `ingest`/`http` 增加 `--mask`/`--mask-fields <csv>`/`--meta <csv>`（`--meta k=v,k2=v2` 写入前为每条 value 追加部署元数据，k 缺 `=` 报错），掩码与富化在 schema 转换之后、幂等去重之前执行（重复投递判定一致；schema 模式下非规范敏感字段天然不落盘 + message 内模式掩码双保险）。实测：kv/schema/lines/HTTP 四条路径——`phone=138****5678`、`idcard=110***********777X`、`token=[REDACTED]`、`sha=[REDACTED]`、lines 整行 `139****5678 … Bearer [REDACTED]`，四项明文 `search` 全部 0 matches；`env=prod region=cn-north version=2.1.0` 富化落盘
+- M119 按时间分区（3.1）：core `Log` 增加 `partition_ms`/`active_bucket` 与 pub `time_bucket`——`put`/`ingest`/`http` 的 `--partition day|hour` 使 append 在记录时间桶与活跃段桶不同时自动滚动新段（`append_batch` 逐条复用同一路径；`Log::recover` 从活跃段首记录恢复桶，重开后同桶续写不切段），桶按 epoch 对齐（负 ts clamp 0、非法 unit 报错）；单段大小仍受 roll_size 控制（分区+段两层大小可控），+2 单测（跨桶滚动/迟到数据开新段/recover 恢复桶）；CLI 新增 `partitions` 视图（按段首记录桶分组：段数/记录数/字节/UTC span，`--unit day|hour` + `--json`）；过期清理沿用整段回收语义——分区对齐即整分区淘汰，prune 只触碰被回收段、读者共享锁不阻塞（并发冒烟验证）。实测：put 三条跨两天 → 2 段、partitions day/hour 两视图正确、ingest `--ts-field` 归一后按事件时间分桶、schema+partition 组合正常、prune-before 精确淘汰旧分区（dropped 1）。开发注记：`Log::recover` 因读段首记录需补 `R : @io.LogReader` 约束；MoonBit 可选默认参数（`partition_ms~ = 0`）保证全部既有调用点零改动
 
 ## 许可
 

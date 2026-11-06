@@ -15,6 +15,8 @@ pub fn decode_manifest(Bytes) -> Manifest raise @core.MetaError
 
 pub fn encode_cursor(UInt64) -> Bytes
 
+pub fn time_bucket(Int64, Int64) -> Int64
+
 // Errors
 
 // Types and methods
@@ -43,6 +45,8 @@ pub(all) struct Log[W, R] {
   mut next_offset : UInt64
   make : (UInt64) -> @segment.Segment[W, R] raise @io.IoError
   sync : SyncPolicy
+  partition_ms : Int64
+  mut active_bucket : Int64
   mut index_cache : KeyIndex?
   mut index_builds : Int32
   mut cursor_guard : UInt64?
@@ -72,10 +76,10 @@ pub fn[W, R : @io.LogReader] Log::get_many(Self[W, R], Array[Bytes]) -> Array[@c
 pub fn[W : @io.LogWriter, R] Log::import_bytes(Self[W, R], Bytes) -> Int32 raise @io.IoError
 pub fn[W, R] Log::index_build_count(Self[W, R]) -> Int32
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::merge_segments(Self[W, R], Int32, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
-pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy) -> Self[W, R]
+pub fn[W, R] Log::new(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, sync? : SyncPolicy, partition_ms? : Int64) -> Self[W, R]
 pub fn[W, R] Log::next_offset(Self[W, R]) -> UInt64
 pub fn[W, R : @io.LogReader] Log::prune_superseded(Self[W, R], KeyIndex, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
-pub fn[W, R] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]], sync? : SyncPolicy) -> Self[W, R]
+pub fn[W, R : @io.LogReader] Log::recover(Int64, (UInt64) -> @segment.Segment[W, R] raise @io.IoError, Array[@segment.Segment[W, R]], sync? : SyncPolicy, partition_ms? : Int64) -> Self[W, R]
 pub fn[W, R : @io.LogReader] Log::retain_before(Self[W, R], Int64, (@segment.Segment[W, R]) -> Unit) -> Int32 raise @io.IoError
 pub fn[W, R] Log::retain_last(Self[W, R], Int32, (@segment.Segment[W, R]) -> Unit) -> Int32
 pub fn[W, R] Log::retain_max_bytes(Self[W, R], Int64, (@segment.Segment[W, R]) -> Unit) -> Int32
