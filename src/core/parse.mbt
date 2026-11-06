@@ -190,7 +190,7 @@ pub(all) struct SamplingConfig {
 /// proportional sample rate.
 pub fn sampling_allows(
   raw_line : Bytes,
-  value : Bytes,
+  fields : Array[(Bytes, Bytes)],
   cfg : SamplingConfig,
 ) -> Bool {
   if cfg.include_text.length() > 0 &&
@@ -202,8 +202,7 @@ pub fn sampling_allows(
     return false
   }
   if cfg.min_level >= 0 {
-    let pairs = parse_kv_pairs(value)
-    for pair in pairs {
+    for pair in fields {
       if pair.0 == cfg.level_field {
         let rank = level_rank(pair.1)
         if rank >= 0 && rank < cfg.min_level {
@@ -213,4 +212,128 @@ pub fn sampling_allows(
     }
   }
   sample_passes(raw_line, cfg.sample_rate)
+}
+
+///|
+/// Tokenize a template into literal and placeholder (`<name>`) segments.
+fn template_segments(template : Bytes) -> Array[(Bool, Bytes)] {
+  let out : Array[(Bool, Bytes)] = []
+  let mut start = 0
+  let mut i = 0
+  while i < template.length() {
+    if template.at(i).to_int() == 60 {
+      if i > start {
+        out.push((false, slice(template, start, i)))
+      }
+      let close = find_byte_http(template, 62, i + 1)
+      if close < 0 {
+        out.push((false, slice(template, i, template.length())))
+        return out
+      }
+      out.push((true, slice(template, i + 1, close)))
+      i = close + 1
+      start = i
+    } else {
+      i = i + 1
+    }
+  }
+  if start < template.length() {
+    out.push((false, slice(template, start, template.length())))
+  }
+  out
+}
+
+///|
+/// Parse a raw line against a template of literal text and `<name>`
+/// placeholders (a lightweight, regex-free Grok equivalent): each placeholder
+/// captures up to the next literal token, and the last placeholder captures to
+/// the end of the line. Returns the extracted `name=value` pairs, or None when
+/// a literal in the template does not match the line at the expected position.
+pub fn parse_by_template(
+  line : Bytes,
+  template : Bytes,
+) -> Array[(Bytes, Bytes)]? {
+  let segments = template_segments(template)
+  let out : Array[(Bytes, Bytes)] = []
+  let mut pos = 0
+  let mut i = 0
+  while i < segments.length() {
+    let is_placeholder = segments[i].0
+    let text = segments[i].1
+    if !is_placeholder {
+      let n = text.length()
+      if pos + n > line.length() {
+        return None
+      }
+      let mut j = 0
+      while j < n {
+        if line.at(pos + j).to_int() != text.at(j).to_int() {
+          return None
+        }
+        j = j + 1
+      }
+      pos = pos + n
+    } else {
+      let mut end = line.length()
+      if i + 1 < segments.length() {
+        // Next literal: capture up to its first occurrence at/after pos.
+        let next = segments[i + 1].1
+        let n = next.length()
+        let mut found = -1
+        let mut scan = pos
+        while scan + n <= line.length() && found < 0 {
+          let mut j = 0
+          let mut ok = true
+          while j < n && ok {
+            if line.at(scan + j).to_int() != next.at(j).to_int() {
+              ok = false
+            }
+            j = j + 1
+          }
+          if ok {
+            found = scan
+          }
+          scan = scan + 1
+        }
+        if found < 0 {
+          return None
+        }
+        end = found
+      }
+      out.push((text, slice(line, pos, end)))
+      pos = end
+    }
+    i = i + 1
+  }
+  Some(out)
+}
+
+///|
+/// Flatten a top-level JSON object into `name=value` field pairs (the same
+/// Bytes model as the kv ingest format). Non-object JSON yields an empty
+/// array; malformed JSON raises ParseError (the caller decides whether to
+/// keep the raw line). String values are kept verbatim; numbers, booleans and
+/// null render as text; nested arrays/objects serialize as compact JSON.
+pub fn json_object_fields(
+  line : Bytes,
+) -> Array[(Bytes, Bytes)] raise @json.ParseError {
+  let text = @utf8.decode_lossy(line)
+  let parsed = @json.parse(text)
+  let out : Array[(Bytes, Bytes)] = []
+  match parsed {
+    Object(map) =>
+      for name, value in map {
+        let v = match value {
+          String(s) => s
+          Number(n, ..) => n.to_string()
+          True => "true"
+          False => "false"
+          Null => "null"
+          _ => value.stringify()
+        }
+        out.push((@utf8.encode(name), @utf8.encode(v)))
+      }
+    _ => ()
+  }
+  out
 }

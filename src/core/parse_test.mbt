@@ -76,10 +76,13 @@ test "sampling_allows applies level include exclude and rate" {
     include_text: b"",
     exclude_text: b"",
   }
-  assert_true(@core.sampling_allows(b"x level=warn", b"level=warn", cfg))
-  assert_true(!@core.sampling_allows(b"x level=info", b"level=info", cfg))
+  let warn_fields = @core.parse_kv_pairs(b"level=warn")
+  let info_fields = @core.parse_kv_pairs(b"level=info")
+  let plain_fields : Array[(Bytes, Bytes)] = []
+  assert_true(@core.sampling_allows(b"x level=warn", warn_fields, cfg))
+  assert_true(!@core.sampling_allows(b"x level=info", info_fields, cfg))
   // Missing level field: never filtered by severity.
-  assert_true(@core.sampling_allows(b"x plain", b"plain", cfg))
+  assert_true(@core.sampling_allows(b"x plain", plain_fields, cfg))
   let inc : @core.SamplingConfig = {
     min_level: -1,
     level_field: b"level",
@@ -87,8 +90,10 @@ test "sampling_allows applies level include exclude and rate" {
     include_text: b"health",
     exclude_text: b"",
   }
-  assert_true(@core.sampling_allows(b"health ping", b"health ping", inc))
-  assert_true(!@core.sampling_allows(b"user login", b"user login", inc))
+  let health_fields : Array[(Bytes, Bytes)] = []
+  let login_fields : Array[(Bytes, Bytes)] = []
+  assert_true(@core.sampling_allows(b"health ping", health_fields, inc))
+  assert_true(!@core.sampling_allows(b"user login", login_fields, inc))
   let exc : @core.SamplingConfig = {
     min_level: -1,
     level_field: b"level",
@@ -96,10 +101,10 @@ test "sampling_allows applies level include exclude and rate" {
     include_text: b"",
     exclude_text: b"noisy",
   }
-  assert_true(
-    !@core.sampling_allows(b"very noisy line", b"very noisy line", exc),
-  )
-  assert_true(@core.sampling_allows(b"quiet line", b"quiet line", exc))
+  let noisy_fields : Array[(Bytes, Bytes)] = []
+  let quiet_fields : Array[(Bytes, Bytes)] = []
+  assert_true(!@core.sampling_allows(b"very noisy line", noisy_fields, exc))
+  assert_true(@core.sampling_allows(b"quiet line", quiet_fields, exc))
 }
 
 ///|
@@ -107,4 +112,70 @@ test "shell_quote wraps and escapes single quotes" {
   assert_eq(@core.shell_quote("plain"), "'plain'")
   assert_eq(@core.shell_quote("a'b"), "'a'\\''b'")
   assert_eq(@core.shell_quote(""), "''")
+}
+
+///|
+test "parse_by_template extracts named placeholders" {
+  let parsed = @core.parse_by_template(
+    b"127.0.0.1 - frank [10/Oct/2000] \"GET\"", b"<ip> - <user> [<ts>] <rest>",
+  )
+  match parsed {
+    Some(f) => {
+      assert_eq(f.length(), 4)
+      assert_eq(f[0], (b"ip", b"127.0.0.1"))
+      assert_eq(f[1], (b"user", b"frank"))
+      assert_eq(f[2], (b"ts", b"10/Oct/2000"))
+      assert_eq(f[3], (b"rest", b"\"GET\""))
+    }
+    None => panic()
+  }
+}
+
+///|
+test "parse_by_template rejects literal mismatch and supports trailing capture" {
+  match @core.parse_by_template(b"GET /x", b"POST <path>") {
+    Some(_) => panic()
+    None => ()
+  }
+  // Greedy capture: the placeholder runs up to the FIRST occurrence of the
+  // next literal, so "500" is part of the captured level here.
+  match @core.parse_by_template(b"error 500: oops", b"<level>: <msg>") {
+    Some(f) => {
+      assert_eq(f[0], (b"level", b"error 500"))
+      assert_eq(f[1], (b"msg", b"oops"))
+    }
+    None => panic()
+  }
+}
+
+///|
+test "json_object_fields flattens top-level object fields" {
+  let fields = @core.json_object_fields(
+    b"{\"level\":\"error\",\"code\":500,\"ok\":true}",
+  )
+  let mut found_level = b""
+  let mut found_code = b""
+  let mut found_ok = b""
+  for pair in fields {
+    if pair.0 == b"level" {
+      found_level = pair.1
+    } else if pair.0 == b"code" {
+      found_code = pair.1
+    } else if pair.0 == b"ok" {
+      found_ok = pair.1
+    }
+  }
+  assert_eq(found_level, b"error")
+  assert_eq(found_code, b"500")
+  assert_eq(found_ok, b"true")
+  // Non-object JSON yields no fields; malformed JSON raises (the ingest
+  // pipeline catches and keeps nothing).
+  assert_eq(@core.json_object_fields(b"[1,2]").length(), 0)
+  let raised = try {
+    ignore(@core.json_object_fields(b"not json"))
+    false
+  } catch {
+    _ => true
+  }
+  assert_true(raised)
 }

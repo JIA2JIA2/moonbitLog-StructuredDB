@@ -3,6 +3,7 @@ package "JIA2JIA2/lsdb/src/core"
 
 import {
   "moonbitlang/core/debug",
+  "moonbitlang/core/json",
 }
 
 // Values
@@ -22,6 +23,8 @@ pub fn fnv1a_hash(Bytes) -> UInt32
 
 pub fn format_utc(Int64, String) -> String
 
+pub fn json_object_fields(Bytes) -> Array[(Bytes, Bytes)] raise @json.ParseError
+
 pub fn level_rank(Bytes) -> Int32
 
 pub fn lz_compress(Bytes) -> Bytes
@@ -29,6 +32,8 @@ pub fn lz_compress(Bytes) -> Bytes
 pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError
 
 pub fn normalize_log_template(Bytes) -> Bytes
+
+pub fn parse_by_template(Bytes, Bytes) -> Array[(Bytes, Bytes)]?
 
 pub fn parse_http_request(Bytes) -> HttpRequest?
 
@@ -46,7 +51,7 @@ pub fn rle_decompress(Bytes, Int64) -> Bytes raise MetaError
 
 pub fn sample_passes(Bytes, Int32) -> Bool
 
-pub fn sampling_allows(Bytes, Bytes, SamplingConfig) -> Bool
+pub fn sampling_allows(Bytes, Array[(Bytes, Bytes)], SamplingConfig) -> Bool
 
 pub fn shell_quote(String) -> String
 

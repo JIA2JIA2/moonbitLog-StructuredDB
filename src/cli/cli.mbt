@@ -125,6 +125,22 @@ type CliLog = @log.Log[
 ]
 
 ///|
+/// Shared options for every ingestion path (file, FIFO and HTTP push): the
+/// parse format, field extraction rules and write behavior.
+struct IngestOptions {
+  format : String
+  key_bytes : Bytes
+  field_bytes : Bytes
+  value_field_bytes : Bytes
+  ts_field_bytes : Bytes?
+  template_bytes : Bytes?
+  batch_n : Int32
+  idempotent : Bool
+  sampling : @core.SamplingConfig?
+  from_bytes : Int64?
+}
+
+///|
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
@@ -1643,24 +1659,25 @@ fn split_complete_lines(
 }
 
 ///|
-/// Extract one record's `(key, value)` from a log line. `lines` keeps the
-/// whole line as the value with `key` as a constant tag. `kv` parses
-/// space-separated `name=value` pairs, promotes the pair named `key_field` to
-/// the record key (falling back to "log"), and joins the remaining pairs back
-/// into the value.
+/// Parse one raw line into `name=value` field pairs according to the format:
+/// - `kv`: space-separated `name=value` pairs (as-is).
+/// - `json`: top-level JSON object fields (numbers/booleans render as text;
+///   malformed JSON yields no fields).
+/// - `template`: `<name>` placeholders matched against `template`; lines that
+///   do not match fall back to the whole line as the value.
+/// - `lines`: no fields (the whole line is the value; key is the constant).
+/// Returns `(key, value, fields)` where key/value are chosen per the options.
 fn parse_ingest_line(
   line : Bytes,
-  format : String,
-  key : Bytes,
-  key_field : Bytes,
-) -> (Bytes, Bytes) {
-  if format == "kv" {
+  opts : IngestOptions,
+) -> (Bytes, Bytes, Array[(Bytes, Bytes)]) {
+  if opts.format == "kv" {
     let pairs = @core.parse_kv_pairs(line)
-    let mut k : Bytes = b"log"
+    let mut k : Bytes = opts.key_bytes
     let v = @buffer.Buffer::Buffer()
     let mut first = true
     for pair in pairs {
-      if pair.0 == key_field {
+      if pair.0 == opts.field_bytes {
         k = pair.1
       } else {
         if !first {
@@ -1672,10 +1689,45 @@ fn parse_ingest_line(
         v.write_bytes(pair.1)
       }
     }
-    (k, v.to_bytes())
-  } else {
-    (key, line)
+    return (k, v.to_bytes(), pairs)
   }
+  if opts.format == "json" {
+    let fields = @core.json_object_fields(line) catch { _ => [] }
+    return finish_parsed_fields(fields, line, opts)
+  }
+  if opts.format == "template" {
+    return match opts.template_bytes {
+      Some(t) =>
+        match @core.parse_by_template(line, t) {
+          Some(fields) => finish_parsed_fields(fields, line, opts)
+          None => (opts.key_bytes, line, [])
+        }
+      None => (opts.key_bytes, line, [])
+    }
+  }
+  (opts.key_bytes, line, [])
+}
+
+///|
+/// Common field extraction for the json/template formats: `--key-field`
+/// promotes a field to the record key (fallback constant "log"), and
+/// `--value-field` picks the value field when given (fallback: the original
+/// raw line).
+fn finish_parsed_fields(
+  fields : Array[(Bytes, Bytes)],
+  raw_line : Bytes,
+  opts : IngestOptions,
+) -> (Bytes, Bytes, Array[(Bytes, Bytes)]) {
+  let mut k : Bytes = opts.key_bytes
+  let mut v : Bytes = raw_line
+  for pair in fields {
+    if pair.0 == opts.field_bytes {
+      k = pair.1
+    } else if pair.0 == opts.value_field_bytes {
+      v = pair.1
+    }
+  }
+  (k, v, fields)
 }
 
 ///|
@@ -1708,26 +1760,9 @@ fn cmd_ingest(
   file : String,
   follow : Bool,
   fifo : Bool,
-  format : String,
-  key : String,
-  key_field : String,
-  ts_field : String?,
-  idempotent : Bool,
-  sampling : @core.SamplingConfig?,
-  from : String?,
-  batch : String?,
+  opts : IngestOptions,
   interval : String?,
 ) -> Unit raise @io.IoError {
-  if format != "lines" && format != "kv" {
-    raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
-  }
-  let batch_n = match batch {
-    Some(s) =>
-      @string.parse_int(s) catch {
-        _ => raise @io.IoError::Invalid("invalid batch: " + s)
-      }
-    None => 256
-  }
   let interval_ms = match interval {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -1735,25 +1770,13 @@ fn cmd_ingest(
       }
     None => 200
   }
-  let key_bytes = @utf8.encode(key)
-  let field_bytes = @utf8.encode(key_field)
-  let ts_field_bytes : Bytes? = match ts_field {
-    Some(f) => Some(@utf8.encode(f))
-    None => None
-  }
   if fifo {
-    cmd_ingest_fifo(
-      dir, file, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
-      sampling,
-    )
+    cmd_ingest_fifo(dir, file, opts)
     return
   }
   let cursor_name = "ingest-" + path_basename(file)
-  let mut pos : Int64 = match from {
-    Some(s) =>
-      @string.parse_int64(s) catch {
-        _ => raise @io.IoError::Invalid("invalid offset: " + s)
-      }
+  let mut pos : Int64 = match opts.from_bytes {
+    Some(b) => b
     None =>
       @backend_native.load_named_cursor(dir, cursor_name).reinterpret_as_int64()
   }
@@ -1769,10 +1792,7 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let (written, sampled) = ingest_lines(
-        dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n, idempotent,
-        sampling,
-      )
+      let (written, sampled) = ingest_lines(dir, lines, opts)
       duplicates = duplicates + (lines.length() - written - sampled)
       sampled_out = sampled_out + sampled
       total = total + written
@@ -1814,18 +1834,17 @@ fn cmd_ingest(
 }
 
 ///|
-/// Record timestamp for an ingested line: the `--ts-field` value when present
-/// and parsable, else the fallback (arrival order based).
+/// Record timestamp for a parsed field set: the `--ts-field` value when
+/// present and parsable, else the fallback (arrival order based).
 fn ingest_timestamp(
-  value : Bytes,
-  ts_field_bytes : Bytes?,
+  fields : Array[(Bytes, Bytes)],
+  opts : IngestOptions,
   fallback : Int64,
 ) -> Int64 {
-  match ts_field_bytes {
+  match opts.ts_field_bytes {
     Some(fb) => {
-      let pairs = @core.parse_kv_pairs(value)
       let mut found : Int64? = None
-      for pair in pairs {
+      for pair in fields {
         if pair.0 == fb {
           found = Some(
             @string.parse_int64(bytes_to_string(pair.1)) catch {
@@ -1844,7 +1863,7 @@ fn ingest_timestamp(
 }
 
 ///|
-/// Append parsed lines to the log in batches of `batch_n`, flushing and
+/// Append parsed lines to the log in batches of `opts.batch_n`, flushing and
 /// persisting metadata per batch. With `idempotent`, a line whose (key, value)
 /// matches the key's latest live record is recognized as a duplicate delivery
 /// and skipped. With a sampling config, lines are filtered at the source
@@ -1854,21 +1873,15 @@ fn ingest_timestamp(
 fn ingest_lines(
   dir : String,
   lines : Array[Bytes],
-  format : String,
-  key_bytes : Bytes,
-  field_bytes : Bytes,
-  ts_field_bytes : Bytes?,
-  batch_n : Int32,
-  idempotent : Bool,
-  sampling : @core.SamplingConfig?,
+  opts : IngestOptions,
 ) -> (Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
   let mut sampled_out = 0
   let mut i = 0
   while i < lines.length() {
-    let chunk_end = if i + batch_n < lines.length() {
-      i + batch_n
+    let chunk_end = if i + opts.batch_n < lines.length() {
+      i + opts.batch_n
     } else {
       lines.length()
     }
@@ -1878,18 +1891,14 @@ fn ingest_lines(
       let log = open_log(dir)
       let mut j = i
       while j < chunk_end {
-        let (k, v) = parse_ingest_line(lines[j], format, key_bytes, field_bytes)
-        let keep = match sampling {
-          Some(cfg) => @core.sampling_allows(lines[j], v, cfg)
+        let (k, v, fields) = parse_ingest_line(lines[j], opts)
+        let keep = match opts.sampling {
+          Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
           None => true
         }
         if keep {
-          let rec_ts = ingest_timestamp(
-            v,
-            ts_field_bytes,
-            ts_base + j.to_int64(),
-          )
-          if idempotent {
+          let rec_ts = ingest_timestamp(fields, opts, ts_base + j.to_int64())
+          if opts.idempotent {
             let (added, _) = log.append_idempotent(k, v, rec_ts)
             if added {
               chunk_written = chunk_written + 1
@@ -1987,17 +1996,16 @@ fn parse_sampling_config(
 /// Returns the kept lines and how many were sampled out.
 fn sampling_filter_lines(
   lines : Array[Bytes],
-  format : String,
-  sampling : @core.SamplingConfig?,
+  opts : IngestOptions,
 ) -> (Array[Bytes], Int32) {
-  match sampling {
+  match opts.sampling {
     None => (lines, 0)
     Some(cfg) => {
       let kept : Array[Bytes] = []
       let mut dropped = 0
       for line in lines {
-        let value = parse_ingest_line(line, format, b"", b"").1
-        if @core.sampling_allows(line, value, cfg) {
+        let (_, _, fields) = parse_ingest_line(line, opts)
+        if @core.sampling_allows(line, fields, cfg) {
           kept.push(line)
         } else {
           dropped = dropped + 1
@@ -2015,13 +2023,7 @@ fn sampling_filter_lines(
 fn cmd_ingest_fifo(
   dir : String,
   path : String,
-  format : String,
-  key_bytes : Bytes,
-  field_bytes : Bytes,
-  ts_field_bytes : Bytes?,
-  batch_n : Int32,
-  idempotent : Bool,
-  sampling : @core.SamplingConfig?,
+  opts : IngestOptions,
 ) -> Unit raise @io.IoError {
   let mut total = 0
   while true {
@@ -2040,10 +2042,7 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, _) = ingest_lines(
-            dir, lines, format, key_bytes, field_bytes, ts_field_bytes, batch_n,
-            idempotent, sampling,
-          )
+          let (written, _) = ingest_lines(dir, lines, opts)
           total = total + written
         }
       }
@@ -2115,9 +2114,7 @@ struct HttpQueue {
   batch : Int32
   alert_threshold : Int32
   mut alerts : Int32
-  idempotent : Bool
-  sampling : @core.SamplingConfig?
-  format : String
+  opts : IngestOptions
 }
 
 ///|
@@ -2136,14 +2133,7 @@ fn http_queue_enqueue(q : HttpQueue, lines : Array[Bytes]) -> Bool {
 ///|
 /// Write one batch from the queue head, compact the backing array periodically,
 /// and raise a warning when the backlog exceeds the alert threshold.
-fn http_queue_drain(
-  q : HttpQueue,
-  dir : String,
-  format : String,
-  key_bytes : Bytes,
-  field_bytes : Bytes,
-  ts_field_bytes : Bytes?,
-) -> Unit raise @io.IoError {
+fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   if q.pending <= 0 {
     return
   }
@@ -2156,19 +2146,7 @@ fn http_queue_drain(
   }
   q.head = q.head + take
   q.pending = q.pending - take
-  ignore(
-    ingest_lines(
-      dir,
-      chunk,
-      format,
-      key_bytes,
-      field_bytes,
-      ts_field_bytes,
-      take,
-      q.idempotent,
-      None,
-    ),
-  )
+  ignore(ingest_lines(dir, chunk, q.opts))
   if q.head > 4096 && q.head * 2 > q.lines.length() {
     let rest : Array[Bytes] = []
     let mut j = q.head
@@ -2261,7 +2239,7 @@ fn handle_http_connection(
     }
     // Source-side sampling runs before the queue, so the capacity below counts
     // only lines that will actually be written.
-    let (kept, sampled_out) = sampling_filter_lines(lines, q.format, q.sampling)
+    let (kept, sampled_out) = sampling_filter_lines(lines, q.opts)
     if http_queue_enqueue(q, kept) {
       http_respond(
         conn,
@@ -2302,15 +2280,10 @@ fn cmd_http(
   queue_cap : String?,
   batch : String?,
   backlog_alert : String?,
-  format : String,
-  key : String,
-  key_field : String,
-  ts_field : String?,
-  idempotent : Bool,
-  sampling : @core.SamplingConfig?,
+  opts : IngestOptions,
 ) -> Unit raise @io.IoError {
-  if format != "lines" && format != "kv" {
-    raise @io.IoError::Invalid("invalid format: " + format + " (lines|kv)")
+  if opts.format != "lines" && opts.format != "kv" {
+    raise @io.IoError::Invalid("invalid format: " + opts.format + " (lines|kv)")
   }
   let port_n = match port {
     Some(s) =>
@@ -2366,12 +2339,6 @@ fn cmd_http(
     backlog_alert_n.to_string() +
     ")",
   )
-  let key_bytes = @utf8.encode(key)
-  let field_bytes = @utf8.encode(key_field)
-  let ts_field_bytes : Bytes? = match ts_field {
-    Some(f) => Some(@utf8.encode(f))
-    None => None
-  }
   let q : HttpQueue = {
     lines: [],
     head: 0,
@@ -2380,16 +2347,14 @@ fn cmd_http(
     batch: batch_n,
     alert_threshold: backlog_alert_n,
     alerts: 0,
-    idempotent,
-    sampling,
-    format,
+    opts,
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
   while !stopping {
     // Drain one batch first, so a burst backlog keeps shrinking even while no
     // new client connects (the accept below times out and loops back here).
-    http_queue_drain(q, dir, format, key_bytes, field_bytes, ts_field_bytes)
+    http_queue_drain(q, dir)
     stopping = @backend_native.shutdown_requested()
     if !stopping {
       let conn = @backend_native.tcp_accept_timeout(listen_fd, 200)
@@ -2402,7 +2367,7 @@ fn cmd_http(
   // Graceful shutdown: write every buffered line before exiting, so nothing
   // accepted with 202 is lost.
   while q.pending > 0 {
-    http_queue_drain(q, dir, format, key_bytes, field_bytes, ts_field_bytes)
+    http_queue_drain(q, dir)
   }
   println(
     "moonlog http shut down (backlog drained, " +
@@ -3582,9 +3547,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
+      let mut value_field = ""
       let mut ts_field : String? = (None : String?)
+      let mut template : String? = (None : String?)
       let mut idempotent = false
-      let mut from : String? = (None : String?)
+      let mut from_str : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut interval : String? = (None : String?)
       let mut min_level : String? = (None : String?)
@@ -3610,8 +3577,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--key-field" && i + 1 < args.length() {
           key_field = args[i + 1]
           i = i + 1
+        } else if a == "--value-field" && i + 1 < args.length() {
+          value_field = args[i + 1]
+          i = i + 1
         } else if a == "--from" && i + 1 < args.length() {
-          from = Some(args[i + 1])
+          from_str = Some(args[i + 1])
           i = i + 1
         } else if a == "--batch" && i + 1 < args.length() {
           batch = Some(args[i + 1])
@@ -3621,6 +3591,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--ts-field" && i + 1 < args.length() {
           ts_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--template" && i + 1 < args.length() {
+          template = Some(args[i + 1])
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
@@ -3645,21 +3618,41 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let sampling = parse_sampling_config(
         min_level, level_field, sample_rate, include_str, exclude_str,
       )
-      cmd_ingest(
-        args[2],
-        args[3],
-        follow,
-        fifo,
+      let batch_n = match batch {
+        Some(s) =>
+          @string.parse_int(s) catch {
+            _ => raise @io.IoError::Invalid("invalid batch: " + s)
+          }
+        None => 256
+      }
+      let from_bytes : Int64? = match from_str {
+        Some(s) =>
+          Some(
+            @string.parse_int64(s) catch {
+              _ => raise @io.IoError::Invalid("invalid offset: " + s)
+            },
+          )
+        None => None
+      }
+      let opts : IngestOptions = {
         format,
-        key,
-        key_field,
-        ts_field,
+        key_bytes: @utf8.encode(key),
+        field_bytes: @utf8.encode(key_field),
+        value_field_bytes: @utf8.encode(value_field),
+        ts_field_bytes: match ts_field {
+          Some(f) => Some(@utf8.encode(f))
+          None => None
+        },
+        template_bytes: match template {
+          Some(t) => Some(@utf8.encode(t))
+          None => None
+        },
+        batch_n,
         idempotent,
         sampling,
-        from,
-        batch,
-        interval,
-      )
+        from_bytes,
+      }
+      cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
   } else if cmd == "http" {
     if args.length() < 3 {
@@ -3672,7 +3665,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
+      let mut value_field = ""
       let mut ts_field : String? = (None : String?)
+      let mut template : String? = (None : String?)
       let mut idempotent = false
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
@@ -3703,8 +3698,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--key-field" && i + 1 < args.length() {
           key_field = args[i + 1]
           i = i + 1
+        } else if a == "--value-field" && i + 1 < args.length() {
+          value_field = args[i + 1]
+          i = i + 1
         } else if a == "--ts-field" && i + 1 < args.length() {
           ts_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--template" && i + 1 < args.length() {
+          template = Some(args[i + 1])
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
@@ -3729,19 +3730,32 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let sampling = parse_sampling_config(
         min_level, level_field, sample_rate, include_str, exclude_str,
       )
-      cmd_http(
-        args[2],
-        port,
-        queue_cap,
-        batch,
-        backlog_alert,
+      let batch_n = match batch {
+        Some(s) =>
+          @string.parse_int(s) catch {
+            _ => raise @io.IoError::Invalid("invalid batch: " + s)
+          }
+        None => 256
+      }
+      let opts : IngestOptions = {
         format,
-        key,
-        key_field,
-        ts_field,
+        key_bytes: @utf8.encode(key),
+        field_bytes: @utf8.encode(key_field),
+        value_field_bytes: @utf8.encode(value_field),
+        ts_field_bytes: match ts_field {
+          Some(f) => Some(@utf8.encode(f))
+          None => None
+        },
+        template_bytes: match template {
+          Some(t) => Some(@utf8.encode(t))
+          None => None
+        },
+        batch_n,
         idempotent,
         sampling,
-      )
+        from_bytes: None,
+      }
+      cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {

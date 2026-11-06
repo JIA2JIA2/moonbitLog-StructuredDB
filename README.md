@@ -100,21 +100,30 @@ moonlog <command> <dir> [args...]
                                 （UTF-8 文本，与 export-jsonl 同构）；`--once`
                                 拉取一轮即退出；轮询间隔可用
                                 `MOONLOG_FOLLOW_INTERVAL` 调整，默认 200ms）
-  ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
-                      [--key <name>] [--key-field <name>] [--ts-field <name>]
-                      [--from <bytes>] [--batch N] [--interval ms]
-                                采集外部日志文件：每行解析为一条记录并写入
-                                （`lines` 默认，整行为 value、`--key` 为常量
-                                键；`kv` 解析空格分隔的 name=value 对，
-                                `--key-field` 指定的字段提升为记录键、其余
-                                字段重组为 value，`--ts-field` 从字段取时间
-                                戳）；`--once` 导入到当前末尾即退出，
-                                `--follow` 持续跟踪追加（半行留待下轮、截断/
-                                轮转自动从零重采）；`--fifo` 改为订阅命名管道
-                                （写者推送批次，跨写者持续采集）；采集位点
-                                以命名游标 `ingest-<basename>` 持久化，重跑
-                                自动续采（`--from` 可覆盖），`--batch` 控制
-                                每批写入条数（默认 256）
+  ingest <dir> <file> [--follow] [--once] [--fifo]
+                    [--format lines|kv|json|template] [--template <tpl>]
+                    [--key <name>] [--key-field <name>] [--value-field <name>]
+                    [--ts-field <name>] [--from <bytes>] [--batch N]
+                    [--interval ms] [--idempotent] [--min-level <level>]
+                    [--level-field <name>] [--sample-rate 0-100]
+                    [--include <text>] [--exclude <text>]
+                                采集外部日志文件：每行按格式解析为字段并写入
+                                （`lines` 默认整行为 value；`kv` 解析空格分
+                                隔 name=value 对；`json` 解析顶层 JSON 对象
+                                字段；`template` 按 `--template "<a> <b>"`
+                                的字面+`<name>` 占位符提取——轻量 Grok 等
+                                价，不含正则）；`--key-field` 字段提升为记
+                                录键、`--value-field` 字段作为 value（缺省
+                                整行）、`--ts-field` 从字段取时间戳；`--idem
+                                potent` 幂等去重；`--min-level`/`--sample-ra
+                                te`/`--include`/`--exclude` 源头采样限流；
+                                `--once` 导入到当前末尾即退出，`--follow` 持
+                                续跟踪追加（半行留待下轮、截断/轮转自动从零
+                                重采）；`--fifo` 改为订阅命名管道（写者推送
+                                批次，跨写者持续采集）；采集位点以命名游标
+                                `ingest-<basename>` 持久化，重跑自动续采
+                                （`--from` 可覆盖），`--batch` 控制每批写入
+                                条数（默认 256）
   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
             [--format lines|kv] [--key <name>] [--key-field <name>]
             [--ts-field <name>]
@@ -474,6 +483,7 @@ u32 crc32          (仅覆盖 body)
 - M112 缓冲与背压（1.3）：HTTP 端点改为**有界入站队列**（`--queue` 行数上限）——`POST` 入队成功返回 **202**（含 pending），队列满返回 **429 + Retry-After**（明确反压、无静默丢弃），后台按 `--batch` 行分批落库；积压超 `--backlog-alert` 打印 `WARN backlog` 并在 `/stats` 暴露 `pending`/`backlog_alerts`；新增 `poll` 超时 accept（空闲时持续消化队列）与 SIGTERM/SIGINT 信号 stub——**优雅关闭前清空队列**（冒烟实测并发超限 429 重试后 1200/1200 零丢失、积压告警触发、退出提示 backlog drained）。首版冒烟曾发现"kill 时队列 200 行未落盘"的静默丢失，由此补上优雅关闭
 - M113 幂等与重放（1.4）：core 新增 `Log::append_idempotent`——待写 (key, value) 与该键最新 live 记录一致时跳过并返回既有 offset（检查骑乘增量 key 索引，O(1)），否则正常追加；CLI `put`/`ingest`/`http` 增加 `--idempotent`（重放文件、HTTP 429 重试、批次重投全部幂等：实测重放 2 行 `2 duplicates skipped` 零新增，非幂等对照翻倍至 4）；`ingest` 输出补充重复跳过计数；与采集位点断点续传互补（位点内不重读，位点外重复投递靠幂等兜底）。新增 2 个幂等单测（基本语义 + 跨段）
 - M114 源头采样限流（1.5）：core 新增 `SamplingConfig` + `sampling_allows`（**按级别** `level_rank` 五级映射、**按比例** `fnv1a_hash` 确定性采样——同内容判定恒定与幂等重放一致、**按规则** include/exclude 子串）+ 5 个单测；`ingest`/`http` 增加 `--min-level`/`--level-field`/`--sample-rate`/`--include`/`--exclude`，采样在源头（HTTP 入队前 / ingest 写入前）执行，`ingest` 输出 `(N sampled out)`、HTTP 202 响应含 `sampled_out`。实测：`--min-level warn` 丢 debug/info、`--sample-rate 0` 全丢、`--sample-rate 50` 采样 99/200、`--exclude healthcheck` 精确过滤
+- M115 结构化解析（2.1）：`--format json`（core `json_object_fields` 复用 `moonbitlang/core/json`，顶层对象字段展平、ParseError 由入库管线捕获）与 `--template "<ip> - <user>"`（core `parse_by_template`——字面 + `<name>` 占位符的**轻量 Grok 等价**，贪婪捕获到下一字面首现，不含正则引擎）；`--value-field` 指定字段作为 value（缺省整行）；`ingest_timestamp` 统一从解析字段提取时间戳（json/template/kv 三格式共用）。实测：JSON 行 key/value 字段提取、模板四字段提取、`--min-level warn` 组合采样全部准确
 
 ## 许可
 
