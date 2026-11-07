@@ -18,6 +18,7 @@
 #include <dirent.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -295,6 +296,36 @@ int32_t moonlog_append_file(moonbit_bytes_t path, moonbit_bytes_t data) {
     return -1;
   }
   return 0;
+}
+
+MOONBIT_FFI_EXPORT
+int64_t moonlog_statvfs_avail(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  struct statvfs st;
+  int r = statvfs(p, &st);
+  free(p);
+  if (r != 0) {
+    return -1;
+  }
+  return (int64_t)st.f_bavail * (int64_t)st.f_frsize;
+}
+
+MOONBIT_FFI_EXPORT
+int64_t moonlog_statvfs_total(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  struct statvfs st;
+  int r = statvfs(p, &st);
+  free(p);
+  if (r != 0) {
+    return -1;
+  }
+  return (int64_t)st.f_blocks * (int64_t)st.f_frsize;
 }
 
 MOONBIT_FFI_EXPORT

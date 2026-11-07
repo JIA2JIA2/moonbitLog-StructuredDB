@@ -199,7 +199,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -2926,6 +2926,10 @@ struct HttpQueue {
   opts : IngestOptions
   // 6.2 per-tenant write/storage quota policy, loaded once at startup.
   quota_rules : Array[@core.QuotaRule]
+  // 6.4 self-monitoring: the enqueue time of the queue-head line (how long
+  // the oldest buffered lines have waited) and the last snapshot report ts.
+  mut head_ts : Int64
+  mut last_report : Int64
 }
 
 ///|
@@ -2934,11 +2938,42 @@ fn http_queue_enqueue(q : HttpQueue, lines : Array[Bytes]) -> Bool {
   if q.pending + lines.length() > q.capacity {
     return false
   }
+  if q.pending == 0 {
+    // The queue just emptied (or starts): the head's enqueue time anchors
+    // the oldest-line lag reported to self-monitoring (6.4).
+    q.head_ts = now_ms()
+  }
   for line in lines {
     q.lines.push(line)
   }
   q.pending = q.pending + lines.length()
   true
+}
+
+///|
+/// 6.4 self-monitoring snapshot: atomically persist the writer's in-flight
+/// state to `<dir>/SELFMON/http.json` so the independent `selfmon` command
+/// can observe backlog and head lag without the writer process being
+/// introspectable. Failures are swallowed — monitoring must not break the
+/// writer.
+fn selfmon_report_http(dir : String, q : HttpQueue) -> Unit {
+  ignore(@backend_native.ensure_dir(dir + "/SELFMON"))
+  let now = now_ms()
+  let lag = if q.head_ts > 0 { now - q.head_ts } else { 0 }
+  let line = "{\"ts\":" +
+    now.to_string() +
+    ",\"writer\":\"http\",\"pending\":" +
+    q.pending.to_string() +
+    ",\"head_lag_ms\":" +
+    lag.to_string() +
+    ",\"backlog_alerts\":" +
+    q.alerts.to_string() +
+    "}"
+  ignore(
+    @backend_native.write_file(dir + "/SELFMON/http.json", @utf8.encode(line)) catch {
+      _ => ()
+    },
+  )
 }
 
 ///|
@@ -2977,6 +3012,13 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
       q.alert_threshold.to_string() +
       ")",
     )
+  }
+  // 6.4: report the writer snapshot at most once a second so the
+  // independent selfmon command sees backlog without adding per-batch
+  // fsync cost.
+  if now_ms() - q.last_report >= 1000 {
+    q.last_report = now_ms()
+    selfmon_report_http(dir, q)
   }
 }
 
@@ -3243,6 +3285,8 @@ fn cmd_http(
     alerts: 0,
     opts,
     quota_rules: load_quota_rules(dir),
+    head_ts: 0,
+    last_report: 0,
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
@@ -3264,6 +3308,9 @@ fn cmd_http(
   while q.pending > 0 {
     http_queue_drain(q, dir)
   }
+  // 6.4: final snapshot so selfmon sees the drained (pending=0) terminal
+  // state instead of a stale pre-shutdown backlog.
+  selfmon_report_http(dir, q)
   println(
     "moonlog http shut down (backlog drained, " +
     q.alerts.to_string() +
@@ -8269,8 +8316,402 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "quota" {
     cmd_quota(args[2])
+  } else if cmd == "selfmon" {
+    let json = args.length() > 3 && args[3] == "--json"
+    cmd_selfmon(args[2], json)
   } else {
     println(USAGE)
+  }
+}
+
+///|
+/// Record one failed command invocation for self-monitoring (6.4): the
+/// events in `<dir>/SELFMON_ERRORS` feed the failure-rate gauge so the log
+/// system's own breakage surfaces before user-facing breakage. Recording
+/// failures are swallowed (best effort, no recursion).
+fn selfmon_report_error(args : Array[String], msg : String) -> Unit {
+  if args.length() < 3 {
+    return
+  }
+  let cmd = args[1]
+  if cmd == "selfmon" {
+    // Self-monitoring failures are not operational failures of the store.
+    return
+  }
+  let line = "{\"ts\":" +
+    now_ms().to_string() +
+    ",\"cmd\":\"" +
+    json_escape_str(cmd) +
+    "\",\"error\":\"" +
+    json_escape_str(msg) +
+    "\"}\n"
+  ignore(
+    @backend_native.append_file(args[2] + "/SELFMON_ERRORS", @utf8.encode(line)) catch {
+      _ => ()
+    },
+  )
+}
+
+///|
+/// Self-monitoring threshold override (`MOONLOG_SELFMON_<NAME>`, 6.4).
+fn selfmon_threshold(name : String, default : Int64) -> Int64 {
+  match @env.get_env_var("MOONLOG_SELFMON_" + name) {
+    Some(v) => @string.parse_int64(v) catch { _ => default }
+    None => default
+  }
+}
+
+///|
+/// Parse one JSON object line into its top-level fields; None on garbage.
+fn selfmon_json_fields(line : Bytes) -> Array[(Bytes, Bytes)]? {
+  Some(@core.json_object_fields(line)) catch {
+    _ => None
+  }
+}
+
+///|
+/// Numeric field of a parsed JSON object as Int64, or -1 when absent.
+fn selfmon_field_int64(fields : Array[(Bytes, Bytes)], key : Bytes) -> Int64 {
+  for pair in fields {
+    if pair.0 == key {
+      return @string.parse_int64(@utf8.decode_lossy(pair.1)) catch { _ => -1 }
+    }
+  }
+  -1
+}
+
+///|
+/// String field of a parsed JSON object, or "" when absent.
+fn selfmon_field_str(fields : Array[(Bytes, Bytes)], key : Bytes) -> String {
+  for pair in fields {
+    if pair.0 == key {
+      return @utf8.decode_lossy(pair.1)
+    }
+  }
+  ""
+}
+
+///|
+/// Whether `name` is a canonical segment file (`<digits>.log`) — mirrors the
+/// recovery-side rule so stray `.log` files never skew selfmon gauges.
+fn selfmon_is_segment_name(name : String) -> Bool {
+  if !name.has_suffix(".log") || name.length() <= 4 {
+    return false
+  }
+  let digits = name[0:name.length() - 4].to_owned()
+  for ch in digits {
+    let c = ch.to_int()
+    if c < 48 || c > 57 {
+      return false
+    }
+  }
+  true
+}
+
+///|
+/// Count JSONL events with `ts >= since` in `path`; returns
+/// (matching, total lines).
+fn selfmon_count_events(path : String, since : Int64) -> (Int32, Int32) {
+  let data = @backend_native.read_file(path)
+  let mut matching = 0
+  let mut total = 0
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        total = total + 1
+        match selfmon_json_fields(line) {
+          Some(fields) =>
+            if selfmon_field_int64(fields, b"ts") >= since {
+              matching = matching + 1
+            }
+          None => ()
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  (matching, total)
+}
+
+///|
+/// Window count of allowed (executed) audit events — the denominator for
+/// the failure-rate gauge; 0 when auditing is not in force.
+fn selfmon_audit_allows(dir : String, since : Int64) -> Int32 {
+  let data = @backend_native.read_file(audit_path(dir))
+  let mut allowed = 0
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        match selfmon_json_fields(line) {
+          Some(fields) =>
+            if selfmon_field_str(fields, b"decision") == "allow" &&
+              selfmon_field_int64(fields, b"ts") >= since {
+              allowed = allowed + 1
+            }
+          None => ()
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  allowed
+}
+
+///|
+/// Age in ms of the newest segment file, or -1 when the directory holds no
+/// segment yet.
+fn selfmon_newest_segment_age_ms(dir : String) -> Int64 {
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let mut newest : String? = None
+  for name in names {
+    if selfmon_is_segment_name(name) {
+      match newest {
+        Some(cur) => if name > cur { newest = Some(name) }
+        None => newest = Some(name)
+      }
+    }
+  }
+  match newest {
+    Some(name) => {
+      let mtime = @backend_native.file_mtime_ns(dir + "/" + name)
+      if mtime < 0 {
+        return -1
+      }
+      let age = now_ms() - mtime / 1000000
+      if age < 0 {
+        0
+      } else {
+        age
+      }
+    }
+    None => -1
+  }
+}
+
+///|
+/// Latest writer snapshot under `<dir>/SELFMON` (max ts across writers):
+/// (writer, ts, pending, head_lag_ms, backlog_alerts); all -1/"" when no
+/// writer has ever reported.
+fn selfmon_latest_snapshot(
+  dir : String,
+) -> (String, Int64, Int64, Int64, Int64) {
+  let names = @backend_native.list_dir(dir + "/SELFMON") catch { _ => [] }
+  let mut best_writer = ""
+  let mut best_ts : Int64 = -1
+  let mut best_pending : Int64 = -1
+  let mut best_lag : Int64 = -1
+  let mut best_alerts : Int64 = -1
+  for name in names {
+    if name.has_suffix(".json") {
+      let data = @backend_native.read_file(dir + "/SELFMON/" + name)
+      match selfmon_json_fields(data) {
+        Some(fields) => {
+          let ts = selfmon_field_int64(fields, b"ts")
+          if ts > best_ts {
+            best_ts = ts
+            best_writer = selfmon_field_str(fields, b"writer")
+            best_pending = selfmon_field_int64(fields, b"pending")
+            best_lag = selfmon_field_int64(fields, b"head_lag_ms")
+            best_alerts = selfmon_field_int64(fields, b"backlog_alerts")
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  if best_ts < 0 {
+    return ("", -1, -1, -1, -1)
+  }
+  (best_writer, best_ts, best_pending, best_lag, best_alerts)
+}
+
+///|
+/// Self-monitoring (6.4): one independent health sweep over `dir` — disk
+/// watermark, writer backlog snapshot, ingest staleness, command failure
+/// rate and basic segment/manifest sanity — so the log system's own
+/// failures surface before user commands break. Prints `STATUS=ok|warn|crit`
+/// first (greppable by cron-style schedulers); `--json` emits the same
+/// result structured. Deep on-disk verification stays with `fsck`.
+fn cmd_selfmon(dir : String, json : Bool) -> Unit {
+  let now = now_ms()
+  let disk_warn = selfmon_threshold("DISK_WARN_PCT", 80)
+  let disk_crit = selfmon_threshold("DISK_CRIT_PCT", 90)
+  let backlog_warn = selfmon_threshold("BACKLOG_WARN", 1000)
+  let lag_warn = selfmon_threshold("LAG_WARN_MS", 5000)
+  let stale_warn = selfmon_threshold("STALE_MS", 300000)
+  let fails_warn = selfmon_threshold("FAILS_WARN", 10)
+  let window = selfmon_threshold("WINDOW_MS", 300000)
+  let active_window = selfmon_threshold("ACTIVE_WINDOW_MS", 60000)
+  let since = now - window
+
+  // --- disk watermark (6.4) ---
+  let avail = @backend_native.fs_bytes_available(dir)
+  let total = @backend_native.fs_bytes_total(dir)
+  let dir_bytes = dir_log_bytes(dir)
+  let mut disk_used : Int64 = -1
+  if total > 0 && avail >= 0 {
+    disk_used = (total - avail) * 100 / total
+  }
+  let mut disk_status = "ok"
+  if disk_used >= disk_crit {
+    disk_status = "crit"
+  } else if disk_used >= disk_warn {
+    disk_status = "warn"
+  }
+
+  // --- writer backlog snapshot (6.4) ---
+  let (writer, snap_ts, pending, head_lag, alerts) = selfmon_latest_snapshot(
+    dir,
+  )
+  let writer_active = snap_ts >= 0 && now - snap_ts <= active_window
+  let mut backlog_status = "ok"
+  if writer_active && (pending >= backlog_warn || head_lag >= lag_warn) {
+    backlog_status = "warn"
+  }
+
+  // --- ingest staleness (6.4): an active writer whose newest segment is
+  // aging past the threshold means collection stalled — alert even though
+  // nothing has failed yet. ---
+  let seg_age = selfmon_newest_segment_age_ms(dir)
+  let mut stale_status = "ok"
+  if writer_active && seg_age >= 0 && seg_age >= stale_warn {
+    stale_status = "warn"
+  }
+
+  // --- command failure rate (6.4) ---
+  let (fails, _total) = selfmon_count_events(dir + "/SELFMON_ERRORS", since)
+  let attempts = if audit_enabled(dir) {
+    selfmon_audit_allows(dir, since)
+  } else {
+    0
+  }
+  let mut failures_status = "ok"
+  if fails.to_int64() >= fails_warn {
+    failures_status = "warn"
+  }
+
+  // --- segment/manifest sanity ---
+  let manifest_present = @backend_native.file_exists(dir + "/MANIFEST")
+  let dir_names = @backend_native.list_dir(dir) catch { _ => [] }
+  let mut segs = 0
+  for name in dir_names {
+    if selfmon_is_segment_name(name) {
+      segs = segs + 1
+    }
+  }
+  let mut segments_status = "ok"
+  if !manifest_present && segs > 0 {
+    segments_status = "warn"
+  }
+
+  let mut status = "ok"
+  if disk_status == "crit" {
+    status = "crit"
+  } else if disk_status == "warn" ||
+    backlog_status == "warn" ||
+    stale_status == "warn" ||
+    failures_status == "warn" ||
+    segments_status == "warn" {
+    status = "warn"
+  }
+
+  if json {
+    println(
+      "{\"status\":\"" +
+      status +
+      "\",\"window_ms\":" +
+      window.to_string() +
+      ",\"disk\":{\"fs_used_pct\":" +
+      disk_used.to_string() +
+      ",\"avail_bytes\":" +
+      avail.to_string() +
+      ",\"dir_bytes\":" +
+      dir_bytes.to_string() +
+      "},\"backlog\":{\"writer\":\"" +
+      writer +
+      "\",\"writer_active\":" +
+      (if writer_active { "true" } else { "false" }) +
+      ",\"pending\":" +
+      pending.to_string() +
+      ",\"head_lag_ms\":" +
+      head_lag.to_string() +
+      ",\"backlog_alerts\":" +
+      alerts.to_string() +
+      "},\"stale\":{\"last_data_age_ms\":" +
+      seg_age.to_string() +
+      "},\"failures\":{\"window_failures\":" +
+      fails.to_string() +
+      ",\"window_attempts\":" +
+      attempts.to_string() +
+      "},\"segments\":{\"manifest\":" +
+      (if manifest_present { "true" } else { "false" }) +
+      ",\"count\":" +
+      segs.to_string() +
+      "}}",
+    )
+  } else {
+    println("STATUS=" + status)
+    println(
+      "disk: fs_used_pct=" +
+      disk_used.to_string() +
+      " avail_bytes=" +
+      avail.to_string() +
+      " dir_bytes=" +
+      dir_bytes.to_string() +
+      " [" +
+      disk_status +
+      "]",
+    )
+    println(
+      "backlog: writer=" +
+      writer +
+      " pending=" +
+      pending.to_string() +
+      " head_lag_ms=" +
+      head_lag.to_string() +
+      " alerts=" +
+      alerts.to_string() +
+      " [" +
+      backlog_status +
+      "]",
+    )
+    println(
+      "stale: last_data_age_ms=" +
+      seg_age.to_string() +
+      " writer_active=" +
+      (if writer_active { "true" } else { "false" }) +
+      " [" +
+      stale_status +
+      "]",
+    )
+    println(
+      "failures: window_ms=" +
+      window.to_string() +
+      " failures=" +
+      fails.to_string() +
+      " attempts=" +
+      attempts.to_string() +
+      " [" +
+      failures_status +
+      "]",
+    )
+    println(
+      "segments: manifest=" +
+      (if manifest_present { "present" } else { "missing" }) +
+      " count=" +
+      segs.to_string() +
+      " [" +
+      segments_status +
+      "]",
+    )
   }
 }
 
@@ -8278,11 +8719,29 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
 fn main {
   let args = @env.args()
   dispatch(args) catch {
-    @io.IoError::Closed => println("error: io closed")
-    @io.IoError::OutOfBounds(o) =>
+    @io.IoError::Closed => {
+      println("error: io closed")
+      selfmon_report_error(args, "io closed")
+    }
+    @io.IoError::OutOfBounds(o) => {
       println("error: out of bounds " + o.to_string())
-    @io.IoError::Corrupt(o) => println("error: corrupt at " + o.to_string())
-    @io.IoError::Syscall(c) => println("error: syscall " + c.to_string())
-    @io.IoError::Invalid(m) => println("error: " + m)
+      selfmon_report_error(args, "out of bounds " + o.to_string())
+    }
+    @io.IoError::Corrupt(o) => {
+      println("error: corrupt at " + o.to_string())
+      selfmon_report_error(args, "corrupt at " + o.to_string())
+    }
+    @io.IoError::Syscall(c) => {
+      println("error: syscall " + c.to_string())
+      selfmon_report_error(args, "syscall " + c.to_string())
+    }
+    @io.IoError::Invalid(m) => {
+      println("error: " + m)
+      // Quota rejections (6.2) are expected tenant behavior, not store
+      // breakage — keep them out of the failure-rate gauge.
+      if !@core.bytes_contains(@utf8.encode(m), b"quota exceeded") {
+        selfmon_report_error(args, m)
+      }
+    }
   }
 }

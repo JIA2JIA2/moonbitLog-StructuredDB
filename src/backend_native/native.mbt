@@ -653,6 +653,27 @@ pub fn append_file(path : String, data : Bytes) -> Unit raise @io.IoError {
 }
 
 ///|
+#borrow(path)
+extern "C" fn moonlog_statvfs_avail(path : Bytes) -> Int64 = "moonlog_statvfs_avail"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_statvfs_total(path : Bytes) -> Int64 = "moonlog_statvfs_total"
+
+///|
+/// Free bytes on the filesystem holding `path` (6.4 disk watermark), or -1
+/// when the filesystem cannot be queried.
+pub fn fs_bytes_available(path : String) -> Int64 {
+  moonlog_statvfs_avail(@utf8.encode(path))
+}
+
+///|
+/// Total bytes of the filesystem holding `path` (6.4), or -1.
+pub fn fs_bytes_total(path : String) -> Int64 {
+  moonlog_statvfs_total(@utf8.encode(path))
+}
+
+///|
 /// File name of a segment's persisted index sidecar.
 fn segment_index_name(base : UInt64) -> String {
   @segment.segment_file_name(base) + ".index"
