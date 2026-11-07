@@ -199,7 +199,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1691,8 +1691,10 @@ fn archive_u32(data : Bytes, pos : Int32) -> UInt32 {
 }
 
 ///|
-/// Log data files worth archiving: the manifest, segment files and every
-/// sidecar (.index/.keys/.inv).
+/// Log data files worth archiving (6.5): the manifest, segment files, every
+/// sidecar (.index/.keys/.inv) and the operator policy files (RBAC/TTL/
+/// QUOTA) — the same durable set a backup carries, so an extracted archive
+/// also restores the configuration.
 fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
   let out : Array[String] = []
   for name in @backend_native.list_dir(dir) {
@@ -1700,7 +1702,10 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name.has_suffix(".log") ||
       name.has_suffix(".log.index") ||
       name.has_suffix(".log.keys") ||
-      name.has_suffix(".log.inv") {
+      name.has_suffix(".log.inv") ||
+      name == "RBAC" ||
+      name == "TTL" ||
+      name == "QUOTA" {
       out.push(name)
     }
   }
@@ -2038,6 +2043,155 @@ fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
     print_verify(report)
     close_log(log)
   })
+}
+
+///|
+/// Remove a directory tree (contents first, then the directory itself);
+/// best effort — cleanup failures never break a drill.
+fn remove_tree(path : String) -> Unit {
+  let names = @backend_native.list_dir(path) catch { _ => [] }
+  for name in names {
+    ignore(@backend_native.remove_file(path + "/" + name))
+  }
+  ignore(@backend_native.remove_file(path))
+}
+
+///|
+/// Configuration-consistency check for a recovery drill (6.5): across the
+/// policy files the result is "absent" when neither side carries any,
+/// "ok" when every present policy matches byte for byte, and "mismatch"
+/// otherwise — a diverging policy would silently change retention or
+/// access behavior on the restored copy.
+fn drill_config_check(dir : String, rst : String) -> String {
+  let files = ["RBAC", "TTL", "QUOTA"]
+  let mut result = "absent"
+  for f in files {
+    let src_has = @backend_native.file_exists(dir + "/" + f)
+    let dst_has = @backend_native.file_exists(rst + "/" + f)
+    let state = if src_has && dst_has {
+      let a = @backend_native.read_file(dir + "/" + f)
+      let b = @backend_native.read_file(rst + "/" + f)
+      if a == b {
+        "ok"
+      } else {
+        "mismatch"
+      }
+    } else if src_has || dst_has {
+      "mismatch"
+    } else {
+      "absent"
+    }
+    if state == "mismatch" {
+      result = "mismatch"
+    } else if state == "ok" && result == "absent" {
+      result = "ok"
+    }
+  }
+  result
+}
+
+///|
+/// One-key recovery drill (6.5): back `dir` up into a scratch directory,
+/// restore it into a second one, fast-verify the restored copy, reconcile
+/// record counts and offsets against the live directory, compare the policy
+/// files and spot-read the first and last record — proving a real restore
+/// succeeds end to end. The live directory is only ever read (under its
+/// shared lock) and the scratch directories are removed unless `--keep`.
+fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  let bak = dir + ".drill-backup"
+  let rst = dir + ".drill-restore"
+  remove_tree(bak)
+  remove_tree(rst)
+  let mut backup_files = 0
+  let mut restored_segs = 0
+  let mut verify_status = "fail"
+  let mut verify_records = -1
+  let mut src_records = -1
+  let mut match_ok = false
+  let mut config_status = "absent"
+  let mut spot_ok = false
+
+  // 1. Backup: flush data and metadata, then copy the durable set under the
+  // exclusive lock.
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    log.flush()
+    @backend_native.flush_meta(dir, log)
+    close_log(log)
+    ignore(@backend_native.backup_log_dir(dir, bak))
+    backup_files = (@backend_native.list_dir(bak) catch { _ => [] }).length()
+  })
+
+  // 2. Restore into the scratch directory (empty by construction).
+  restored_segs = @backend_native.restore_log_dir(bak, rst)
+
+  // 3. Verify and reconcile against the live directory (shared lock).
+  run_locked(dir, false, () => {
+    let src_log = open_log(dir)
+    src_records = src_log.count()
+    let src_next = src_log.next_offset()
+    let first_src = src_log.get((0 : UInt64))
+    let last_src = if src_next > (0 : UInt64) {
+      src_log.get(src_next - (1 : UInt64))
+    } else {
+      None
+    }
+    let rst_log = open_log(rst)
+    let report = rst_log.verify_fast()
+    verify_records = report.records
+    let verify_ok = report.first_bad_offset is None &&
+      report.first_bad_checksum is None
+    let next_ok = rst_log.next_offset() == src_next
+    let first_rst = rst_log.get((0 : UInt64))
+    let last_rst = if src_next > (0 : UInt64) {
+      rst_log.get(src_next - (1 : UInt64))
+    } else {
+      None
+    }
+    let spot = match (first_src, first_rst, last_src, last_rst) {
+      (Some(a), Some(b), Some(c), Some(d)) =>
+        a.key == b.key &&
+        a.value == b.value &&
+        c.key == d.key &&
+        c.value == d.value
+      (None, None, None, None) => true
+      _ => false
+    }
+    spot_ok = spot
+    config_status = drill_config_check(dir, rst)
+    match_ok = verify_ok &&
+      next_ok &&
+      verify_records == src_records &&
+      spot &&
+      config_status != "mismatch"
+    verify_status = if match_ok { "ok" } else { "fail" }
+    close_log(src_log)
+    close_log(rst_log)
+  })
+
+  let status = if match_ok { "ok" } else { "fail" }
+  println("DRILL status=" + status)
+  println("backup: files=" + backup_files.to_string() + " path=" + bak)
+  println("restore: segments=" + restored_segs.to_string() + " path=" + rst)
+  println(
+    "verify: " +
+    verify_status +
+    " records=" +
+    verify_records.to_string() +
+    " source_records=" +
+    src_records.to_string() +
+    " spot_read=" +
+    (if spot_ok { "ok" } else { "fail" }),
+  )
+  println("config: " + config_status)
+  if !keep {
+    remove_tree(bak)
+    remove_tree(rst)
+    println("cleanup: scratch removed (use --keep to inspect)")
+  } else {
+    println("cleanup: kept (" + bak + ", " + rst + ")")
+  }
 }
 
 ///|
@@ -6243,7 +6397,7 @@ let audit_cmds : Array[String] = [
   "scan-time", "tail", "follow", "search", "query", "context", "aggregate", "cluster",
   "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor", "cursor-lag",
   "cursor-list", "stats", "partitions", "export", "export-jsonl", "archive", "backup",
-  "delete", "prune", "prune-bytes", "prune-before", "prune-expired", "prune-superseded",
+  "drill", "delete", "prune", "prune-bytes", "prune-before", "prune-expired", "prune-superseded",
   "merge", "compact", "compact-expired", "compress", "tier", "ttl-expire", "restore",
   "recover", "maintain", "rbac",
 ]
@@ -8316,6 +8470,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "quota" {
     cmd_quota(args[2])
+  } else if cmd == "drill" {
+    let keep = args.length() > 3 && args[3] == "--keep"
+    cmd_drill(args[2], keep)
   } else if cmd == "selfmon" {
     let json = args.length() > 3 && args[3] == "--json"
     cmd_selfmon(args[2], json)

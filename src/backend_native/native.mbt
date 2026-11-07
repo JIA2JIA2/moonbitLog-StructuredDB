@@ -1264,14 +1264,22 @@ pub fn rename_file(from : String, to : String) -> Bool {
 
 ///|
 /// Whether `name` belongs to a log directory's durable state and is carried by
-/// a backup: segment data files, their `.index`/`.keys` sidecars, and the
-/// manifest. `LOCK` and consumer-cursor files are deliberately excluded — a
-/// backup snapshots the data, not consumer progress or process state.
+/// a backup (6.5): segment data files, their `.index`/`.keys`/`.inv` sidecars,
+/// the manifest, and the operator policy files (RBAC/TTL/QUOTA) — a restored
+/// copy must come back with its configuration so a recovery drill succeeds
+/// end to end. `LOCK`, consumer-cursor files and operational trails
+/// (AUDIT/TTL_AUDIT/SELFMON) are deliberately excluded: a backup snapshots
+/// data, configuration and indexes, not consumer progress, process state or
+/// audit history.
 fn is_backup_file(name : String) -> Bool {
   name == MANIFEST_NAME ||
   name.has_suffix(".log") ||
   name.has_suffix(".log.index") ||
-  name.has_suffix(".log.keys")
+  name.has_suffix(".log.keys") ||
+  name.has_suffix(".log.inv") ||
+  name == "RBAC" ||
+  name == "TTL" ||
+  name == "QUOTA"
 }
 
 ///|
