@@ -787,8 +787,11 @@ fn write_file_atomic(
 }
 
 ///|
-/// Remove a segment's data and index files (retention). When the data path is
-/// a cold-tier symlink, the file it points at is removed too.
+/// Remove a segment's data and sidecars (retention): the data file (following
+/// a cold-tier symlink), the sparse index, the key index and the inverted/
+/// field-column index. The `.inv` sidecar must go too (review of 6.6): a
+/// later segment reusing the same base offset would otherwise load the stale
+/// index and answer indexed/inverted queries with ghost records.
 pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
   ignore(
     moonlog_remove_with_link(
@@ -797,6 +800,7 @@ pub fn remove_segment_files(dir : String, base : UInt64) -> Unit {
   )
   ignore(remove_file(segment_index_path(dir, base)))
   ignore(remove_file(segment_keys_path(dir, base)))
+  ignore(remove_file(segment_inv_path(dir, base)))
   ignore(fsync_dir(dir) catch { _ => () })
 }
 
