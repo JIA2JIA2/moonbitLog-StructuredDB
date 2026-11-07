@@ -111,6 +111,12 @@
 ///                                    totals, latency quantiles and top
 ///                                    services (drill down with trend/query
 ///                                    on suspicious windows)
+///   anomalies <dir> [--baseline sec] [--recent sec] [--sigma N]
+///            [--min-count N] [--top N] [--json]
+///                                    automatic anomaly detection (5.6) —
+///                                    volume spikes, NEW error patterns vs
+///                                    the baseline period, hour-of-day
+///                                    seasonal deviations; no rules needed
 ///   alert <dir> <match> --threshold N [--window minute|hour|day]
 ///                   [--notify-file <path>] [--webhook <url>] [--json]
 ///                                    threshold alerting per UTC window
@@ -4741,6 +4747,333 @@ fn cmd_dashboard(
 }
 
 ///|
+/// Automatic anomaly detection (5.6): one scan over the baseline period
+/// [now-baseline, now-recent) and the recent period [now-recent, now],
+/// reporting — with zero configured rules — three shapes:
+/// 1. VOLUME_SPIKE: a recent minute bucket whose count exceeds the baseline
+///    minute-bucket distribution (mean/std, z > --sigma);
+/// 2. NEW_PATTERN: an error template (`normalize_log_template`) present in
+///    the recent window but absent from the baseline (count >= --min-count);
+/// 3. SEASONAL_DEVIATION: an hour-of-day whose recent count deviates from
+///    the baseline hour-of-day average (Poisson approximation, z > --sigma).
+/// Errors are records with severity rank >= 3, or a literal "error"
+/// substring when no level field exists (same as dashboard).
+fn cmd_anomalies(
+  dir : String,
+  baseline_sec : String,
+  recent_sec : String,
+  sigma : String,
+  min_count : String,
+  top : String,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  let base_ms = (@string.parse_int64(baseline_sec) catch {
+      _ => raise @io.IoError::Invalid("invalid baseline: " + baseline_sec)
+    }) *
+    (1000 : Int64)
+  let rec_ms = (@string.parse_int64(recent_sec) catch {
+      _ => raise @io.IoError::Invalid("invalid recent: " + recent_sec)
+    }) *
+    (1000 : Int64)
+  if base_ms <= 0 || rec_ms <= 0 {
+    raise @io.IoError::Invalid("baseline/recent must be positive")
+  }
+  let sigma_v = @string.parse_double(sigma) catch {
+    _ => raise @io.IoError::Invalid("invalid sigma: " + sigma)
+  }
+  let min_cnt = @string.parse_int(min_count) catch {
+    _ => raise @io.IoError::Invalid("invalid min-count: " + min_count)
+  }
+  let top_n = @string.parse_int(top) catch {
+    _ => raise @io.IoError::Invalid("invalid top: " + top)
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let now = now_ms()
+    let recent_start = now - rec_ms
+    let base_start = now - rec_ms - base_ms
+    // Accumulators per period.
+    let base_min : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+    let rec_min : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+    let base_tpl : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    let rec_tpl : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    let base_hod : FixedArray[Int64] = FixedArray::make(24, 0)
+    let rec_hod : FixedArray[Int64] = FixedArray::make(24, 0)
+    let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      let in_recent = rec.timestamp >= recent_start && rec.timestamp <= now
+      let in_base = rec.timestamp >= base_start && rec.timestamp < recent_start
+      if in_recent || in_base {
+        let label = @core.format_utc(rec.timestamp, "minute")
+        let hod = if rec.timestamp >= 0 {
+          (rec.timestamp / (3600000 : Int64) % 24).to_int()
+        } else {
+          0
+        }
+        let pairs = @core.parse_kv_pairs(rec.value)
+        let mut lv : Bytes? = None
+        for pair in pairs {
+          if pair.0 == b"level" {
+            lv = Some(pair.1)
+          }
+        }
+        let is_err = match lv {
+          Some(l) => @core.level_rank(l) >= 3
+          None => match_needle(rec.value, b"error", true)
+        }
+        if in_recent {
+          bump_string(rec_min, label)
+          if hod >= 0 && hod < 24 {
+            rec_hod[hod] = rec_hod[hod] + 1
+          }
+          if is_err {
+            let tpl = @core.normalize_log_template(rec.value)
+            bump_bytes(rec_tpl, tpl)
+            match samples.get(tpl) {
+              None => samples.set(tpl, rec.value)
+              Some(_) => ()
+            }
+          }
+        } else {
+          bump_string(base_min, label)
+          if hod >= 0 && hod < 24 {
+            base_hod[hod] = base_hod[hod] + 1
+          }
+          if is_err {
+            bump_bytes(base_tpl, @core.normalize_log_template(rec.value))
+          }
+        }
+      }
+      true
+    })
+    // Detection 1: volume spikes in recent minute buckets.
+    let mut base_sum : Double = 0.0
+    let mut base_n : Double = 0.0
+    for k in base_min.keys() {
+      match base_min.get(k) {
+        Some(c) => {
+          base_sum = base_sum + c.to_double()
+          base_n = base_n + 1.0
+        }
+        None => ()
+      }
+    }
+    let base_mean = if base_n > 0.0 { base_sum / base_n } else { 0.0 }
+    let mut base_var : Double = 0.0
+    for k in base_min.keys() {
+      match base_min.get(k) {
+        Some(c) => {
+          let d = c.to_double() - base_mean
+          base_var = base_var + d * d
+        }
+        None => ()
+      }
+    }
+    let base_std = if base_n > 1.0 {
+      sqrt_double(base_var / (base_n - 1.0))
+    } else {
+      0.0
+    }
+    let spikes : Array[(String, Int32, Double)] = []
+    for k in rec_min.keys() {
+      match rec_min.get(k) {
+        Some(c) => {
+          let z = if base_std > 0.0 {
+            (c.to_double() - base_mean) / base_std
+          } else {
+            0.0
+          }
+          if z > sigma_v {
+            spikes.push((k, c, z))
+          }
+        }
+        None => ()
+      }
+    }
+    spikes
+    .mut_view()
+    .sort_by(fn(a, b) {
+      let d = b.2.compare(a.2)
+      if d != 0 {
+        d
+      } else {
+        b.1.compare(a.1)
+      }
+    })
+    // Detection 2: new error patterns (in recent, absent from baseline).
+    let news : Array[(Bytes, Int32)] = []
+    for k in rec_tpl.keys() {
+      match rec_tpl.get(k) {
+        Some(c) =>
+          if c >= min_cnt {
+            match base_tpl.get(k) {
+              Some(_) => ()
+              None => news.push((k, c))
+            }
+          }
+        None => ()
+      }
+    }
+    news.mut_view().sort_by(fn(a, b) { b.1.compare(a.1) })
+    // Detection 3: seasonal (hour-of-day) deviations.
+    let base_days = if base_ms / (86400000 : Int64) > 0 {
+      base_ms / (86400000 : Int64)
+    } else {
+      1
+    }
+    let seasonal : Array[(Int32, Int64, Double)] = []
+    let mut h = 0
+    while h < 24 {
+      let bh = base_hod[h].to_double() / base_days.to_double()
+      let rc = rec_hod[h].to_double()
+      let z = if bh > 0.0 { (rc - bh) / sqrt_double(bh) } else { 0.0 }
+      if z > sigma_v {
+        seasonal.push((h, rec_hod[h], z))
+      }
+      h = h + 1
+    }
+    seasonal
+    .mut_view()
+    .sort_by(fn(a, b) {
+      let d = b.2.compare(a.2)
+      if d != 0 {
+        d
+      } else {
+        b.1.compare(a.1)
+      }
+    })
+    let clip = fn(n : Int32) -> Int32 { if n > top_n { top_n } else { n } }
+    if json {
+      let mut s = "{\"baseline_sec\":" +
+        baseline_sec.to_string() +
+        ",\"recent_sec\":" +
+        recent_sec.to_string() +
+        ",\"sigma\":" +
+        sigma +
+        ",\"volume_spikes\":["
+      let mut first = true
+      let sn = clip(spikes.length())
+      for i2 in 0..<sn {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"window\":\"" +
+          spikes[i2].0 +
+          "\",\"count\":" +
+          spikes[i2].1.to_string() +
+          ",\"z\":" +
+          spikes[i2].2.to_string() +
+          "}"
+      }
+      s = s + "],\"new_patterns\":["
+      first = true
+      let nn = clip(news.length())
+      for i2 in 0..<nn {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"template\":\"" +
+          json_escape_str(bytes_to_string(news[i2].0)) +
+          "\",\"count\":" +
+          news[i2].1.to_string() +
+          ",\"sample\":\"" +
+          json_escape_str(
+            bytes_to_string(
+              match samples.get(news[i2].0) {
+                Some(sv) => sv
+                None => b""
+              },
+            ),
+          ) +
+          "}"
+      }
+      s = s + "],\"seasonal_deviations\":["
+      first = true
+      let sn2 = clip(seasonal.length())
+      for i2 in 0..<sn2 {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"hour_utc\":" +
+          seasonal[i2].0.to_string() +
+          ",\"recent_count\":" +
+          seasonal[i2].1.to_string() +
+          ",\"z\":" +
+          seasonal[i2].2.to_string() +
+          "}"
+      }
+      s = s + "]}"
+      println(s)
+    } else {
+      println(
+        "=== anomalies: " +
+        dir +
+        " (baseline " +
+        baseline_sec.to_string() +
+        "s, recent " +
+        recent_sec.to_string() +
+        "s, sigma " +
+        sigma +
+        ") ===",
+      )
+      println("volume spikes: " + spikes.length().to_string())
+      let sn = clip(spikes.length())
+      for i2 in 0..<sn {
+        println(
+          "  " +
+          spikes[i2].0 +
+          "  count=" +
+          spikes[i2].1.to_string() +
+          "  z=" +
+          spikes[i2].2.to_string(),
+        )
+      }
+      println("new error patterns: " + news.length().to_string())
+      let nn = clip(news.length())
+      for i2 in 0..<nn {
+        let sample = match samples.get(news[i2].0) {
+          Some(sv) => bytes_to_string(sv)
+          None => ""
+        }
+        println(
+          "  " +
+          news[i2].1.to_string() +
+          "x  " +
+          bytes_to_string(news[i2].0) +
+          "  | " +
+          sample,
+        )
+      }
+      println("seasonal deviations: " + seasonal.length().to_string())
+      let sn2 = clip(seasonal.length())
+      for i2 in 0..<sn2 {
+        let bh = base_hod[seasonal[i2].0].to_double() / base_days.to_double()
+        println(
+          "  hour_utc=" +
+          seasonal[i2].0.to_string() +
+          "  recent=" +
+          seasonal[i2].1.to_string() +
+          "  baseline_mean=" +
+          bh.to_string() +
+          "  z=" +
+          seasonal[i2].2.to_string(),
+        )
+      }
+      if spikes.length() == 0 && news.length() == 0 && seasonal.length() == 0 {
+        println("no anomalies detected")
+      }
+    }
+    close_log(log)
+  })
+}
+
+///|
 /// Error clustering: normalize each matching line into a template (digit
 /// runs, hex and quoted spans replaced) and count templates, so variable
 /// content collapses into message shapes. `--match` (default "error") selects
@@ -6776,6 +7109,49 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_dashboard(args[2], last_sec, bucket, quantile_field, service, json)
+    }
+  } else if cmd == "anomalies" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut baseline_sec = "604800"
+      let mut recent_sec = "3600"
+      let mut sigma = "3"
+      let mut min_count = "2"
+      let mut top = "10"
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--baseline" && i + 1 < args.length() {
+          baseline_sec = args[i + 1]
+          i = i + 1
+        } else if a == "--recent" && i + 1 < args.length() {
+          recent_sec = args[i + 1]
+          i = i + 1
+        } else if a == "--sigma" && i + 1 < args.length() {
+          sigma = args[i + 1]
+          i = i + 1
+        } else if a == "--min-count" && i + 1 < args.length() {
+          min_count = args[i + 1]
+          i = i + 1
+        } else if a == "--top" && i + 1 < args.length() {
+          top = args[i + 1]
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        }
+        i = i + 1
+      }
+      cmd_anomalies(
+        args[2],
+        baseline_sec,
+        recent_sec,
+        sigma,
+        min_count,
+        top,
+        json,
+      )
     }
   } else if cmd == "alert" {
     if args.length() < 4 {
