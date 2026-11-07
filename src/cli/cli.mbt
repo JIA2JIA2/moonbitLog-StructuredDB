@@ -104,6 +104,13 @@
 ///                                    error clustering by normalized template
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
 ///                                    time-bucket histogram as text bars
+///   dashboard <dir> [--last sec] [--bucket minute|hour] [--service <svc>]
+///            [--quantile-field <f>] [--json]
+///                                    ops panel for daily inspection:
+///                                    volume/error-rate histogram, window
+///                                    totals, latency quantiles and top
+///                                    services (drill down with trend/query
+///                                    on suspicious windows)
 ///   alert <dir> <match> --threshold N [--window minute|hour|day]
 ///                   [--notify-file <path>] [--webhook <url>] [--json]
 ///                                    threshold alerting per UTC window
@@ -4407,6 +4414,333 @@ fn cmd_aggregate(
 }
 
 ///|
+/// Ops dashboard (5.5): one scan, one panel for daily inspection — volume
+/// histogram with per-bucket error rate, window totals, optional latency
+/// quantiles (`--quantile-field`) and a top-service breakdown. Time-scoped
+/// by `--last <sec>` (default 3600), pushed down to segment min_ts/max_ts.
+/// Drill-down: shrink `--last`/`--bucket` and follow with `trend`/`query`/
+/// `context` on the suspicious window. Error = severity rank >= 3, or a
+/// literal "error" substring when the record has no level field.
+fn cmd_dashboard(
+  dir : String,
+  last_sec : String,
+  bucket : String,
+  quantile_field : String?,
+  service : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  if bucket != "minute" && bucket != "hour" && bucket != "day" {
+    raise @io.IoError::Invalid(
+      "invalid bucket: " + bucket + " (minute|hour|day)",
+    )
+  }
+  let last_ms = (@string.parse_int64(last_sec) catch {
+      _ => raise @io.IoError::Invalid("invalid last: " + last_sec)
+    }) *
+    (1000 : Int64)
+  if last_ms <= 0 {
+    raise @io.IoError::Invalid("last must be positive")
+  }
+  let qfield : Bytes? = match quantile_field {
+    Some(f) => Some(@utf8.encode(f))
+    None => None
+  }
+  let service_b : Bytes? = match service {
+    Some(sv) => Some(@utf8.encode(sv))
+    None => None
+  }
+  run_locked(dir, false, () => {
+    let log = open_log(dir)
+    let now = now_ms()
+    let from_ts = now - last_ms
+    let bucket_total : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([],
+    )
+    let bucket_err : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([],
+    )
+    let svc_counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([],
+    )
+    let qvals : Array[Double] = []
+    let mut total = 0
+    let mut errors = 0
+    for seg in log.segments {
+      if seg.record_count > 0 {
+        // Pushdown: skip segments disjoint from the inspection window.
+        if seg.max_ts < from_ts {
+          continue
+        }
+        if seg.min_ts > now {
+          continue
+        }
+      }
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        if rec.timestamp < from_ts || rec.timestamp > now {
+          return
+        }
+        match service_b {
+          Some(sb) => if rec.key != sb { return }
+          None => ()
+        }
+        total = total + 1
+        let label = @core.format_utc(rec.timestamp, bucket)
+        bump_string(bucket_total, label)
+        let pairs = @core.parse_kv_pairs(rec.value)
+        let mut lv : Bytes? = None
+        for pair in pairs {
+          if pair.0 == b"level" {
+            lv = Some(pair.1)
+          }
+        }
+        let is_err = match lv {
+          Some(l) => @core.level_rank(l) >= 3
+          None => match_needle(rec.value, b"error", true)
+        }
+        if is_err {
+          errors = errors + 1
+          bump_string(bucket_err, label)
+        }
+        bump_bytes(svc_counts, rec.key)
+        match qfield {
+          Some(qf) =>
+            for pair in pairs {
+              if pair.0 == qf {
+                let d_opt = Some(
+                  @string.parse_double(@utf8.decode_lossy(pair.1)),
+                ) catch {
+                  _ => None
+                }
+                match d_opt {
+                  Some(d) => qvals.push(d)
+                  None => ()
+                }
+              }
+            }
+          None => ()
+        }
+      })
+    }
+    // Sorted bucket labels (oldest first).
+    let labels : Array[String] = []
+    for k in bucket_total.keys() {
+      labels.push(k)
+    }
+    labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+    let mut max_total : Int32 = 0
+    for label in labels {
+      match bucket_total.get(label) {
+        Some(c) => if c > max_total { max_total = c }
+        None => ()
+      }
+    }
+    let err_rate : Double = if total > 0 {
+      errors.to_double() * 100.0 / total.to_double()
+    } else {
+      0.0
+    }
+    if json {
+      let mut s = "{\"dir\":\"" +
+        json_escape_str(dir) +
+        "\",\"last_sec\":" +
+        last_sec.to_string() +
+        ",\"bucket\":\"" +
+        bucket +
+        "\",\"windows\":["
+      let mut first = true
+      for label in labels {
+        let t = match bucket_total.get(label) {
+          Some(c) => c
+          None => 0
+        }
+        let e = match bucket_err.get(label) {
+          Some(c) => c
+          None => 0
+        }
+        let rate = if t > 0 {
+          e.to_double() * 100.0 / t.to_double()
+        } else {
+          0.0
+        }
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"window\":\"" +
+          label +
+          "\",\"total\":" +
+          t.to_string() +
+          ",\"errors\":" +
+          e.to_string() +
+          ",\"err_pct\":" +
+          rate.to_string() +
+          "}"
+      }
+      s = s +
+        "],\"summary\":{\"total\":" +
+        total.to_string() +
+        ",\"errors\":" +
+        errors.to_string() +
+        ",\"err_pct\":" +
+        err_rate.to_string() +
+        ",\"services\":" +
+        svc_counts.length().to_string() +
+        "}"
+      match qfield {
+        Some(qf) => {
+          qvals
+          .mut_view()
+          .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+          let n = qvals.length()
+          let mut sum : Double = 0.0
+          for v in qvals {
+            sum = sum + v
+          }
+          let avg = if n > 0 { sum / n.to_double() } else { 0.0 }
+          s = s +
+            ",\"quantile\":{\"field\":\"" +
+            bytes_to_string(qf) +
+            "\",\"n\":" +
+            n.to_string() +
+            ",\"min\":" +
+            (if n > 0 { qvals[0].to_string() } else { "0" }) +
+            ",\"avg\":" +
+            avg.to_string() +
+            ",\"p50\":" +
+            (if n > 0 { pct_of(qvals, 0.5).to_string() } else { "0" }) +
+            ",\"p95\":" +
+            (if n > 0 { pct_of(qvals, 0.95).to_string() } else { "0" }) +
+            ",\"p99\":" +
+            (if n > 0 { pct_of(qvals, 0.99).to_string() } else { "0" }) +
+            ",\"max\":" +
+            (if n > 0 { qvals[n - 1].to_string() } else { "0" }) +
+            "}"
+        }
+        None => ()
+      }
+      s = s + "}"
+      println(s)
+    } else {
+      println(
+        "=== dashboard: " +
+        dir +
+        " (last " +
+        last_sec.to_string() +
+        "s, bucket " +
+        bucket +
+        ") ===",
+      )
+      println("volume & errors:")
+      for label in labels {
+        let t = match bucket_total.get(label) {
+          Some(c) => c
+          None => 0
+        }
+        let e = match bucket_err.get(label) {
+          Some(c) => c
+          None => 0
+        }
+        let rate = if t > 0 {
+          e.to_double() * 100.0 / t.to_double()
+        } else {
+          0.0
+        }
+        let bars = if max_total > 0 {
+          (t.to_double() * 40.0 / max_total.to_double()).to_int()
+        } else {
+          0
+        }
+        let bar = {
+          let sb = StringBuilder()
+          let mut k = 0
+          while k < bars {
+            sb.write_char('#')
+            k = k + 1
+          }
+          sb.to_string()
+        }
+        println(
+          label +
+          "  " +
+          t.to_string() +
+          "  err=" +
+          e.to_string() +
+          " (" +
+          rate.to_string() +
+          "%)  |" +
+          bar,
+        )
+      }
+      println(
+        "summary: total=" +
+        total.to_string() +
+        " errors=" +
+        errors.to_string() +
+        " err_rate=" +
+        err_rate.to_string() +
+        "% services=" +
+        svc_counts.length().to_string(),
+      )
+      match qfield {
+        Some(qf) => {
+          qvals
+          .mut_view()
+          .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+          let n = qvals.length()
+          if n > 0 {
+            let mut sum : Double = 0.0
+            for v in qvals {
+              sum = sum + v
+            }
+            println(
+              "latency (" +
+              bytes_to_string(qf) +
+              ", n=" +
+              n.to_string() +
+              "): min=" +
+              qvals[0].to_string() +
+              " avg=" +
+              (sum / n.to_double()).to_string() +
+              " p50=" +
+              pct_of(qvals, 0.5).to_string() +
+              " p95=" +
+              pct_of(qvals, 0.95).to_string() +
+              " p99=" +
+              pct_of(qvals, 0.99).to_string() +
+              " max=" +
+              qvals[n - 1].to_string(),
+            )
+          } else {
+            println("latency: no numeric samples")
+          }
+        }
+        None => ()
+      }
+      let svc_items : Array[(Bytes, Int32)] = []
+      for k in svc_counts.keys() {
+        match svc_counts.get(k) {
+          Some(c) => svc_items.push((k, c))
+          None => ()
+        }
+      }
+      let svc_top = top_counts(svc_items, 5)
+      let mut svc_line = "top services: "
+      let mut first_sv = true
+      for item in svc_top {
+        if !first_sv {
+          svc_line = svc_line + " "
+        }
+        first_sv = false
+        svc_line = svc_line + bytes_to_string(item.0) + "=" + item.1.to_string()
+      }
+      println(svc_line)
+      println(
+        "(drill-down: trend --bucket minute / query --since --until / context)",
+      )
+    }
+    close_log(log)
+  })
+}
+
+///|
 /// Error clustering: normalize each matching line into a template (digit
 /// runs, hex and quoted spans replaced) and count templates, so variable
 /// content collapses into message shapes. `--match` (default "error") selects
@@ -6411,6 +6745,37 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_trend(args[2], bucket, match_text, width)
+    }
+  } else if cmd == "dashboard" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut last_sec = "3600"
+      let mut bucket = "minute"
+      let mut quantile_field : String? = (None : String?)
+      let mut service : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--last" && i + 1 < args.length() {
+          last_sec = args[i + 1]
+          i = i + 1
+        } else if a == "--bucket" && i + 1 < args.length() {
+          bucket = args[i + 1]
+          i = i + 1
+        } else if a == "--quantile-field" && i + 1 < args.length() {
+          quantile_field = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        }
+        i = i + 1
+      }
+      cmd_dashboard(args[2], last_sec, bucket, quantile_field, service, json)
     }
   } else if cmd == "alert" {
     if args.length() < 4 {
