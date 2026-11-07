@@ -196,7 +196,7 @@ struct IngestOptions {
 const ROLL_SIZE : Int64 = 1_048_576
 
 ///|
-const MOONLOG_VERSION : String = "0.1.2"
+const MOONLOG_VERSION : String = "0.1.3"
 
 ///|
 const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
