@@ -1,11 +1,14 @@
 ///|
 /// One RBAC role rule, parsed from a line of the form
-/// `role=<name> token=<token> allow=<cmd1,cmd2,...|*>` (space-separated
-/// key=value pairs, the same shape as `parse_kv_pairs`).
+/// `role=<name> token=<token> allow=<cmd1,cmd2,...|*> [scope=<prefix|*>]`
+/// (space-separated key=value pairs, the same shape as `parse_kv_pairs`).
+/// `scope` (6.1) restricts the data the role may read and write to record
+/// keys with that prefix; `None` (or `*`) means the whole index.
 pub(all) struct RbacRole {
   name : Bytes
   token : Bytes
   allow : Array[Bytes]
+  scope : Bytes?
 }
 
 ///|
@@ -16,6 +19,8 @@ pub fn parse_rbac_line(line : Bytes) -> RbacRole? {
   let mut name : Bytes? = None
   let mut token : Bytes? = None
   let mut allow : Array[Bytes] = []
+  let mut scope : Bytes? = None
+  let mut scope_wild = false
   for pair in pairs {
     if pair.0 == b"role" {
       name = Some(pair.1)
@@ -23,6 +28,12 @@ pub fn parse_rbac_line(line : Bytes) -> RbacRole? {
       token = Some(pair.1)
     } else if pair.0 == b"allow" {
       allow = split_commas(pair.1)
+    } else if pair.0 == b"scope" {
+      if pair.1 == b"*" {
+        scope_wild = true
+      } else if pair.1.length() > 0 {
+        scope = Some(pair.1)
+      }
     }
   }
   match (name, token) {
@@ -30,7 +41,17 @@ pub fn parse_rbac_line(line : Bytes) -> RbacRole? {
       if allow.length() == 0 {
         None
       } else {
-        Some({ name: n, token: t, allow, })
+        // `scope=*` and a missing scope both mean "whole index".
+        Some({
+          name: n,
+          token: t,
+          allow,
+          scope: if scope_wild {
+            None
+          } else {
+            scope
+          },
+        })
       }
     _ => None
   }
@@ -63,6 +84,30 @@ pub fn rbac_allows(role : RbacRole, command : Bytes) -> Bool {
     }
   }
   false
+}
+
+///|
+/// Whether the role may access `key` under its data scope (6.1): `None`
+/// means unrestricted; `Some(prefix)` requires the key to start with that
+/// prefix — writes outside the scope are rejected and reads outside the
+/// scope are filtered.
+pub fn rbac_scope_allows(role : RbacRole, key : Bytes) -> Bool {
+  match role.scope {
+    None => true
+    Some(prefix) => {
+      if key.length() < prefix.length() {
+        return false
+      }
+      let mut i = 0
+      while i < prefix.length() {
+        if key.at(i) != prefix.at(i) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+  }
 }
 
 ///|

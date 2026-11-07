@@ -64,3 +64,37 @@ test "rbac_find matches tokens and never matches an empty token" {
     None => ()
   }
 }
+
+///|
+test "rbac scope restricts data access by key prefix (6.1)" {
+  let role = @core.parse_rbac_line(
+    b"role=tenant-a token=ta allow=* scope=app1/",
+  )
+  match role {
+    Some(r) => {
+      // In-scope keys (exact prefix boundary).
+      assert_true(@core.rbac_scope_allows(r, b"app1/x"))
+      assert_true(@core.rbac_scope_allows(r, b"app1/"))
+      // Out-of-scope keys, including prefix-adjacent ones.
+      assert_true(!@core.rbac_scope_allows(r, b"app2/x"))
+      assert_true(!@core.rbac_scope_allows(r, b"app1x"))
+      assert_true(!@core.rbac_scope_allows(r, b""))
+    }
+    None => panic()
+  }
+  // A missing scope (M109 legacy lines) means unrestricted access.
+  let legacy = @core.parse_rbac_line(b"role=admin token=tok allow=*")
+  match legacy {
+    Some(r) => {
+      assert_true(r.scope is None)
+      assert_true(@core.rbac_scope_allows(r, b"anything"))
+    }
+    None => panic()
+  }
+  // `scope=*` also means unrestricted.
+  let wild = @core.parse_rbac_line(b"role=admin token=tok allow=* scope=*")
+  match wild {
+    Some(r) => assert_true(@core.rbac_scope_allows(r, b"any/key"))
+    None => panic()
+  }
+}

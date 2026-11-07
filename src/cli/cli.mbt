@@ -187,6 +187,9 @@ struct IngestOptions {
   mask_extra : Array[Bytes]
   meta_bytes : Bytes?
   partition_ms : Int64
+  // 6.2: the HTTP push server accounts each tenant's write quota when the
+  // request is accepted (202), so its drain path must not account again.
+  skip_quota : Bool
 }
 
 ///|
@@ -196,7 +199,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -429,9 +432,15 @@ fn cmd_put(
     None => now_ms()
   }
   run_locked(dir, true, () => {
-    let log = open_log(dir, partition~)
+    let rule = active_quota_rule(dir)
     let kb = @utf8.encode(key)
     let vb = @utf8.encode(value)
+    let incoming : Int64 = (kb.length() + vb.length()).to_int64()
+    match quota_write_error(dir, rule, incoming) {
+      Some(msg) => raise @io.IoError::Invalid(msg)
+      None => ()
+    }
+    let log = open_log(dir, partition~)
     let (added, off) = if idempotent {
       log.append_idempotent(kb, vb, timestamp)
     } else {
@@ -439,6 +448,7 @@ fn cmd_put(
       (true, off)
     }
     if added {
+      quota_record_write(dir, rule, incoming)
       println("offset " + off.to_string())
       @backend_native.flush_meta(dir, log)
     } else {
@@ -458,20 +468,26 @@ fn cmd_put_if(
   value : String,
 ) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
+    let rule = active_quota_rule(dir)
+    let kb = @utf8.encode(key)
+    let vb = @utf8.encode(value)
+    let incoming : Int64 = (kb.length() + vb.length()).to_int64()
+    match quota_write_error(dir, rule, incoming) {
+      Some(msg) => raise @io.IoError::Invalid(msg)
+      None => ()
+    }
     let log = open_log(dir)
     let expected_bytes : Bytes? = if expected == "-" {
       (None : Bytes?)
     } else {
       Some(@utf8.encode(expected))
     }
-    let result = log.compare_and_swap(
-      @utf8.encode(key),
-      expected_bytes,
-      @utf8.encode(value),
-      now_ms(),
-    )
+    let result = log.compare_and_swap(kb, expected_bytes, vb, now_ms())
     match result {
-      Some(off) => println("offset " + off.to_string())
+      Some(off) => {
+        quota_record_write(dir, rule, incoming)
+        println("offset " + off.to_string())
+      }
       None => println("condition not met")
     }
     @backend_native.flush_meta(dir, log)
@@ -487,14 +503,24 @@ fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
     raise @io.IoError::Invalid("put-batch needs key/value pairs")
   }
   run_locked(dir, true, () => {
-    let log = open_log(dir)
+    let rule = active_quota_rule(dir)
     let recs : Array[(Bytes, Bytes, Int64)] = []
+    let mut incoming : Int64 = 0
     let mut i = 3
     while i < n {
-      recs.push((@utf8.encode(args[i]), @utf8.encode(args[i + 1]), now_ms()))
+      let kb = @utf8.encode(args[i])
+      let vb = @utf8.encode(args[i + 1])
+      incoming = incoming + (kb.length() + vb.length()).to_int64()
+      recs.push((kb, vb, now_ms()))
       i = i + 2
     }
+    match quota_write_error(dir, rule, incoming) {
+      Some(msg) => raise @io.IoError::Invalid(msg)
+      None => ()
+    }
+    let log = open_log(dir)
     let offsets = log.append_batch(recs)
+    quota_record_write(dir, rule, incoming)
     for off in offsets {
       println("offset " + off.to_string())
     }
@@ -1060,6 +1086,9 @@ fn cmd_ttl_expire(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
     Some(p) => p
     None => raise @io.IoError::Invalid("invalid TTL policy file: " + ppath)
   }
+  // 6.2: per-tenant retain-days overrides join as prefix rules (strictest
+  // matching rule wins, so quotas only tighten file-based retention).
+  let policy = effective_ttl_policy(dir, policy)
   run_locked(dir, true, () => {
     let log = open_log(dir)
     let (dropped, expired) = log.expire_by_policy(
@@ -1190,6 +1219,7 @@ fn run_maintenance(
       let raw_policy = @backend_native.read_file(ttl_path)
       match @core.parse_ttl_policy(raw_policy) {
         Some(policy) => {
+          let policy = effective_ttl_policy(dir, policy)
           let (td, te) = log.expire_by_policy(now_ms(), policy, on_drop=seg => {
             @backend_native.remove_segment_files(dir, seg.base_offset)
             seg.writer.close()
@@ -2538,7 +2568,23 @@ fn ingest_lines(
     }
     let mut chunk_written = 0
     let mut chunk_sampled = 0
+    let mut written_bytes : Int64 = 0
     run_locked(dir, true, () => {
+      // 6.2 write/storage quota: the pre-check runs inside the directory lock
+      // (the persisted usage file must not race concurrent writers); the
+      // budget is recorded with the actually written bytes after the batch
+      // lands. HTTP drain passes skip_quota and was accounted on accept.
+      let rule = if opts.skip_quota { None } else { active_quota_rule(dir) }
+      let mut pre_bytes : Int64 = 0
+      let mut j2 = i
+      while j2 < chunk_end {
+        pre_bytes = pre_bytes + lines[j2].length().to_int64()
+        j2 = j2 + 1
+      }
+      match quota_write_error(dir, rule, pre_bytes) {
+        Some(msg) => raise @io.IoError::Invalid(msg)
+        None => ()
+      }
       let log = open_log(dir, partition=opts.partition_ms)
       let mut j = i
       while j < chunk_end {
@@ -2581,10 +2627,13 @@ fn ingest_lines(
             let (added, _) = log.append_idempotent(k, v, rec_ts)
             if added {
               chunk_written = chunk_written + 1
+              written_bytes = written_bytes +
+                (k.length() + v.length()).to_int64()
             }
           } else {
             ignore(log.append(k, v, rec_ts))
             chunk_written = chunk_written + 1
+            written_bytes = written_bytes + (k.length() + v.length()).to_int64()
           }
         } else {
           chunk_sampled = chunk_sampled + 1
@@ -2594,6 +2643,7 @@ fn ingest_lines(
       log.flush()
       @backend_native.flush_meta(dir, log)
       close_log(log)
+      quota_record_write(dir, rule, written_bytes)
     })
     written = written + chunk_written
     sampled_out = sampled_out + chunk_sampled
@@ -2862,6 +2912,8 @@ struct HttpQueue {
   alert_threshold : Int32
   mut alerts : Int32
   opts : IngestOptions
+  // 6.2 per-tenant write/storage quota policy, loaded once at startup.
+  quota_rules : Array[@core.QuotaRule]
 }
 
 ///|
@@ -2962,6 +3014,21 @@ fn handle_http_connection(
   if is_get && request.path == b"/health" {
     http_respond(conn, 200, "{\"status\":\"ok\"}")
   } else if is_get && request.path == b"/stats" {
+    // 6.2: with RBAC in force, stats are tenant-visible only with a valid
+    // token (they expose store counters); open-local mode stays open.
+    let has_rbac = @backend_native.file_exists(dir + "/RBAC")
+    if has_rbac {
+      let auth = @core.rbac_find(
+        load_rbac_rules(dir),
+        http_bearer_token(request.authorization),
+      )
+      if auth is None {
+        http_respond(
+          conn, 401, "{\"error\":\"missing or invalid bearer token\"}",
+        )
+        return
+      }
+    }
     run_locked(dir, false, () => {
       let log = open_log(dir)
       let payload = "{\"records\":" +
@@ -2979,6 +3046,41 @@ fn handle_http_connection(
       close_log(log)
     })
   } else if is_post && (request.path == b"/" || request.path == b"/push") {
+    // 6.2: pushes are attributed to a tenant. With RBAC in force a valid
+    // `Authorization: Bearer <token>` is mandatory and the role must carry
+    // the `put` permission; open-local mode stays anonymous and is governed
+    // by the `default` quota rule.
+    let has_rbac = @backend_native.file_exists(dir + "/RBAC")
+    let auth : @core.RbacRole? = if has_rbac {
+      @core.rbac_find(
+        load_rbac_rules(dir),
+        http_bearer_token(request.authorization),
+      )
+    } else {
+      None
+    }
+    let authed = match auth {
+      Some(_) => true
+      None => !has_rbac
+    }
+    if !authed {
+      http_respond(conn, 401, "{\"error\":\"missing or invalid bearer token\"}")
+      return
+    }
+    if has_rbac {
+      match auth {
+        Some(r) =>
+          if !@core.rbac_allows(r, b"put") {
+            http_respond(conn, 403, "{\"error\":\"role not allowed to write\"}")
+            return
+          }
+        None => ()
+      }
+    }
+    let role_name : Bytes = match auth {
+      Some(r) => r.name
+      None => b""
+    }
     let (lines, _) = split_complete_lines(body, true)
     if lines.length() > 10000 {
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
@@ -2987,27 +3089,60 @@ fn handle_http_connection(
     // Source-side sampling runs before the queue, so the capacity below counts
     // only lines that will actually be written.
     let (kept, sampled_out) = sampling_filter_lines(lines, q.opts)
-    if http_queue_enqueue(q, kept) {
+    // 6.2 write/storage quota: pre-checked per request against the tenant's
+    // rule and recorded when accepted (202), so a spent budget survives
+    // restarts and a 202 always promises space under the storage share. The
+    // drain path skips accounting (skip_quota).
+    if kept.length() > 0 {
+      let mut incoming : Int64 = 0
+      for line in kept {
+        incoming = incoming + line.length().to_int64()
+      }
+      let rule = @core.quota_for_role(q.quota_rules, role_name)
+      match quota_write_error(dir, rule, incoming) {
+        Some(_) => {
+          // Not admitted, nothing buffered or accounted; the client can
+          // retry after the window resets or the quota is raised.
+          http_respond(
+            conn, 429, "{\"error\":\"tenant write quota exceeded\",\"retry_after_ms\":1000}",
+          )
+          return
+        }
+        None => ()
+      }
+      if http_queue_enqueue(q, kept) {
+        quota_record_write(dir, rule, incoming)
+        http_respond(
+          conn,
+          202,
+          "{\"accepted\":" +
+          kept.length().to_string() +
+          ",\"sampled_out\":" +
+          sampled_out.to_string() +
+          ",\"pending\":" +
+          q.pending.to_string() +
+          "}",
+        )
+      } else {
+        // Explicit backpressure: the request was not buffered, so the client
+        // can retry the same payload — nothing is dropped silently.
+        http_respond(
+          conn,
+          429,
+          "{\"error\":\"backlog full\",\"pending\":" +
+          q.pending.to_string() +
+          ",\"retry_after_ms\":1000}",
+        )
+      }
+    } else {
       http_respond(
         conn,
         202,
-        "{\"accepted\":" +
-        kept.length().to_string() +
-        ",\"sampled_out\":" +
+        "{\"accepted\":0,\"sampled_out\":" +
         sampled_out.to_string() +
         ",\"pending\":" +
         q.pending.to_string() +
         "}",
-      )
-    } else {
-      // Explicit backpressure: the request was not buffered, so the client can
-      // retry the same payload — nothing is dropped silently.
-      http_respond(
-        conn,
-        429,
-        "{\"error\":\"backlog full\",\"pending\":" +
-        q.pending.to_string() +
-        ",\"retry_after_ms\":1000}",
       )
     }
   } else {
@@ -3095,6 +3230,7 @@ fn cmd_http(
     alert_threshold: backlog_alert_n,
     alerts: 0,
     opts,
+    quota_rules: load_quota_rules(dir),
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
@@ -3497,6 +3633,23 @@ fn cmd_query(
   }
   // 4.6 query guard: concurrency slot, per-segment timeout and scan budget.
   acquire_query_slot(dir)
+  // 6.2 tenant concurrency quota: additionally hold one of the tenant's own
+  // slots (QLOCK.<role>.<i>) so a single tenant cannot occupy the whole
+  // global pool. The `default` rule covers anonymous/open-local callers.
+  let quota_rules = load_quota_rules(dir)
+  if quota_rules.length() > 0 {
+    let role = match current_role(dir) {
+      Some(r) => r
+      None => b""
+    }
+    match @core.quota_for_role(quota_rules, role) {
+      Some(rule) =>
+        if rule.query_concurrent > 0 {
+          acquire_tenant_query_slot(dir, role, rule.query_concurrent)
+        }
+      None => ()
+    }
+  }
   let timeout_val : Int64 = match timeout {
     Some(t) =>
       @string.parse_int64(t) catch {
@@ -6043,6 +6196,342 @@ fn record_denied(dir : String, cmd : String) -> Unit {
 }
 
 ///|
+/// Load the directory's QUOTA policy file (6.2); an empty array when the
+/// file is absent (per-tenant quotas disabled). Malformed lines are skipped
+/// like RBAC lines.
+fn load_quota_rules(dir : String) -> Array[@core.QuotaRule] {
+  if !@backend_native.file_exists(dir + "/QUOTA") {
+    return []
+  }
+  let data = @backend_native.read_file(dir + "/QUOTA")
+  let rules : Array[@core.QuotaRule] = []
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        match @core.parse_quota_line(line) {
+          Some(r) => rules.push(r)
+          None => ()
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  rules
+}
+
+///|
+/// The role name behind MOONLOG_TOKEN, or None when the directory has no
+/// RBAC file (open local mode) or the token matches no role.
+fn current_role(dir : String) -> Bytes? {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return None
+  }
+  let rules = load_rbac_rules(dir)
+  let token = match @env.get_env_var("MOONLOG_TOKEN") {
+    Some(t) => @utf8.encode(t)
+    None => b""
+  }
+  match @core.rbac_find(rules, token) {
+    Some(role) => Some(role.name)
+    None => None
+  }
+}
+
+///|
+/// The quota rule governing this invocation: the MOONLOG_TOKEN role's rule,
+/// else the reserved `default` rule, else None (no QUOTA file or no
+/// applicable rule).
+fn active_quota_rule(dir : String) -> @core.QuotaRule? {
+  let rules = load_quota_rules(dir)
+  if rules.length() == 0 {
+    return None
+  }
+  let role = match current_role(dir) {
+    Some(r) => r
+    None => b""
+  }
+  @core.quota_for_role(rules, role)
+}
+
+///|
+/// Filesystem-safe rendering of a role name for QUOTA_STATE and lock file
+/// names: ASCII letters/digits and `-_.` pass through, everything else
+/// (including `/`, which could escape the directory) becomes `_`; an empty
+/// name becomes `_`.
+fn sanitize_role_name(role : Bytes) -> String {
+  let raw = bytes_to_string(role)
+  let sb = StringBuilder()
+  for ch in raw {
+    let c = ch.to_int()
+    if (c >= 48 && c <= 57) ||
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      c == 45 ||
+      c == 95 ||
+      c == 46 {
+      sb.write_char(ch)
+    } else {
+      sb.write_char('_')
+    }
+  }
+  let out = sb.to_string()
+  if out.length() == 0 {
+    "_"
+  } else {
+    out
+  }
+}
+
+///|
+/// Total bytes of segment data files (`*.log`) in `dir` — the measure the
+/// storage quota caps (6.2), matching what `retain_max_bytes` accounts.
+/// Sidecars (index/keys/inv) and control files are excluded.
+fn dir_log_bytes(dir : String) -> Int64 {
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let mut total : Int64 = 0
+  for name in names {
+    if name.has_suffix(".log") {
+      let s = @backend_native.file_size(dir + "/" + name)
+      if s > 0 {
+        total = total + s
+      }
+    }
+  }
+  total
+}
+
+///|
+/// Quota gate (6.2): returns the violation message when appending `incoming`
+/// bytes would exceed the rule's storage share or the persisted write
+/// window; None means admitted (nothing is persisted yet — pair with
+/// `quota_record_write` once the data is actually accepted).
+fn quota_write_error(
+  dir : String,
+  rule : @core.QuotaRule?,
+  incoming : Int64,
+) -> String? {
+  let r = match rule {
+    Some(r) => r
+    None => return None
+  }
+  if r.storage_bytes >= 0 {
+    let used = dir_log_bytes(dir)
+    if used + incoming > r.storage_bytes {
+      return Some(
+        "storage quota exceeded for role '" +
+        bytes_to_string(r.role) +
+        "': " +
+        (used + incoming).to_string() +
+        " > " +
+        r.storage_bytes.to_string() +
+        " bytes on disk (prune old data or raise storage-bytes)",
+      )
+    }
+  }
+  if r.write_bytes >= 0 {
+    let usage = quota_window_usage(dir, r)
+    if !@core.quota_write_allows(usage, r.write_bytes, incoming) {
+      return Some(
+        "write quota exceeded for role '" +
+        bytes_to_string(r.role) +
+        "': " +
+        (usage.used + incoming).to_string() +
+        " > " +
+        r.write_bytes.to_string() +
+        " bytes this window (slow down or raise write-bytes)",
+      )
+    }
+  }
+  None
+}
+
+///|
+/// Current (window-reset applied) write usage for a rule's role.
+fn quota_window_usage(dir : String, r : @core.QuotaRule) -> @core.QuotaUsage {
+  let path = dir + "/QUOTA_STATE/" + sanitize_role_name(r.role) + ".write"
+  match @core.parse_quota_usage(@backend_native.read_file(path)) {
+    Some(u) => @core.quota_window_current(u, now_ms())
+    None => { window_start: now_ms(), used: 0, }
+  }
+}
+
+///|
+/// Persist an admitted write's bytes into the role's window usage. Called
+/// only after the data is accepted, so rejected requests never consume
+/// budget; a spent budget survives restarts (usage lives on disk).
+fn quota_record_write(
+  dir : String,
+  rule : @core.QuotaRule?,
+  incoming : Int64,
+) -> Unit raise @io.IoError {
+  let r = match rule {
+    Some(r) => r
+    None => return
+  }
+  if r.write_bytes < 0 {
+    return
+  }
+  ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+  let path = dir + "/QUOTA_STATE/" + sanitize_role_name(r.role) + ".write"
+  let usage = quota_window_usage(dir, r)
+  let updated : @core.QuotaUsage = {
+    window_start: usage.window_start,
+    used: usage.used + incoming,
+  }
+  @backend_native.write_file(path, @core.encode_quota_usage(updated))
+}
+
+///|
+/// The effective TTL policy for `dir` (3.4 + 6.2): the parsed TTL file plus
+/// one `prefix` rule per scoped role with a `retain-days` quota override.
+/// Expiry keeps the strictest matching rule, so tenant quotas can only
+/// tighten — never extend — file-based retention.
+fn effective_ttl_policy(
+  dir : String,
+  policy : @core.TtlPolicy,
+) -> @core.TtlPolicy {
+  let rules = load_quota_rules(dir)
+  if rules.length() == 0 {
+    return policy
+  }
+  let scopes : Array[(Bytes, Bytes)] = []
+  for r in load_rbac_rules(dir) {
+    match r.scope {
+      Some(s) => scopes.push((r.name, s))
+      None => ()
+    }
+  }
+  let extra = @core.quota_retain_prefix_rules(rules, scopes)
+  if extra.length() == 0 {
+    return policy
+  }
+  let all : Array[(Bytes, Bytes, Int64)] = []
+  for r0 in policy.rules {
+    all.push(r0)
+  }
+  for e in extra {
+    all.push(e)
+  }
+  { default_days: policy.default_days, rules: all, }
+}
+
+///|
+/// Acquire one tenant-level query slot (6.2): a non-blocking flock on
+/// `QLOCK.<role>.<i>` with `i` below the tenant's `query-concurrent` quota,
+/// retried until the lock timeout, so one busy tenant fails its own queries
+/// instead of occupying the whole global pool.
+fn acquire_tenant_query_slot(
+  dir : String,
+  role : Bytes,
+  limit : Int32,
+) -> Unit raise @io.IoError {
+  let prefix = "QLOCK." + sanitize_role_name(role) + "."
+  let deadline = now_ms() + lock_timeout_ms().to_int64()
+  let mut idx = 0
+  while true {
+    let fd = @backend_native.try_named_lock(dir, prefix + idx.to_string())
+    if fd >= 0 {
+      return
+    }
+    idx = idx + 1
+    if idx >= limit {
+      if now_ms() >= deadline {
+        raise @io.IoError::Invalid(
+          "too many concurrent queries for tenant '" +
+          bytes_to_string(role) +
+          "' (limit " +
+          limit.to_string() +
+          "); wait for one to finish or raise its query-concurrent quota",
+        )
+      }
+      idx = 0
+      @backend_native.sleep_ms(20)
+    }
+  }
+}
+
+///|
+/// Strip an ASCII-case-insensitive `Bearer ` prefix from an Authorization
+/// header value; values without the prefix pass through unchanged.
+fn http_bearer_token(authorization : Bytes) -> Bytes {
+  let prefix = b"Bearer "
+  if authorization.length() < prefix.length() {
+    return authorization
+  }
+  let mut i = 0
+  while i < prefix.length() {
+    let c = authorization.at(i).to_int()
+    let p = prefix.at(i).to_int()
+    let hit = c == p ||
+      (c >= 65 && c <= 90 && c + 32 == p) ||
+      (c >= 97 && c <= 122 && c - 32 == p)
+    if !hit {
+      return authorization
+    }
+    i = i + 1
+  }
+  @core.slice(authorization, prefix.length(), authorization.length())
+}
+
+///|
+/// Show the directory's per-tenant quota policy (6.2) and each limited
+/// role's current write-window usage. Rules are edited directly in
+/// `<dir>/QUOTA`.
+fn cmd_quota(dir : String) -> Unit {
+  let rules = load_quota_rules(dir)
+  if rules.length() == 0 {
+    println(
+      "no quota policy: " +
+      dir +
+      "/QUOTA absent — per-tenant limits (write/storage/query-concurrent/retain-days) are disabled",
+    )
+    return
+  }
+  for r in rules {
+    let write_s = if r.write_bytes < 0 {
+      "unlimited"
+    } else {
+      r.write_bytes.to_string()
+    }
+    let storage_s = if r.storage_bytes < 0 {
+      "unlimited"
+    } else {
+      r.storage_bytes.to_string()
+    }
+    let conc_s = if r.query_concurrent > 0 {
+      r.query_concurrent.to_string()
+    } else {
+      "global-only"
+    }
+    let retain_s = if r.retain_days < 0 {
+      "no-override"
+    } else {
+      r.retain_days.to_string()
+    }
+    let line = "role=" +
+      bytes_to_string(r.role) +
+      " write-bytes=" +
+      write_s +
+      " storage-bytes=" +
+      storage_s +
+      " query-concurrent=" +
+      conc_s +
+      " retain-days=" +
+      retain_s +
+      (if r.write_bytes >= 0 {
+        " used=" + quota_window_usage(dir, r).used.to_string()
+      } else {
+        ""
+      })
+    println(line)
+  }
+}
+
+///|
 /// Mask a token for display: keep at most the last four characters.
 fn mask_token(token : String) -> String {
   let n = token.length()
@@ -6096,18 +6585,35 @@ fn cmd_rbac(
     println("rbac initialized: admin role created (token hidden)")
   } else if sub == "add" {
     if args.length() < start + 3 {
-      raise @io.IoError::Invalid("usage: rbac <dir> add <name> <token> <allow>")
+      raise @io.IoError::Invalid(
+        "usage: rbac <dir> add <name> <token> <allow> [scope=<prefix>]",
+      )
     }
     let name = args[start]
     let token = args[start + 1]
     let allow = args[start + 2]
+    // Optional data scope (6.1): restricts the role to keys with that prefix;
+    // 6.2 also uses it to bind per-tenant retain-days overrides.
+    let scope_line = if args.length() > start + 3 &&
+      args[start + 3].has_prefix("scope=") {
+      " " + args[start + 3]
+    } else {
+      ""
+    }
     let path = dir + "/RBAC"
     let existing = @backend_native.read_file(path)
     @backend_native.write_file(
       path,
       existing +
       @utf8.encode(
-        "role=" + name + " token=" + token + " allow=" + allow + "\n",
+        "role=" +
+        name +
+        " token=" +
+        token +
+        " allow=" +
+        allow +
+        scope_line +
+        "\n",
       ),
     )
     println("role added: " + name)
@@ -6663,6 +7169,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           Some(s) => parse_partition(s)
           None => 0
         },
+        skip_quota: false,
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -6810,6 +7317,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           Some(s) => parse_partition(s)
           None => 0
         },
+        // 6.2: the HTTP server accounts per-tenant write quota on accept.
+        skip_quota: true,
       }
       cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
     }
@@ -7601,6 +8110,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       cmd_rbac(args[2], args[3], args, 4)
     }
+  } else if cmd == "quota" {
+    cmd_quota(args[2])
   } else {
     println(USAGE)
   }

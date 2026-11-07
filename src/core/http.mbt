@@ -1,16 +1,19 @@
 ///|
-/// A parsed HTTP/1.x request head.
+/// A parsed HTTP/1.x request head. `authorization` carries the raw
+/// `Authorization:` header value (6.2: the `Bearer <token>` credential the
+/// push endpoint authenticates against RBAC), empty when absent.
 pub(all) struct HttpRequest {
   verb : Bytes
   path : Bytes
   content_length : Int32
+  authorization : Bytes
 }
 
 ///|
 /// Parse the head of an HTTP/1.x request (the bytes up to and including the
 /// blank line). Returns None when the request line is malformed. Header names
-/// compare case-insensitively; `Content-Length` defaults to 0 when absent or
-/// unparsable.
+/// compare case-insensitively; `Content-Length` defaults to 0 and
+/// `Authorization` to empty when absent or unparsable.
 pub fn parse_http_request(head : Bytes) -> HttpRequest? {
   let first_end = find_byte_http(head, 10, 0)
   if first_end < 0 {
@@ -22,6 +25,7 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
     return None
   }
   let mut content_length = 0
+  let mut authorization : Bytes = b""
   let mut pos = first_end + 1
   while pos < head.length() {
     let end = find_byte_http(head, 10, pos)
@@ -46,10 +50,16 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
         v = v + 1
       }
       content_length = num
+    } else if has_ci_prefix_http(line, b"authorization:") {
+      let mut v = 14
+      while v < line.length() && line.at(v).to_int() == 32 {
+        v = v + 1
+      }
+      authorization = slice(line, v, line.length())
     }
     pos = end + 1
   }
-  Some({ verb: parts[0], path: parts[1], content_length, })
+  Some({ verb: parts[0], path: parts[1], content_length, authorization, })
 }
 
 ///|

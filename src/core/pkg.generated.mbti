@@ -7,6 +7,8 @@ import {
 }
 
 // Values
+pub const QUOTA_WRITE_WINDOW_MS : Int64 = 3_600_000
+
 pub fn body_len_at(Bytes, Int32) -> Int32 raise DecodeError
 
 pub fn bytes_contains(Bytes, Bytes) -> Bool
@@ -20,6 +22,8 @@ pub fn crc32(Bytes) -> UInt32
 pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
 
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
+
+pub fn encode_quota_usage(QuotaUsage) -> Bytes
 
 pub fn fnv1a_hash(Bytes) -> UInt32
 
@@ -49,13 +53,27 @@ pub fn parse_iso8601_ms(Bytes, Int64) -> Int64
 
 pub fn parse_kv_pairs(Bytes) -> Array[(Bytes, Bytes)]
 
+pub fn parse_quota_line(Bytes) -> QuotaRule?
+
+pub fn parse_quota_usage(Bytes) -> QuotaUsage?
+
 pub fn parse_rbac_line(Bytes) -> RbacRole?
 
 pub fn parse_ttl_policy(Bytes) -> TtlPolicy?
 
+pub fn quota_for_role(Array[QuotaRule], Bytes) -> QuotaRule?
+
+pub fn quota_retain_prefix_rules(Array[QuotaRule], Array[(Bytes, Bytes)]) -> Array[(Bytes, Bytes, Int64)]
+
+pub fn quota_window_current(QuotaUsage, Int64) -> QuotaUsage
+
+pub fn quota_write_allows(QuotaUsage, Int64, Int64) -> Bool
+
 pub fn rbac_allows(RbacRole, Bytes) -> Bool
 
 pub fn rbac_find(Array[RbacRole], Bytes) -> RbacRole?
+
+pub fn rbac_scope_allows(RbacRole, Bytes) -> Bool
 
 pub fn rle_compress(Bytes) -> Bytes
 
@@ -99,12 +117,27 @@ pub(all) struct HttpRequest {
   verb : Bytes
   path : Bytes
   content_length : Int32
+  authorization : Bytes
+}
+
+pub(all) struct QuotaRule {
+  role : Bytes
+  write_bytes : Int64
+  storage_bytes : Int64
+  query_concurrent : Int32
+  retain_days : Int64
+}
+
+pub(all) struct QuotaUsage {
+  window_start : Int64
+  used : Int64
 }
 
 pub(all) struct RbacRole {
   name : Bytes
   token : Bytes
   allow : Array[Bytes]
+  scope : Bytes?
 }
 
 pub(all) struct Record {

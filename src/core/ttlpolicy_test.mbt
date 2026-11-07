@@ -27,6 +27,37 @@ test "parse ttl policy with default service and level rules" {
 }
 
 ///|
+test "prefix rules match tenant key namespaces (6.2)" {
+  let p = @core.parse_ttl_policy(
+    b"default 30\nprefix tenant-a/ 7\nprefix tenant-b/ 365\n",
+  )
+  match p {
+    Some(policy) => {
+      assert_eq(policy.rules.length(), 2)
+      // Keys under the tenant prefix hit the prefix rule.
+      assert_eq(
+        @core.ttl_days_of(policy, b"tenant-a/orders", Some(b"info")),
+        7L,
+      )
+      assert_eq(@core.ttl_days_of(policy, b"tenant-a/", None), 7L)
+      // Keys outside every prefix fall back to the default.
+      assert_eq(@core.ttl_days_of(policy, b"tenant-c/x", None), 30L)
+      // Several hits → the stricter one wins.
+      let both = @core.parse_ttl_policy(b"prefix t/ 90\nservice t/a 10\n")
+      match both {
+        Some(policy2) =>
+          assert_eq(@core.ttl_days_of(policy2, b"t/a", None), 10L)
+        None => panic()
+      }
+    }
+    None => panic()
+  }
+  // Malformed prefix lines reject the whole file, like every other scope.
+  assert_true(@core.parse_ttl_policy(b"prefix tenant-a/\n") is None)
+  assert_true(@core.parse_ttl_policy(b"prefix tenant-a/ abc\n") is None)
+}
+
+///|
 test "ttl policy rejects malformed lines and supports default-less files" {
   // A malformed line rejects the whole file (no silent partial policy).
   assert_true(@core.parse_ttl_policy(b"default 30\nservice bad\n") is None)

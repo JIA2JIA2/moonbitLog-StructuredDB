@@ -1,8 +1,9 @@
 ///|
 /// Differentiated retention policy (3.4): a global default in days plus
-/// per-service (`service <name> <days>`) and per-level (`level <level>
-/// <days>`) overrides. `default_days < 0` means "no default expiry" —
-/// records matching no rule are kept forever.
+/// per-service (`service <name> <days>`), per-level (`level <level> <days>`)
+/// and per-key-prefix (`prefix <p> <days>`, the tenant dimension of 6.2)
+/// overrides. `default_days < 0` means "no default expiry" — records
+/// matching no rule are kept forever.
 pub(all) struct TtlPolicy {
   default_days : Int64
   rules : Array[(Bytes, Bytes, Int64)]
@@ -35,9 +36,9 @@ fn ttl_tokens(line : Bytes) -> Array[Bytes] {
 
 ///|
 /// Parse a `<dir>/TTL` policy file: lines are `default <days>`,
-/// `service <name> <days>` or `level <level> <days>` (whitespace separated;
-/// `#` comments and blank lines are ignored). Returns None on any malformed
-/// line, so a typo never silently changes retention.
+/// `service <name> <days>`, `level <level> <days>` or `prefix <p> <days>`
+/// (whitespace separated; `#` comments and blank lines are ignored). Returns
+/// None on any malformed line, so a typo never silently changes retention.
 pub fn parse_ttl_policy(text : Bytes) -> TtlPolicy? {
   let mut default_days : Int64 = -1
   let rules : Array[(Bytes, Bytes, Int64)] = []
@@ -71,7 +72,7 @@ pub fn parse_ttl_policy(text : Bytes) -> TtlPolicy? {
             default_days = d
           }
         }
-      } else if head == b"service" || head == b"level" {
+      } else if head == b"service" || head == b"level" || head == b"prefix" {
         if toks.length() != 3 {
           ok = false
         } else {
@@ -97,11 +98,28 @@ pub fn parse_ttl_policy(text : Bytes) -> TtlPolicy? {
 }
 
 ///|
+/// Whether `data` starts with `prefix` byte for byte.
+fn bytes_has_prefix(data : Bytes, prefix : Bytes) -> Bool {
+  if data.length() < prefix.length() {
+    return false
+  }
+  let mut i = 0
+  while i < prefix.length() {
+    if data.at(i) != prefix.at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 /// Effective retention days for a record: the service scope matches the
-/// record key and the level scope matches the parsed `level` field; when
-/// both match, the stricter (smaller) one wins; when none match, the default
-/// applies. Days < 0 mean "no matching rule and no default" — the record
-/// never expires.
+/// record key, the level scope matches the parsed `level` field and the
+/// prefix scope matches the key's leading bytes (tenant namespaces, 6.2);
+/// when several match, the stricter (smaller) one wins; when none match, the
+/// default applies. Days < 0 mean "no matching rule and no default" — the
+/// record never expires.
 pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
   let mut days : Int64 = -1
   let mut hit_any = false
@@ -114,6 +132,8 @@ pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
         Some(l) => l == name
         None => false
       }
+    } else if scope == b"prefix" {
+      bytes_has_prefix(key, name)
     } else {
       false
     }

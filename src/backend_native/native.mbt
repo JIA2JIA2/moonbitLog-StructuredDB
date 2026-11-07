@@ -85,7 +85,16 @@ pub fn flush_stdout() -> Unit {
 /// LOCK_NB). Returns the held fd, or -1 when the slot is busy; the caller
 /// releases by closing the fd (CLI processes release all slots on exit).
 pub fn try_query_slot(dir : String, idx : Int32) -> Int32 {
-  let path = dir + "/QLOCK." + idx.to_string()
+  try_named_lock(dir, "QLOCK." + idx.to_string())
+}
+
+///|
+/// Try to acquire a non-blocking exclusive flock on `<dir>/<name>` (6.2:
+/// per-tenant query slots live in `QLOCK.<role>.<i>` files beside the global
+/// pool). Returns the held fd, or -1 when the lock is busy or cannot be
+/// opened; the caller releases by closing the fd.
+pub fn try_named_lock(dir : String, name : String) -> Int32 {
+  let path = dir + "/" + name
   let fd = moonlog_open_rw(@utf8.encode(path))
   if fd < 0 {
     return -1
