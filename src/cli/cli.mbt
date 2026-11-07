@@ -199,7 +199,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.2"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1961,24 +1961,92 @@ fn write_json_string(out : @buffer.Buffer, data : Bytes, b64 : Bool) -> Unit {
 }
 
 ///|
-/// Export every record as JSON Lines (one self-contained JSON object per
-/// line: `offset`, `timestamp`, `kind`, `key`, `value`). The default text
+/// Whether `data` starts with `prefix` byte for byte (CLI-side helper; the
+/// core one is private to ttlpolicy).
+fn bytes_has_prefix_cli(data : Bytes, prefix : Bytes) -> Bool {
+  if data.length() < prefix.length() {
+    return false
+  }
+  let mut i = 0
+  while i < prefix.length() {
+    if data.at(i) != prefix.at(i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Export records as JSON Lines (one self-contained JSON object per line:
+/// `offset`, `timestamp`, `kind`, `key`, `value`). The default text
 /// mode assumes keys/values are UTF-8 text; pass `base64` as the third
-/// argument for a lossless encoding of arbitrary bytes.
+/// argument for a lossless encoding of arbitrary bytes. Optional filters
+/// (6.6) narrow the export to a key `--prefix`, a `--match` substring over
+/// key/value, or a `--from/--until` timestamp window — a query result can
+/// then be handed off in a universally parseable format.
 fn cmd_export_jsonl(
   dir : String,
   file : String,
   mode : String,
+  prefix : String?,
+  match_text : String?,
+  from_ts : String?,
+  until_ts : String?,
 ) -> Unit raise @io.IoError {
   if mode != "text" && mode != "base64" {
     raise @io.IoError::Invalid("invalid mode: " + mode + " (text|base64)")
   }
   let b64 = mode == "base64"
+  let pb : Bytes = match prefix {
+    Some(p) => @utf8.encode(p)
+    None => b""
+  }
+  let has_prefix = prefix is Some(_)
+  let mb : Bytes = match match_text {
+    Some(m) => @utf8.encode(m)
+    None => b""
+  }
+  let has_match = match_text is Some(_)
+  let from = match from_ts {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid --from: " + s)
+        },
+      )
+    None => None
+  }
+  let until = match until_ts {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid --until: " + s)
+        },
+      )
+    None => None
+  }
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let buf = @buffer.Buffer::Buffer()
     let mut count = 0
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if has_prefix && !bytes_has_prefix_cli(rec.key, pb) {
+        return true
+      }
+      if has_match &&
+        !@core.bytes_contains(rec.key, mb) &&
+        !@core.bytes_contains(rec.value, mb) {
+        return true
+      }
+      match from {
+        Some(f) => if rec.timestamp < f { return true }
+        None => ()
+      }
+      match until {
+        Some(u) => if rec.timestamp >= u { return true }
+        None => ()
+      }
       buf.write_bytes(b"{\"offset\":")
       buf.write_bytes(@utf8.encode(rec.offset.to_string()))
       buf.write_bytes(b",\"timestamp\":")
@@ -2010,6 +2078,120 @@ fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
     println("imported " + n.to_string() + " records")
     println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
+  })
+}
+
+///|
+/// Compliance purge (6.6): delete every live record whose key starts with
+/// `prefix` — the erasure path for a data subject's records. With
+/// `--into <file>` the matching records are first exported as JSONL (a
+/// universally parseable retention copy), then tombstones are written and
+/// the directory is physically compacted, so the erased records and their
+/// tombstones are gone from disk. The sweep afterwards verifies zero
+/// remaining matches and the report states `PURGE status=ok|fail`.
+/// Offsets are renumbered by the compaction (cursors need resetting).
+fn cmd_purge(
+  dir : String,
+  prefix : String,
+  into : String?,
+) -> Unit raise @io.IoError {
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let pb = @utf8.encode(prefix)
+    let now = now_ms()
+    let buf = @buffer.Buffer::Buffer()
+    let mut exported = 0
+    let mut matched_records = 0
+    let keys : Array[Bytes] = []
+    // Sweep once: retention copy and key collection over the live records.
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if !rec.is_delete() && bytes_has_prefix_cli(rec.key, pb) {
+        matched_records = matched_records + 1
+        match into {
+          Some(_) => {
+            buf.write_bytes(b"{\"offset\":")
+            buf.write_bytes(@utf8.encode(rec.offset.to_string()))
+            buf.write_bytes(b",\"timestamp\":")
+            buf.write_bytes(@utf8.encode(rec.timestamp.to_string()))
+            buf.write_bytes(b",\"kind\":")
+            buf.write_bytes(
+              if rec.is_delete() {
+                b"\"delete\""
+              } else {
+                b"\"put\""
+              },
+            )
+            buf.write_bytes(b",\"key\":")
+            write_json_string(buf, rec.key, false)
+            buf.write_bytes(b",\"value\":")
+            write_json_string(buf, rec.value, false)
+            buf.write_bytes(b"}\n")
+            exported = exported + 1
+          }
+          None => ()
+        }
+        let mut seen = false
+        for k in keys {
+          if k == rec.key {
+            seen = true
+          }
+        }
+        if !seen {
+          keys.push(rec.key)
+        }
+      }
+      true
+    })
+    match into {
+      Some(file) => @backend_native.write_file(file, buf.to_bytes())
+      None => ()
+    }
+    // Erase: tombstone every matched key, then physically compact so the
+    // records and their tombstones leave the segment files.
+    for k in keys {
+      ignore(log.delete(k, now))
+    }
+    let live = log.compact(on_drop=seg => {
+      @backend_native.remove_segment_files(dir, seg.base_offset)
+      seg.writer.close()
+    })
+    @backend_native.flush_meta(dir, log)
+    // Verify (6.6): after compaction nothing matching the prefix remains.
+    let mut remaining = 0
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if !rec.is_delete() && bytes_has_prefix_cli(rec.key, pb) {
+        remaining = remaining + 1
+      }
+      true
+    })
+    close_log(log)
+    let status = if remaining == 0 { "ok" } else { "fail" }
+    println("PURGE status=" + status)
+    println("prefix: " + prefix)
+    match into {
+      Some(file) =>
+        println(
+          "exported: " +
+          exported.to_string() +
+          " records -> " +
+          file +
+          " (parseable JSONL retention copy)",
+        )
+      None => ()
+    }
+    println(
+      "deleted: keys=" +
+      keys.length().to_string() +
+      " records=" +
+      matched_records.to_string(),
+    )
+    println("compacted: live_records=" + live.to_string())
+    println(
+      "verified: remaining=" +
+      remaining.to_string() +
+      " (prefix scan after physical compaction)",
+    )
+    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
   })
 }
 
@@ -6397,9 +6579,9 @@ let audit_cmds : Array[String] = [
   "scan-time", "tail", "follow", "search", "query", "context", "aggregate", "cluster",
   "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor", "cursor-lag",
   "cursor-list", "stats", "partitions", "export", "export-jsonl", "archive", "backup",
-  "drill", "delete", "prune", "prune-bytes", "prune-before", "prune-expired", "prune-superseded",
-  "merge", "compact", "compact-expired", "compress", "tier", "ttl-expire", "restore",
-  "recover", "maintain", "rbac",
+  "drill", "purge", "delete", "prune", "prune-bytes", "prune-before", "prune-expired",
+  "prune-superseded", "merge", "compact", "compact-expired", "compress", "tier",
+  "ttl-expire", "restore", "recover", "maintain", "rbac",
 ]
 
 ///|
@@ -8453,8 +8635,55 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
-      let mode = if args.length() > 4 { args[4] } else { "text" }
-      cmd_export_jsonl(args[2], args[3], mode)
+      let mut mode = "text"
+      let mut prefix : String? = (None : String?)
+      let mut match_text : String? = (None : String?)
+      let mut from_ts : String? = (None : String?)
+      let mut until_ts : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--prefix" && i + 1 < args.length() {
+          prefix = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--match" && i + 1 < args.length() {
+          match_text = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--from" && i + 1 < args.length() {
+          from_ts = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until_ts = Some(args[i + 1])
+          i = i + 1
+        } else if a == "text" || a == "base64" {
+          mode = a
+        }
+        i = i + 1
+      }
+      cmd_export_jsonl(
+        args[2],
+        args[3],
+        mode,
+        prefix,
+        match_text,
+        from_ts,
+        until_ts,
+      )
+    }
+  } else if cmd == "purge" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut into : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        if args[i] == "--into" && i + 1 < args.length() {
+          into = Some(args[i + 1])
+          i = i + 1
+        }
+        i = i + 1
+      }
+      cmd_purge(args[2], args[3], into)
     }
   } else if cmd == "import" {
     if args.length() < 4 {
