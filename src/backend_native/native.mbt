@@ -517,7 +517,11 @@ pub fn recover_log_dir(
   let names = list_dir(dir)
   let mut segs : Array[@segment.Segment[NativeFileLog, NativeFileLog]] = []
   for name in names {
-    if name.has_suffix(".log") {
+    // Only canonical segment names (`<digits>.log`) are recovered. Anything
+    // else ending in `.log` — a stray user file, an audit log — must never
+    // be opened as a segment: its content would be truncated as a "corrupt
+    // tail" (6.3 regression smoke caught exactly that with AUDIT.log).
+    if name.has_suffix(".log") && parse_base_from_log_name(name) is Some(_) {
       let path = dir + "/" + name
       match load_compressed_segment(dir, name, path) {
         Some(seg) => segs = insert_segment_sorted(segs, seg)
@@ -611,6 +615,10 @@ extern "C" fn moonlog_read_file(path : Bytes) -> Bytes = "moonlog_read_file"
 extern "C" fn moonlog_write_file(path : Bytes, data : Bytes) -> Int32 = "moonlog_write_file"
 
 ///|
+#borrow(path, data)
+extern "C" fn moonlog_append_file(path : Bytes, data : Bytes) -> Int32 = "moonlog_append_file"
+
+///|
 #borrow(from, to)
 extern "C" fn moonlog_rename(from : Bytes, to : Bytes) -> Int32 = "moonlog_rename"
 
@@ -628,6 +636,17 @@ pub fn read_file(path : String) -> Bytes {
 /// Replace a file's contents (truncate + write + fsync).
 pub fn write_file(path : String, data : Bytes) -> Unit raise @io.IoError {
   let r = moonlog_write_file(@utf8.encode(path), data)
+  if r < 0 {
+    raise @io.IoError::Syscall(r)
+  }
+}
+
+///|
+/// Atomically append `data` to `path` (O_APPEND + fsync, creating the file
+/// when absent): concurrent processes appending audit events never
+/// overwrite each other's bytes.
+pub fn append_file(path : String, data : Bytes) -> Unit raise @io.IoError {
+  let r = moonlog_append_file(@utf8.encode(path), data)
   if r < 0 {
     raise @io.IoError::Syscall(r)
   }

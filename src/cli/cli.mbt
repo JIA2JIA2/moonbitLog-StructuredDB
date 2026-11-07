@@ -1040,16 +1040,16 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
 /// Drop segments whose last record is older than `ttl` ms relative to now.
 
 ///|
-/// Append a TTL expiry event to `<dir>/TTL_AUDIT.log` (JSONL), so retention
-/// actions stay auditable beyond the one-line command output.
+/// Append a TTL expiry event to `<dir>/TTL_AUDIT` (JSONL), so retention
+/// actions stay auditable beyond the one-line command output. Atomic append
+/// (O_APPEND), so concurrent maintain passes never overwrite each other.
 fn append_ttl_audit(
   dir : String,
   policy_text : String,
   dropped : Int32,
   expired : Int32,
 ) -> Unit {
-  let path = dir + "/TTL_AUDIT.log"
-  let existing = @backend_native.read_file(path)
+  let path = ttl_audit_path(dir)
   let line = "{\"ts\":" +
     now_ms().to_string() +
     ",\"event\":\"ttl_expire\"" +
@@ -1061,10 +1061,22 @@ fn append_ttl_audit(
     json_escape_str(policy_text) +
     "\"}\n"
   ignore(
-    @backend_native.write_file(path, existing + @utf8.encode(line)) catch {
+    @backend_native.append_file(path, @utf8.encode(line)) catch {
       _ => ()
     },
   )
+}
+
+///|
+/// The TTL audit path (6.3): `<dir>/TTL_AUDIT` — renamed from the legacy
+/// `TTL_AUDIT.log` (whose `.log` suffix made recovery treat it as a
+/// segment) on first use, keeping prior history.
+fn ttl_audit_path(dir : String) -> String {
+  let legacy = dir + "/TTL_AUDIT.log"
+  if @backend_native.file_exists(legacy) {
+    ignore(@backend_native.rename_file(legacy, dir + "/TTL_AUDIT"))
+  }
+  dir + "/TTL_AUDIT"
 }
 
 ///|
@@ -6175,24 +6187,144 @@ fn rbac_check(dir : String, cmd : String) -> Bool {
 }
 
 ///|
-/// Append a denial to the directory's audit log (`AUDIT.log`) when RBAC is in
-/// force, so unrestricted directories stay untouched.
-fn record_denied(dir : String, cmd : String) -> Unit {
-  if !@backend_native.file_exists(dir + "/RBAC") {
-    return
+/// Commands that leave an operation-audit trail (6.3): queries, exports,
+/// destructive maintenance/deletes and configuration changes. Writes and
+/// ingest are not audited — the log itself is the record — and consumer
+/// cursor management is not a key operation.
+let audit_cmds : Array[String] = [
+  "get", "getkey", "get-many", "getkey-live", "has-key", "scan", "scan-prefix", "scan-range",
+  "scan-time", "tail", "follow", "search", "query", "context", "aggregate", "cluster",
+  "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor", "cursor-lag",
+  "cursor-list", "stats", "partitions", "export", "export-jsonl", "archive", "backup",
+  "delete", "prune", "prune-bytes", "prune-before", "prune-expired", "prune-superseded",
+  "merge", "compact", "compact-expired", "compress", "tier", "ttl-expire", "restore",
+  "recover", "maintain", "rbac",
+]
+
+///|
+/// Whether `cmd` belongs to the audited set (6.3).
+fn audit_cmd_listed(cmd : String) -> Bool {
+  for c in audit_cmds {
+    if c == cmd {
+      return true
+    }
   }
-  let path = dir + "/AUDIT.log"
-  let existing = @backend_native.read_file(path)
+  false
+}
+
+///|
+/// Whether operation auditing (6.3) is in force for `dir`: explicitly opted
+/// in by the presence of `AUDIT.log` (e.g. `touch AUDIT.log`), or implicit
+/// because RBAC is in force (denials were always recorded there).
+fn audit_enabled(dir : String) -> Bool {
+  @backend_native.file_exists(dir + "/AUDIT") ||
+  @backend_native.file_exists(dir + "/AUDIT.log") ||
+  @backend_native.file_exists(dir + "/RBAC")
+}
+
+///|
+/// Who is behind this invocation for audit purposes: the MOONLOG_TOKEN's
+/// RBAC role when RBAC is in force (tokens themselves never land in the
+/// log), `unknown` for an unmatched token, `local` in open local mode.
+fn audit_actor(dir : String) -> String {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return "local"
+  }
+  let rules = load_rbac_rules(dir)
+  let token = match @env.get_env_var("MOONLOG_TOKEN") {
+    Some(t) => @utf8.encode(t)
+    None => b""
+  }
+  match @core.rbac_find(rules, token) {
+    Some(r) => bytes_to_string(r.name)
+    None => "unknown"
+  }
+}
+
+///|
+/// Compact summary of a command's arguments for the audit trail: the
+/// space-joined arguments after `<dir>` (start=3), truncated to 200
+/// characters. RBAC credentials never land in the log — the token of
+/// `add`/`init` is masked.
+fn audit_target(cmd : String, args : Array[String], start : Int32) -> String {
+  let sb = StringBuilder()
+  let mut i = start
+  let mut first = true
+  while i < args.length() {
+    let masked = cmd == "rbac" &&
+      args.length() > 3 &&
+      ((args[3] == "add" && i == 5) || (args[3] == "init" && i == 4))
+    if !first {
+      sb.write_string(" ")
+    }
+    sb.write_string(if masked { mask_token(args[i]) } else { args[i] })
+    first = false
+    i = i + 1
+  }
+  let s = sb.to_string()
+  if s.length() > 200 {
+    s[0:200].to_owned() + "..."
+  } else {
+    s
+  }
+}
+
+///|
+/// The audit trail path (6.3): `<dir>/AUDIT` — deliberately without a
+/// `.log` suffix, which the recovery pass would treat as a segment file and
+/// truncate to zero (the 6.3 smoke caught exactly that). A legacy
+/// `AUDIT.log` (M109-era denial trail) is renamed forward on first use so
+/// history survives.
+fn audit_path(dir : String) -> String {
+  let legacy = dir + "/AUDIT.log"
+  if @backend_native.file_exists(legacy) {
+    ignore(@backend_native.rename_file(legacy, dir + "/AUDIT"))
+  }
+  dir + "/AUDIT"
+}
+
+///|
+/// Append one operation-audit event to `<dir>/AUDIT` (6.3): JSONL with
+/// ts/actor/action/decision/target, atomically appended (O_APPEND) so
+/// concurrent CLI processes never lose events. Failures are swallowed —
+/// auditing must not break the operation it observes.
+fn audit_log(
+  dir : String,
+  actor : String,
+  action : String,
+  decision : String,
+  target : String,
+) -> Unit {
+  // `rbac init` audits before cmd_rbac creates the directory; ensure_dir is
+  // idempotent, so every audit path survives a not-yet-created store dir.
+  ignore(@backend_native.ensure_dir(dir))
   let line = "{\"ts\":" +
     now_ms().to_string() +
-    ",\"command\":\"" +
-    json_escape_str(cmd) +
-    "\",\"decision\":\"deny\"}\n"
+    ",\"actor\":\"" +
+    json_escape_str(actor) +
+    "\",\"action\":\"" +
+    json_escape_str(action) +
+    "\",\"decision\":\"" +
+    decision +
+    "\",\"target\":\"" +
+    json_escape_str(target) +
+    "\"}\n"
   ignore(
-    @backend_native.write_file(path, existing + @utf8.encode(line)) catch {
+    @backend_native.append_file(audit_path(dir), @utf8.encode(line)) catch {
       _ => ()
     },
   )
+}
+
+///|
+/// Append a denial to the directory's audit log (`<dir>/AUDIT`, 6.3): the
+/// actor (matched role or `unknown`) and the argument summary make denied
+/// attempts attributable to a person and a time.
+fn record_denied(dir : String, cmd : String, args : Array[String]) -> Unit {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return
+  }
+  audit_log(dir, audit_actor(dir), cmd, "deny", audit_target(cmd, args, 3))
 }
 
 ///|
@@ -6822,13 +6954,38 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     args.length() > 3 &&
     (args[3] == "init" || args[3] == "check")
   if !bootstrapping && !rbac_check(args[2], cmd) {
-    record_denied(args[2], cmd)
+    record_denied(args[2], cmd, args)
     println(
       "permission denied: '" +
       cmd +
       "' requires MOONLOG_TOKEN with a permitted role",
     )
     return
+  }
+  // 6.3 operation audit: queries, exports, destructive maintenance and
+  // configuration changes leave an attributable allow event (actor + ts +
+  // argument summary) before execution, so a failed run still shows who
+  // attempted it. Enabled when AUDIT.log or RBAC exists (opt in locally by
+  // touching AUDIT.log); `rbac init` always leaves a trail since it
+  // bootstraps RBAC itself, `rbac check` stays a pure diagnostic.
+  if cmd == "rbac" && args.length() > 3 && args[3] == "init" {
+    audit_log(
+      args[2],
+      audit_actor(args[2]),
+      cmd,
+      "allow",
+      audit_target(cmd, args, 3),
+    )
+  } else if audit_enabled(args[2]) &&
+    audit_cmd_listed(cmd) &&
+    !(cmd == "rbac" && args.length() > 3 && args[3] == "check") {
+    audit_log(
+      args[2],
+      audit_actor(args[2]),
+      cmd,
+      "allow",
+      audit_target(cmd, args, 3),
+    )
   }
   if cmd == "put" {
     if args.length() < 5 {

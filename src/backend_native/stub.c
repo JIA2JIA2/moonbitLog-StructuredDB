@@ -274,6 +274,30 @@ int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
 }
 
 MOONBIT_FFI_EXPORT
+int32_t moonlog_append_file(moonbit_bytes_t path, moonbit_bytes_t data) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  // O_APPEND: the kernel positions every write atomically at the end, so
+  // concurrent processes appending audit events never overwrite each other.
+  int fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+  free(p);
+  if (fd < 0) {
+    return -1;
+  }
+  int32_t len = Moonbit_array_length(data);
+  ssize_t n = write(fd, data, (size_t)len);
+  int r = fsync(fd);
+  close(fd);
+  (void)r;
+  if (n < 0 || (int32_t)n != len) {
+    return -1;
+  }
+  return 0;
+}
+
+MOONBIT_FFI_EXPORT
 int32_t moonlog_rename(moonbit_bytes_t from, moonbit_bytes_t to) {
   char *a = moonlog_c_path(from);
   char *b = moonlog_c_path(to);
