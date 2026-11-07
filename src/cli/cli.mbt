@@ -4666,6 +4666,98 @@ fn dispatch_notification(
 }
 
 ///|
+/// Fan a firing/resolved/escalated notification out to the extra channels
+/// of 5.4: DingTalk and WeCom robot webhooks (their msgtype envelopes) and
+/// e-mail via curl SMTP (an .eml temp file + --mail-from/--mail-rcpt/-T).
+/// With `notify_dry` the delivery commands are printed instead of executed,
+/// so the assembly can be verified without reaching the network.
+fn notify_extra(
+  summary : String,
+  dingtalk : String?,
+  wecom : String?,
+  email_to : String?,
+  smtp_url : String?,
+  notify_dry : Bool,
+) -> Unit raise @io.IoError {
+  match dingtalk {
+    Some(url) => {
+      let payload = "{\"msgtype\":\"text\",\"text\":{\"content\":" +
+        json_escape_str(summary) +
+        "}}"
+      if notify_dry {
+        println("[dry-run] dingtalk --data " + payload + " -> " + url)
+      } else {
+        let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+          @core.shell_quote(payload) +
+          " " +
+          @core.shell_quote(url)
+        let rc = @backend_native.run_command(cmd)
+        if rc != 0 {
+          println(
+            "warning: dingtalk delivery failed (exit " + rc.to_string() + ")",
+          )
+        }
+      }
+    }
+    None => ()
+  }
+  match wecom {
+    Some(url) => {
+      let payload = "{\"msgtype\":\"text\",\"content\":{\"content\":" +
+        json_escape_str(summary) +
+        "}}"
+      if notify_dry {
+        println("[dry-run] wecom --data " + payload + " -> " + url)
+      } else {
+        let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+          @core.shell_quote(payload) +
+          " " +
+          @core.shell_quote(url)
+        let rc = @backend_native.run_command(cmd)
+        if rc != 0 {
+          println(
+            "warning: wecom delivery failed (exit " + rc.to_string() + ")",
+          )
+        }
+      }
+    }
+    None => ()
+  }
+  match email_to {
+    Some(to) =>
+      match smtp_url {
+        Some(smtp) => {
+          let eml = "/tmp/moonlog_mail." + now_ms().to_string() + ".eml"
+          let mail = "Subject: moonlog alert\nFrom: moonlog@localhost\nTo: " +
+            to +
+            "\n\n" +
+            summary +
+            "\n"
+          @backend_native.write_file(eml, @utf8.encode(mail))
+          let cmd = "curl -s -m 10 " +
+            @core.shell_quote(smtp) +
+            " --mail-from moonlog@localhost --mail-rcpt " +
+            @core.shell_quote(to) +
+            " -T " +
+            @core.shell_quote(eml)
+          if notify_dry {
+            println("[dry-run] email " + cmd)
+          } else {
+            let rc = @backend_native.run_command(cmd)
+            if rc != 0 {
+              println(
+                "warning: email delivery failed (exit " + rc.to_string() + ")",
+              )
+            }
+          }
+        }
+        None => raise @io.IoError::Invalid("--email requires --smtp-url")
+      }
+    None => ()
+  }
+}
+
+///|
 /// Threshold alerting: count records matching `--match` per UTC window and
 /// alert on every window whose count exceeds `--threshold`. Alerts print to
 /// stdout and may additionally be delivered to `--notify-file` (JSON lines)
@@ -4768,6 +4860,12 @@ fn cmd_watch(
   every_ms : String?,
   notify_file : String?,
   webhook : String?,
+  dingtalk : String?,
+  wecom : String?,
+  email_to : String?,
+  smtp_url : String?,
+  escalate_sec : String?,
+  notify_dry : Bool,
   json : Bool,
   once : Bool,
 ) -> Unit raise @io.IoError {
@@ -4828,6 +4926,16 @@ fn cmd_watch(
   let mut from : UInt64 = (0 : UInt64)
   let mut buf : Array[@core.Record] = []
   let mut firing = false
+  let mut escalated = false
+  let mut fired_at : Int64 = 0
+  let esc_ms = match escalate_sec {
+    Some(sv) =>
+      (@string.parse_int64(sv) catch {
+        _ => raise @io.IoError::Invalid("invalid escalate-sec: " + sv)
+      }) *
+      (1000 : Int64)
+    None => 0
+  }
   run_locked(dir, false, () => {
     let log = open_log(dir)
     // `--once` evaluates the data already present (from 0); the resident
@@ -4949,6 +5057,7 @@ fn cmd_watch(
     // firing/resolved state machine — one notification per transition.
     if violated && !firing {
       firing = true
+      fired_at = now
       let event = "{\"kind\":\"" +
         kind_str +
         "\",\"state\":\"firing\",\"value\":" +
@@ -4982,6 +5091,14 @@ fn cmd_watch(
           "ALERT firing count=" + cur_value + " over window " + win_s + "s",
         )
       }
+      let summary = "ALERT firing " +
+        kind_str +
+        " value=" +
+        cur_value +
+        " over window " +
+        win_s +
+        "s"
+      notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
       dispatch_notification(event, notify_file, webhook)
     } else if !violated && firing {
       firing = false
@@ -5001,7 +5118,41 @@ fn cmd_watch(
       } else {
         println("RESOLVED value=" + cur_value)
       }
+      let summary = "RESOLVED " +
+        kind_str +
+        " value=" +
+        cur_value +
+        " (window " +
+        win_s +
+        "s)"
+      notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
       dispatch_notification(event, notify_file, webhook)
+    }
+    // Escalation (5.4): still firing after --escalate-sec -> one ESCALATED
+    // notification per episode (bounded, no storm).
+    if esc_ms > 0 && firing && !escalated && now - fired_at >= esc_ms {
+      escalated = true
+      let event = "{\"kind\":\"escalation\",\"state\":\"escalated\",\"value\":" +
+        cur_value +
+        ",\"elapsed_ms\":" +
+        (now - fired_at).to_string() +
+        ",\"ts\":" +
+        now.to_string() +
+        "}"
+      let summary = "ESCALATED " +
+        kind_str +
+        " value=" +
+        cur_value +
+        " still firing after " +
+        (now - fired_at).to_string() +
+        "ms"
+      if json {
+        println(event)
+      } else {
+        println(summary)
+      }
+      dispatch_notification(event, notify_file, webhook)
+      notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
     }
     if once {
       go = false
@@ -6309,6 +6460,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut every_ms : String? = (None : String?)
       let mut notify_file : String? = (None : String?)
       let mut webhook : String? = (None : String?)
+      let mut dingtalk : String? = (None : String?)
+      let mut wecom : String? = (None : String?)
+      let mut email_to : String? = (None : String?)
+      let mut smtp_url : String? = (None : String?)
+      let mut escalate_sec : String? = (None : String?)
+      let mut notify_dry = false
       let mut json = false
       let mut once = false
       let mut i = 4
@@ -6341,6 +6498,23 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--webhook" && i + 1 < args.length() {
           webhook = Some(args[i + 1])
           i = i + 1
+        } else if a == "--dingtalk" && i + 1 < args.length() {
+          dingtalk = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--wecom" && i + 1 < args.length() {
+          wecom = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--email" && i + 1 < args.length() {
+          email_to = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--smtp-url" && i + 1 < args.length() {
+          smtp_url = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--escalate-sec" && i + 1 < args.length() {
+          escalate_sec = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--notify-dry-run" {
+          notify_dry = true
         } else if a == "--json" {
           json = true
         } else if a == "--once" {
@@ -6365,6 +6539,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
             every_ms,
             notify_file,
             webhook,
+            dingtalk,
+            wecom,
+            email_to,
+            smtp_url,
+            escalate_sec,
+            notify_dry,
             json,
             once,
           )
