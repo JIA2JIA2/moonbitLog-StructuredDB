@@ -82,3 +82,21 @@ test "lzss round-trips a patterned buffer" {
   }
   assert_eq(dec, src)
 }
+
+///|
+test "lzss finds repeated log lines beyond the old 64-byte scan" {
+  let line = b"level=info service=orders host=h1 trace_id=t123456 message=user login completed ok\n"
+  let buf = @buffer.Buffer::Buffer()
+  for i = 0; i < 200; i = i + 1 {
+    buf.write_bytes(line)
+  }
+  let src = buf.to_bytes()
+  let enc = @core.lz_compress(src)
+  // Repeats are ~89 bytes apart (> the old 64-candidate linear scan), so the
+  // previous matcher missed them and the "compressed" output grew.
+  assert_true(enc.length() < src.length() / 2)
+  let dec = @core.lz_decompress(enc, src.length().to_int64()) catch {
+    _ => panic()
+  }
+  assert_eq(dec, src)
+}

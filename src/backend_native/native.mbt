@@ -1077,14 +1077,18 @@ pub fn compress_rolled_segments(
         } else {
           @core.lz_compress(raw)
         }
-        write_file_atomic(
-          dir,
-          @segment.segment_file_name(seg.base_offset),
-          packed_bytes,
-        )
-        seg.mark_compressed(raw_size, algo)
-        seg.mark_fsync_clean()
-        packed = packed + 1
+        // Only replace the raw segment when the candidate is actually smaller:
+        // tiny or incompressible segments would otherwise grow on disk.
+        if packed_bytes.length() < raw.length() {
+          write_file_atomic(
+            dir,
+            @segment.segment_file_name(seg.base_offset),
+            packed_bytes,
+          )
+          seg.mark_compressed(raw_size, algo)
+          seg.mark_fsync_clean()
+          packed = packed + 1
+        }
       }
     }
     i = i + 1
@@ -1539,6 +1543,12 @@ pub fn tier_log_dir(
   roll_size : Int64,
   warm_segments : Int32,
 ) -> Int32 raise @io.IoError {
+  // Refuse relative cold paths: the per-segment symlink resolves relative to
+  // the main directory, so a relative target would silently dangle and make
+  // migrated segments unreadable.
+  if cold_dir.length() == 0 || cold_dir.at(0).to_int() != 47 {
+    raise @io.IoError::Invalid("cold-dir must be an absolute path: " + cold_dir)
+  }
   ignore(ensure_dir(cold_dir))
   let log = open_log_dir(dir, roll_size)
   let n = log.segment_count()

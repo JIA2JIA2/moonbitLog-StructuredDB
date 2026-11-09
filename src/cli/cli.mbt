@@ -206,10 +206,13 @@
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
 ///   compress <dir> [rle|lzss]        compress rolled-over segments
-///   tier <dir> <cold-dir> [--warm N] [--dry-run]
+///   tier <dir> <cold-dir> [--warm N] [--dry-run] [--json]
 ///                                    hot/warm/cold tiering: compress rolled
 ///                                    segments, move the oldest ones into
-///                                    cold-dir behind symlinks
+///                                    cold-dir behind symlinks (cold-dir must
+///                                    be an absolute path; relative paths are
+///                                    rejected because the symlink resolves
+///                                    relative to the log directory)
 ///   fsck <dir> [fast] [--fix] [--dry-run]
 ///                                    verify integrity; --fix repairs what it
 ///                                    can; --dry-run only prints the repair plan
@@ -1253,9 +1256,17 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
     let detail = log.segment_summaries()
     let mut raw_total : Int64 = 0
     let mut disk_total : Int64 = 0
+    let actual_disk : Array[Int64] = []
     for seg in detail {
       raw_total = raw_total + seg.bytes
-      disk_total = disk_total + seg.disk_bytes
+      // Use the real file size (following cold-tier symlinks): a compressed
+      // segment's `reader.length()` is its logical size, which would hide the
+      // compression gain in `stats`.
+      let d = @backend_native.file_size(
+        dir + "/" + @segment.segment_file_name(seg.base_offset),
+      )
+      actual_disk.push(d)
+      disk_total = disk_total + d
     }
     if json {
       let mut s = "{\"records\":" +
@@ -1270,7 +1281,9 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
         disk_total.to_string() +
         ",\"detail\":["
       let mut first = true
-      for seg in detail {
+      let mut i = 0
+      while i < detail.length() {
+        let seg = detail[i]
         if !first {
           s = s + ","
         }
@@ -1283,7 +1296,7 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           ",\"bytes\":" +
           seg.bytes.to_string() +
           ",\"disk_bytes\":" +
-          seg.disk_bytes.to_string() +
+          actual_disk[i].to_string() +
           ",\"compressed\":" +
           (if seg.compressed { "true" } else { "false" })
         if seg.has_span {
@@ -1294,6 +1307,7 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
             seg.max_ts.to_string()
         }
         s = s + "}"
+        i = i + 1
       }
       println(s + "]}")
     } else {
@@ -1302,7 +1316,9 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
       println("next_offset " + log.next_offset().to_string())
       println("raw_bytes " + raw_total.to_string())
       println("disk_bytes " + disk_total.to_string())
-      for seg in detail {
+      let mut i = 0
+      while i < detail.length() {
+        let seg = detail[i]
         println(
           "seg " +
           seg.base_offset.to_string() +
@@ -1311,10 +1327,11 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           " bytes=" +
           seg.bytes.to_string() +
           " disk=" +
-          seg.disk_bytes.to_string() +
+          actual_disk[i].to_string() +
           " compressed=" +
           (if seg.compressed { "true" } else { "false" }),
         )
+        i = i + 1
       }
     }
     close_log(log)
@@ -2096,7 +2113,14 @@ fn cmd_tier(
   cold_dir : String,
   warm : String?,
   dry : Bool,
+  json : Bool,
 ) -> Unit raise @io.IoError {
+  // A relative cold path would make the per-segment symlink resolve relative
+  // to the main directory and silently point at nothing (segments become
+  // unreadable). Demand an absolute path so tiering cannot break reads.
+  if cold_dir.length() == 0 || cold_dir.at(0).to_int() != 47 {
+    raise @io.IoError::Invalid("cold-dir must be an absolute path: " + cold_dir)
+  }
   let warm_n = match warm {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -2110,21 +2134,49 @@ fn cmd_tier(
       let n = log.segment_count()
       let cut = n - 1 - warm_n
       let to_move = if cut > 0 { cut } else { 0 }
-      println(
-        "tier plan: " +
-        to_move.to_string() +
-        " cold of " +
-        n.to_string() +
-        " segments (warm " +
-        warm_n.to_string() +
-        ")",
-      )
       close_log(log)
+      if json {
+        println(
+          "{\"dry_run\":true,\"segments\":" +
+          n.to_string() +
+          ",\"cold\":" +
+          to_move.to_string() +
+          ",\"warm\":" +
+          warm_n.to_string() +
+          ",\"cold_dir\":\"" +
+          json_escape_str(cold_dir) +
+          "\"}",
+        )
+      } else {
+        println(
+          "tier plan: " +
+          to_move.to_string() +
+          " cold of " +
+          n.to_string() +
+          " segments (warm " +
+          warm_n.to_string() +
+          ")",
+        )
+      }
     })
   } else {
     run_locked(dir, true, () => {
       let moved = @backend_native.tier_log_dir(dir, cold_dir, ROLL_SIZE, warm_n)
-      println("tiered " + moved.to_string() + " segments cold into " + cold_dir)
+      if json {
+        println(
+          "{\"dry_run\":false,\"moved\":" +
+          moved.to_string() +
+          ",\"warm\":" +
+          warm_n.to_string() +
+          ",\"cold_dir\":\"" +
+          json_escape_str(cold_dir) +
+          "\"}",
+        )
+      } else {
+        println(
+          "tiered " + moved.to_string() + " segments cold into " + cold_dir,
+        )
+      }
     })
   }
 }
@@ -2156,7 +2208,9 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name == "RBAC" ||
       name == "TTL" ||
       name == "QUOTA" ||
-      name == "PARTITION" {
+      name == "PARTITION" ||
+      name == "AUDIT" ||
+      name == "TTL_AUDIT" {
       out.push(name)
     }
   }
@@ -10022,18 +10076,21 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut warm : String? = (None : String?)
       let mut dry = false
+      let mut json = false
       let mut i = 4
       while i < args.length() {
         let a = args[i]
         if a == "--dry-run" {
           dry = true
+        } else if a == "--json" {
+          json = true
         } else if a == "--warm" && i + 1 < args.length() {
           warm = Some(args[i + 1])
           i = i + 1
         }
         i = i + 1
       }
-      cmd_tier(args[2], args[3], warm, dry)
+      cmd_tier(args[2], args[3], warm, dry, json)
     }
   } else if cmd == "compress" {
     let mut algo = "lzss"
