@@ -8193,14 +8193,21 @@ fn cmd_alert(
 ///|
 /// Sliding-window threshold watch (5.3): continuously pull new records and
 /// evaluate the trailing `--window-sec S` window every `--every <ms>` (default
-/// 1000). Two metric shapes: count mode (`--match <text> --threshold N` —
-/// matching records in the window) and metric mode (`--metric <field>
-/// --metric-threshold <v>` — average of the numeric field over the window).
-/// A firing/resolved state machine keeps the alarm quiet: entering the
-/// violation emits one ALERT notification, staying violated emits nothing,
-/// falling back emits one RESOLVED — no alert storms. `--level-min`/
-/// `--service` narrow the records (same semantics as query); notifications
-/// reuse the three channels of `alert` (`--notify-file`/`--webhook`).
+/// 1000); fresh records trigger an immediate re-evaluation, so an alert fires
+/// within a processing round. Two metric shapes: count mode (`--match <text>
+/// --threshold N` — matching records in the window) and metric mode
+/// (`--metric <field> --metric-threshold <v>` — average of the numeric field
+/// over the window). Field filters and metrics read JSON values as well as
+/// `k=v` (2.1 flattening); `--level-min` accepts either case and `--service`
+/// matches the record key or the unified-schema service field. A
+/// firing/resolved state machine keeps the alarm quiet: entering the
+/// violation emits one ALERT, staying violated emits nothing, falling back
+/// emits one RESOLVED — `--resolve-after N` (default 1) further requires N
+/// consecutive calm evaluations and `--min-samples N` (default 1) ignores
+/// windows with too few metric samples, so spikes/flapping cannot storm.
+/// Events are flushed immediately (pipes/redirects see alerts in real time),
+/// SIGTERM/SIGINT exits cooperatively with a summary, and `--json` keeps
+/// stdout pure JSON (events and the closing summary).
 /// `--once` performs a single pull+evaluate pass (for scripts and tests).
 fn cmd_watch(
   dir : String,
@@ -8222,9 +8229,31 @@ fn cmd_watch(
   notify_dry : Bool,
   json : Bool,
   once : Bool,
+  min_samples_s : String?,
+  resolve_after_s : String?,
 ) -> Unit raise @io.IoError {
   let threshold_n = @string.parse_int(threshold) catch {
     _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
+  }
+  let min_samples : Int32 = match min_samples_s {
+    Some(v) =>
+      @string.parse_int(v) catch {
+        _ => raise @io.IoError::Invalid("invalid min-samples: " + v)
+      }
+    None => 1
+  }
+  if min_samples < 0 {
+    raise @io.IoError::Invalid("min-samples must be >= 0")
+  }
+  let resolve_after : Int32 = match resolve_after_s {
+    Some(v) =>
+      @string.parse_int(v) catch {
+        _ => raise @io.IoError::Invalid("invalid resolve-after: " + v)
+      }
+    None => 1
+  }
+  if resolve_after < 1 {
+    raise @io.IoError::Invalid("resolve-after must be >= 1")
   }
   let win_ms = (@string.parse_int64(window_sec) catch {
       _ => raise @io.IoError::Invalid("invalid window-sec: " + window_sec)
@@ -8297,13 +8326,21 @@ fn cmd_watch(
     from = if once { (0 : UInt64) } else { log.next_offset() }
     close_log(log)
   })
+  @backend_native.install_shutdown_handler()
+  let mut evals : Int32 = 0
+  let mut firings : Int32 = 0
+  let mut resolutions : Int32 = 0
+  let mut escalations : Int32 = 0
+  let mut calm_rounds : Int32 = 0
   let mut go = true
-  while go {
+  while go && !@backend_native.shutdown_requested() {
     // Pull new records into the window buffer.
+    let mut got_new = false
     run_locked(dir, false, () => {
       let log = open_log(dir)
       let next = log.next_offset()
       if next > from {
+        got_new = true
         let recs = log.scan_range(from, next)
         for rec in recs {
           buf.push(rec)
@@ -8328,21 +8365,49 @@ fn cmd_watch(
     let mut samples = 0
     for rec in buf {
       let mut pass = true
+      let needs_fields = match service_b {
+        Some(_) => true
+        None =>
+          match min_rank {
+            Some(_) => true
+            None =>
+              match metric_b {
+                Some(_) => true
+                None => false
+              }
+          }
+      }
+      let mut fields : Array[(Bytes, Bytes)] = []
+      let mut sf_service : Bytes? = None
+      let mut sf_level : Bytes? = None
+      if needs_fields {
+        // 5.3: live field filters/metrics read JSON values too (2.1
+        // flattening), not just `k=v` pairs.
+        fields = ctx_value_fields(rec.value)
+        let sf = @core.schema_from_fields(fields, (0 : Int64))
+        sf_service = sf.service
+        sf_level = sf.level
+      }
       match service_b {
-        Some(sb) => if rec.key != sb { pass = false }
+        Some(sb) => {
+          let mut sm = ctx_bytes_eq_ci(rec.key, sb)
+          if !sm {
+            sm = match sf_service {
+              Some(sv) => ctx_bytes_eq_ci(sv, sb)
+              None => false
+            }
+          }
+          if !sm {
+            pass = false
+          }
+        }
         None => ()
       }
       if pass {
         match min_rank {
           Some(r) => {
-            let mut lv : Bytes? = None
-            for pair in @core.parse_kv_pairs(rec.value) {
-              if pair.0 == b"level" {
-                lv = Some(pair.1)
-              }
-            }
-            let lr = match lv {
-              Some(l) => @core.level_rank(l)
+            let lr = match sf_level {
+              Some(l) => @core.level_rank(follow_lower_ascii(l))
               None => -1
             }
             // Range filter requires a known level (same as query).
@@ -8367,8 +8432,8 @@ fn cmd_watch(
         count = count + 1
         match metric_b {
           Some(mf) =>
-            for pair in @core.parse_kv_pairs(rec.value) {
-              if pair.0 == mf {
+            for pair in fields {
+              if ctx_name_eq(pair.0, mf) {
                 let d_opt = Some(
                   @string.parse_double(@utf8.decode_lossy(pair.1)),
                 ) catch {
@@ -8393,9 +8458,13 @@ fn cmd_watch(
       None => 0.0
     }
     let violated : Bool = match metric_b {
-      Some(_) => samples > 0 && sum / samples.to_double() > metric_thr_v
+      Some(_) =>
+        samples > 0 &&
+        samples >= min_samples &&
+        sum / samples.to_double() > metric_thr_v
       None => count > threshold_n
     }
+    evals = evals + 1
     let cur_value : String = match metric_b {
       Some(_) => {
         let avg = if samples > 0 { sum / samples.to_double() } else { 0.0 }
@@ -8409,83 +8478,97 @@ fn cmd_watch(
       None => threshold_n.to_string()
     }
     // firing/resolved state machine — one notification per transition.
-    if violated && !firing {
-      firing = true
-      fired_at = now
-      let event = "{\"kind\":\"" +
-        kind_str +
-        "\",\"state\":\"firing\",\"value\":" +
-        cur_value +
-        ",\"threshold\":" +
-        thr_str +
-        ",\"window_sec\":" +
-        win_s +
-        ",\"ts\":" +
-        now.to_string() +
-        "}"
-      if json {
-        println(event)
-      } else if metric_mode {
-        println(
-          "ALERT firing avg(" +
-          bytes_to_string(
-            match metric_b {
-              Some(m) => m
-              None => b""
-            },
-          ) +
-          ")=" +
+    // `--resolve-after N` requires N consecutive calm evaluations before
+    // RESOLVED, so a flapping window cannot produce an alert storm.
+    if violated {
+      calm_rounds = 0
+      if !firing {
+        firing = true
+        firings = firings + 1
+        fired_at = now
+        let event = "{\"kind\":\"" +
+          kind_str +
+          "\",\"state\":\"firing\",\"value\":" +
+          cur_value +
+          ",\"threshold\":" +
+          thr_str +
+          ",\"window_sec\":" +
+          win_s +
+          ",\"ts\":" +
+          now.to_string() +
+          "}"
+        if json {
+          println(event)
+        } else if metric_mode {
+          println(
+            "ALERT firing avg(" +
+            bytes_to_string(
+              match metric_b {
+                Some(m) => m
+                None => b""
+              },
+            ) +
+            ")=" +
+            cur_value +
+            " over window " +
+            win_s +
+            "s",
+          )
+        } else {
+          println(
+            "ALERT firing count=" + cur_value + " over window " + win_s + "s",
+          )
+        }
+        let summary = "ALERT firing " +
+          kind_str +
+          " value=" +
           cur_value +
           " over window " +
           win_s +
-          "s",
-        )
-      } else {
-        println(
-          "ALERT firing count=" + cur_value + " over window " + win_s + "s",
-        )
+          "s"
+        notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
+        dispatch_notification(event, notify_file, webhook)
+        @backend_native.flush_stdout()
       }
-      let summary = "ALERT firing " +
-        kind_str +
-        " value=" +
-        cur_value +
-        " over window " +
-        win_s +
-        "s"
-      notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
-      dispatch_notification(event, notify_file, webhook)
-    } else if !violated && firing {
-      firing = false
-      let event = "{\"kind\":\"" +
-        kind_str +
-        "\",\"state\":\"resolved\",\"value\":" +
-        cur_value +
-        ",\"threshold\":" +
-        thr_str +
-        ",\"window_sec\":" +
-        win_s +
-        ",\"ts\":" +
-        now.to_string() +
-        "}"
-      if json {
-        println(event)
-      } else {
-        println("RESOLVED value=" + cur_value)
+    } else if firing {
+      calm_rounds = calm_rounds + 1
+      if calm_rounds >= resolve_after {
+        firing = false
+        resolutions = resolutions + 1
+        calm_rounds = 0
+        let event = "{\"kind\":\"" +
+          kind_str +
+          "\",\"state\":\"resolved\",\"value\":" +
+          cur_value +
+          ",\"threshold\":" +
+          thr_str +
+          ",\"window_sec\":" +
+          win_s +
+          ",\"ts\":" +
+          now.to_string() +
+          "}"
+        if json {
+          println(event)
+        } else {
+          println("RESOLVED value=" + cur_value)
+        }
+        let summary = "RESOLVED " +
+          kind_str +
+          " value=" +
+          cur_value +
+          " (window " +
+          win_s +
+          "s)"
+        notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
+        dispatch_notification(event, notify_file, webhook)
+        @backend_native.flush_stdout()
       }
-      let summary = "RESOLVED " +
-        kind_str +
-        " value=" +
-        cur_value +
-        " (window " +
-        win_s +
-        "s)"
-      notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
-      dispatch_notification(event, notify_file, webhook)
     }
     // Escalation (5.4): still firing after --escalate-sec -> one ESCALATED
     // notification per episode (bounded, no storm).
     if esc_ms > 0 && firing && !escalated && now - fired_at >= esc_ms {
       escalated = true
+      escalations = escalations + 1
       let event = "{\"kind\":\"escalation\",\"state\":\"escalated\",\"value\":" +
         cur_value +
         ",\"elapsed_ms\":" +
@@ -8507,32 +8590,70 @@ fn cmd_watch(
       }
       dispatch_notification(event, notify_file, webhook)
       notify_extra(summary, dingtalk, wecom, email_to, smtp_url, notify_dry)
+      @backend_native.flush_stdout()
     }
     if once {
       go = false
+    } else if got_new {
+      // Fresh records are present: re-pull/re-evaluate immediately so the
+      // alert fires within a processing round instead of waiting out --every.
+      @backend_native.sleep_ms(1)
     } else {
       @backend_native.sleep_ms(every)
     }
   }
-  println(
-    "(watch ended, window " +
-    win_s +
-    "s, buffered " +
-    buf.length().to_string() +
-    " records)",
-  )
+  if json {
+    println(
+      "{\"kind\":\"summary\",\"evals\":" +
+      evals.to_string() +
+      ",\"firings\":" +
+      firings.to_string() +
+      ",\"resolved\":" +
+      resolutions.to_string() +
+      ",\"escalated\":" +
+      escalations.to_string() +
+      ",\"buffered\":" +
+      buf.length().to_string() +
+      ",\"window_sec\":" +
+      win_s +
+      "}",
+    )
+  } else {
+    println(
+      "(watch ended, window " +
+      win_s +
+      "s, buffered " +
+      buf.length().to_string() +
+      " records, evals " +
+      evals.to_string() +
+      ", firings " +
+      firings.to_string() +
+      ", resolved " +
+      resolutions.to_string() +
+      ")",
+    )
+  }
+  @backend_native.flush_stdout()
 }
 
 ///   watch <dir> <match-text> --threshold N [--window-sec S] [--every ms]
 ///            [--metric <field> --metric-threshold <v>] [--level-min <lv>]
-///            [--service <svc>] [--notify-file <f>] [--webhook <url>]
+///            [--service <svc>] [--min-samples N] [--resolve-after N]
+///            [--escalate-sec S] [--notify-file <f>] [--webhook <url>]
+///            [--dingtalk <url>] [--wecom <url>]
+///            [--email <to> --smtp-url <url>] [--notify-dry-run]
 ///            [--json] [--once]
 ///                                    sliding-window threshold watch (5.3):
 ///                                    re-evaluates the trailing window every
-///                                    cycle; count or metric-average modes;
+///                                    cycle; count or metric-average modes
+///                                    (JSON and KV values both parsed);
 ///                                    firing/resolved state machine emits one
-///                                    notification per transition (no alert
-///                                    storms)
+///                                    notification per transition, with
+///                                    --min-samples/--resolve-after guarding
+///                                    spikes and flapping (no alert storms);
+///                                    fresh records re-evaluate immediately;
+///                                    events are flushed for real-time pipes;
+///                                    SIGTERM/SIGINT exits with a summary
 
 ///|
 /// Baseline anomaly detection: count records matching `--match` per UTC
@@ -10654,6 +10775,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut email_to : String? = (None : String?)
       let mut smtp_url : String? = (None : String?)
       let mut escalate_sec : String? = (None : String?)
+      let mut min_samples_s : String? = (None : String?)
+      let mut resolve_after_s : String? = (None : String?)
       let mut notify_dry = false
       let mut json = false
       let mut once = false
@@ -10702,12 +10825,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--escalate-sec" && i + 1 < args.length() {
           escalate_sec = Some(args[i + 1])
           i = i + 1
+        } else if a == "--min-samples" && i + 1 < args.length() {
+          min_samples_s = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--resolve-after" && i + 1 < args.length() {
+          resolve_after_s = Some(args[i + 1])
+          i = i + 1
         } else if a == "--notify-dry-run" {
           notify_dry = true
         } else if a == "--json" {
           json = true
         } else if a == "--once" {
           once = true
+        } else {
+          raise @io.IoError::Invalid("unknown watch option: " + a)
         }
         i = i + 1
       }
@@ -10736,6 +10867,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
             notify_dry,
             json,
             once,
+            min_samples_s,
+            resolve_after_s,
           )
         None => raise @io.IoError::Invalid("watch requires --threshold")
       }
