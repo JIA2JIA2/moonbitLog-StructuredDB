@@ -5215,13 +5215,16 @@ fn query_window_ms() -> Int64 {
 /// `--limit` stops early. With `--sort-by-time`, matches are collected and
 /// printed ordered by event time (ties keep offset order) instead of the
 /// arrival (offset) order — the standard answer to out-of-order delivery.
-/// With `--indexed`, the first given equality filter (`--level`/`--service`/
-/// `--host`/`--trace-id`) preselects candidates through the per-segment
-/// field-column index (`name=value` postings, service also via the record
-/// key) before the full AND refinement — no equality filter falls back to
-/// the linear scan. Output is the standard record line, or JSON with
-/// `--json`. Non-schema records still match `--service` via the key and
-/// `--contains` via the value, so mixed directories stay queryable.
+/// With `--indexed`, **every** equality/range condition is pushed down: each
+/// expands to per-segment field-column postings (`name=value`, service also
+/// via the record key); an empty posting means the segment cannot match, and
+/// the shortest posting becomes the candidate set before the full AND
+/// refinement. `--explain` prints the pushed conditions, candidate count and
+/// skipped-segment count so the storage-level execution can be audited. No
+/// condition falls back to the linear scan. Output is the standard record
+/// line, or JSON with `--json`. Non-schema records still match `--service`
+/// via the key and `--contains` via the value, so mixed directories stay
+/// queryable.
 fn cmd_query(
   dir : String,
   level : String?,
@@ -5239,6 +5242,7 @@ fn cmd_query(
   json : Bool,
   require_time : Bool,
   timeout : String?,
+  explain : Bool,
 ) -> Unit raise @io.IoError {
   let level_b : Bytes? = match level {
     Some(s) => Some(@utf8.encode(s))
@@ -5399,198 +5403,248 @@ fn cmd_query(
   } else {
     None
   }
-  let idx_sel : (Bytes, Array[Bytes], Bool)? = if indexed {
+  let idx_filters : Array[(Bytes, Array[Bytes], Bool)] = []
+  if indexed {
     match level_values {
-      Some(vals) => Some((b"level", vals, false))
-      None =>
-        match service_b {
-          Some(s) => Some((b"service", [s], true))
-          None =>
-            match host_b {
-              Some(h) => Some((b"host", [h], false))
-              None =>
-                match trace_b {
-                  Some(t) => Some((b"trace_id", [t], false))
-                  None => None
-                }
-            }
-        }
+      Some(vals) => idx_filters.push((b"level", vals, false))
+      None => ()
     }
-  } else {
-    None
+    match service_b {
+      Some(s) => idx_filters.push((b"service", [s], true))
+      None => ()
+    }
+    match host_b {
+      Some(h) => idx_filters.push((b"host", [h], false))
+      None => ()
+    }
+    match trace_b {
+      Some(t) => idx_filters.push((b"trace_id", [t], false))
+      None => ()
+    }
   }
-  match idx_sel {
-    Some((fname, fvals, also_key)) => {
-      run_locked(dir, false, () => {
-        let log = open_log(dir)
-        let mut hits = 0
-        let mut stop = false
-        let mut abort_msg : String? = None
-        for seg in log.segments {
-          if stop {
-            break
+  let mut pushed : String = ""
+  for f in idx_filters {
+    if pushed.length() > 0 {
+      pushed = pushed + ","
+    }
+    pushed = pushed + (@utf8.decode(f.0) catch { _ => "" })
+  }
+  if idx_filters.length() > 0 {
+    run_locked(dir, false, () => {
+      let log = open_log(dir)
+      let mut hits = 0
+      let mut stop = false
+      let mut abort_msg : String? = None
+      let mut total_cands : Int64 = 0
+      let mut skipped : Int32 = 0
+      for seg in log.segments {
+        if stop {
+          break
+        }
+        if abort_msg is Some(_) {
+          break
+        }
+        // Pushdown (4.2): skip segments disjoint from the time bounds.
+        let mut in_range = true
+        if seg.record_count > 0 {
+          match since_ts {
+            Some(t) => if seg.max_ts < t { in_range = false }
+            None => ()
           }
-          if abort_msg is Some(_) {
-            break
+          match until_ts {
+            Some(t) => if seg.min_ts > t { in_range = false }
+            None => ()
           }
-          // Pushdown (4.2): skip segments disjoint from the time bounds.
-          if seg.record_count > 0 {
-            match since_ts {
-              Some(t) => if seg.max_ts < t { continue }
-              None => ()
-            }
-            match until_ts {
-              Some(t) => if seg.min_ts > t { continue }
-              None => ()
-            }
+        }
+        if !in_range {
+          skipped = skipped + 1
+          continue
+        }
+        qg.check(seg.size)
+        seg.ensure_inv_index()
+        // Persist the lazily built index so a later process loads the
+        // sidecar instead of rebuilding (atomic replace, safe under the
+        // shared reader lock).
+        if !@backend_native.has_segment_inv(dir, seg.base_offset) {
+          match seg.inv_index {
+            Some(ix) =>
+              @backend_native.save_segment_inv(
+                dir,
+                seg.base_offset,
+                ix.encode(),
+              )
+            None => ()
           }
-          qg.check(seg.size)
-          seg.ensure_inv_index()
-          // Persist the lazily built index so a later process loads the
-          // sidecar instead of rebuilding (atomic replace, safe under the
-          // shared reader lock).
-          if !@backend_native.has_segment_inv(dir, seg.base_offset) {
-            match seg.inv_index {
-              Some(ix) =>
-                @backend_native.save_segment_inv(
-                  dir,
-                  seg.base_offset,
-                  ix.encode(),
-                )
-              None => ()
-            }
-          }
-          let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([],
-          )
+        }
+        // All AND conditions are pushed down: each produces a per-segment
+        // posting union; an empty union means the segment cannot match, and
+        // the shortest union becomes the candidate set (the remaining
+        // conditions are verified by schema_matches below).
+        let mut best : Array[UInt64]? = None
+        let mut best_len : Int32 = 0
+        let mut seg_empty = false
+        for f in idx_filters {
+          let (fname, fvals, also_key) = f
+          let set : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
           for v in fvals {
             for i2 in seg.inv_field_postings(fname, v) {
-              let off = seg.base_offset + i2.to_uint64()
-              seen.set(off, true)
+              set.set(seg.base_offset + i2.to_uint64(), true)
             }
           }
           if also_key {
             for v in fvals {
               for i2 in seg.inv_field_postings(b"__key__", v) {
-                let off = seg.base_offset + i2.to_uint64()
-                seen.set(off, true)
+                set.set(seg.base_offset + i2.to_uint64(), true)
               }
             }
           }
-          let cands : Array[UInt64] = []
-          seen.each(fn(k, _) { cands.push(k) })
-          cands
-          .mut_view()
-          .sort_by(fn(a, b) {
-            let d = a.compare(b)
-            if d < 0 {
-              -1
-            } else if d > 0 {
-              1
-            } else {
-              0
-            }
-          })
-          let mut seen_cands : Int32 = 0
-          for off in cands {
-            seen_cands = seen_cands + 1
-            // Record-granularity timeout sampling (4.6).
-            if seen_cands % 512 == 0 {
-              match qg.check_soft(0) {
-                Some(m) => abort_msg = Some(m)
-                None => ()
-              }
-            }
-            if abort_msg is Some(_) {
-              break
-            }
-            if max_hits >= 0 && hits >= max_hits {
-              stop = true
-              break
-            }
-            let rec = log.get(off) catch { _ => None }
-            match rec {
-              Some(r) => {
-                let mut hit = true
-                match since_ts {
-                  Some(t) => if r.timestamp < t { hit = false }
-                  None => ()
-                }
-                match until_ts {
-                  Some(t) => if r.timestamp > t { hit = false }
-                  None => ()
-                }
-                if hit {
-                  let fields = @core.parse_kv_pairs(r.value)
-                  let mut lv : Bytes? = None
-                  for pair in fields {
-                    if pair.0 == b"level" {
-                      lv = Some(pair.1)
-                    }
-                  }
-                  let lr = match lv {
-                    Some(l) => @core.level_rank(l)
-                    None => -1
-                  }
-                  let ranged = match min_rank {
-                    Some(_) => true
-                    None =>
-                      match max_rank {
-                        Some(_) => true
-                        None => false
-                      }
-                  }
-                  if ranged {
-                    // Consistent with the linear path: a range filter
-                    // requires a known level.
-                    if lr < 0 {
-                      hit = false
-                    } else {
-                      match min_rank {
-                        Some(rk) => if lr < rk { hit = false }
-                        None => ()
-                      }
-                      match max_rank {
-                        Some(rk) => if lr > rk { hit = false }
-                        None => ()
-                      }
-                    }
-                  }
-                  if hit {
-                    hit = @core.schema_matches(
-                      fields,
-                      r.key,
-                      r.value,
-                      level_b,
-                      service_b,
-                      host_b,
-                      trace_b,
-                      contains_b,
-                    )
-                  }
-                }
-                if hit {
-                  if json {
-                    print_json_record(r)
-                  } else {
-                    print_record(r)
-                  }
-                  hits = hits + 1
-                }
-              }
+          let arr : Array[UInt64] = []
+          set.each(fn(k, _) { arr.push(k) })
+          if arr.length() == 0 {
+            seg_empty = true
+            break
+          }
+          let have = match best {
+            Some(_) => true
+            None => false
+          }
+          if !have || arr.length() < best_len {
+            best = Some(arr)
+            best_len = arr.length()
+          }
+        }
+        if seg_empty {
+          skipped = skipped + 1
+          continue
+        }
+        let mut cands : Array[UInt64] = []
+        match best {
+          Some(a) => cands = a
+          None => ()
+        }
+        total_cands = total_cands + cands.length().to_int64()
+        cands
+        .mut_view()
+        .sort_by(fn(a, b) {
+          let d = a.compare(b)
+          if d < 0 {
+            -1
+          } else if d > 0 {
+            1
+          } else {
+            0
+          }
+        })
+        let mut seen_cands : Int32 = 0
+        for off in cands {
+          seen_cands = seen_cands + 1
+          // Record-granularity timeout sampling (4.6).
+          if seen_cands % 512 == 0 {
+            match qg.check_soft(0) {
+              Some(m) => abort_msg = Some(m)
               None => ()
             }
           }
+          if abort_msg is Some(_) {
+            break
+          }
+          if max_hits >= 0 && hits >= max_hits {
+            stop = true
+            break
+          }
+          let rec = log.get(off) catch { _ => None }
+          match rec {
+            Some(r) => {
+              let mut hit = true
+              match since_ts {
+                Some(t) => if r.timestamp < t { hit = false }
+                None => ()
+              }
+              match until_ts {
+                Some(t) => if r.timestamp > t { hit = false }
+                None => ()
+              }
+              if hit {
+                let fields = @core.parse_kv_pairs(r.value)
+                let mut lv : Bytes? = None
+                for pair in fields {
+                  if pair.0 == b"level" {
+                    lv = Some(pair.1)
+                  }
+                }
+                let lr = match lv {
+                  Some(l) => @core.level_rank(l)
+                  None => -1
+                }
+                let ranged = match min_rank {
+                  Some(_) => true
+                  None =>
+                    match max_rank {
+                      Some(_) => true
+                      None => false
+                    }
+                }
+                if ranged {
+                  // Consistent with the linear path: a range filter
+                  // requires a known level.
+                  if lr < 0 {
+                    hit = false
+                  } else {
+                    match min_rank {
+                      Some(rk) => if lr < rk { hit = false }
+                      None => ()
+                    }
+                    match max_rank {
+                      Some(rk) => if lr > rk { hit = false }
+                      None => ()
+                    }
+                  }
+                }
+                if hit {
+                  hit = @core.schema_matches(
+                    fields,
+                    r.key,
+                    r.value,
+                    level_b,
+                    service_b,
+                    host_b,
+                    trace_b,
+                    contains_b,
+                  )
+                }
+              }
+              if hit {
+                if json {
+                  print_json_record(r)
+                } else {
+                  print_record(r)
+                }
+                hits = hits + 1
+              }
+            }
+            None => ()
+          }
         }
-        match abort_msg {
-          Some(m) => raise @io.IoError::Invalid(m)
-          None => ()
-        }
-        println("(" + hits.to_string() + " matches) (indexed)")
-        close_log(log)
-      })
-      return
-    }
-    None => ()
+      }
+      match abort_msg {
+        Some(m) => raise @io.IoError::Invalid(m)
+        None => ()
+      }
+      if explain {
+        println(
+          "(pushed " +
+          pushed +
+          "; candidates " +
+          total_cands.to_string() +
+          "; segments_skipped " +
+          skipped.to_string() +
+          ")",
+        )
+      }
+      println("(" + hits.to_string() + " matches) (indexed)")
+      close_log(log)
+    })
+    return
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -9407,6 +9461,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut json = false
       let mut require_time = false
       let mut timeout : String? = (None : String?)
+      let mut explain = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -9451,6 +9506,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--json" {
           json = true
+        } else if a == "--explain" {
+          explain = true
         }
         i = i + 1
       }
@@ -9471,6 +9528,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         json,
         require_time,
         timeout,
+        explain,
       )
     }
   } else if cmd == "context" {
