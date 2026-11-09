@@ -88,3 +88,35 @@ test "mask_sensitive honors extra names and preserves other bytes" {
   assert_eq(@core.mask_sensitive(b"plain text", []), b"plain text")
   assert_eq(@core.mask_sensitive(b"", []), b"")
 }
+
+///|
+test "mask_sensitive handles JSON fields and provider secret prefixes" {
+  assert_eq(
+    @core.mask_sensitive(
+      b"{\"token\":\"sk-abcdefghijklmnop\",\"password\":\"p@ss\"}",
+      [],
+    ),
+    b"{\"token\":\"[REDACTED]\",\"password\":\"[REDACTED]\"}",
+  )
+  assert_eq(
+    @core.mask_sensitive(b"{\"token\": \"abc def\"}", []),
+    b"{\"token\": \"[REDACTED]\"}",
+  )
+  assert_eq(
+    @core.mask_sensitive(b"note=sk-abcdefghijklmnop", []),
+    b"note=[REDACTED]",
+  )
+  assert_eq(
+    @core.mask_sensitive(b"key=AKIAABCDEFGHIJKLMNOP", []),
+    b"key=[REDACTED]",
+  )
+  assert_eq(
+    @core.mask_sensitive(b"gh=ghp_abcdefghijklmnopqrstuvwx", []),
+    b"gh=[REDACTED]",
+  )
+  // Ordinary hyphenated identifiers are untouched.
+  assert_eq(
+    @core.mask_sensitive(b"task=disk-usage-report-2026", []),
+    b"task=disk-usage-report-2026",
+  )
+}

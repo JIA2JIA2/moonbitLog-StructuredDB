@@ -57,24 +57,51 @@ fn bytes_eq_ci(a : Bytes, b : Bytes) -> Bool {
 }
 
 ///|
-/// True when `b` at `i` starts with `name` (ASCII case-insensitive) followed
-/// by `=`, with a word boundary before `name`.
-fn field_at(b : Bytes, i : Int32, name : Bytes) -> Bool {
+/// Value start position when `b` at `i` begins a sensitive field name
+/// followed by `=` or `:`. JSON shapes (`"token":"..."`, `"token": "..."`)
+/// and a closing quote after the key are accepted; an opening quote of the
+/// value, when present, is consumed. Returns None when this position is not
+/// such a field.
+fn field_value_start(b : Bytes, i : Int32, name : Bytes) -> Int32? {
   if i > 0 && is_word_c(b.at(i - 1).to_int()) {
-    return false
+    return None
   }
   let n = name.length()
-  if i + n + 1 > b.length() {
-    return false
+  if i + n > b.length() {
+    return None
   }
-  let mut j = 0
-  while j < n {
-    if lower_byte(b.at(i + j).to_int()) != lower_byte(name.at(j).to_int()) {
-      return false
+  let mut j = i
+  while j < i + n {
+    if lower_byte(b.at(j).to_int()) != lower_byte(name.at(j - i).to_int()) {
+      return None
     }
     j = j + 1
   }
-  b.at(i + n).to_int() == 61
+  if j < b.length() && b.at(j).to_int() == 34 {
+    j = j + 1
+  }
+  while j < b.length() && b.at(j).to_int() == 32 {
+    j = j + 1
+  }
+  if j >= b.length() {
+    return None
+  }
+  let sep = b.at(j).to_int()
+  if sep != 61 && sep != 58 {
+    return None
+  }
+  j = j + 1
+  // JSON allows spaces after the colon; after `=` a leading space means an
+  // empty value (kept as-is, as before).
+  if sep == 58 {
+    while j < b.length() && b.at(j).to_int() == 32 {
+      j = j + 1
+    }
+  }
+  if j < b.length() && b.at(j).to_int() == 34 {
+    j = j + 1
+  }
+  Some(j)
 }
 
 ///|
@@ -116,6 +143,89 @@ fn jwt_start_at(b : Bytes, i : Int32) -> Bool {
 }
 
 ///|
+/// Length of a known provider secret starting at `b[i]` (`sk-…`, `AKIA…`,
+/// `ghp_…`, `github_pat_…`, `xox?-…`), or 0. Prefix-specific minimum lengths
+/// keep ordinary hyphenated identifiers such as `disk-usage-report` intact.
+fn provider_secret_len(b : Bytes, i : Int32) -> Int32 {
+  if i > 0 && is_token_c(b.at(i - 1).to_int()) {
+    return 0
+  }
+  let len = b.length()
+  // sk- (OpenAI/Anthropic style): prefix + >=16 token chars.
+  if i + 3 <= len &&
+    b.at(i).to_int() == 115 &&
+    b.at(i + 1).to_int() == 107 &&
+    b.at(i + 2).to_int() == 45 {
+    let mut j = i + 3
+    while j < len && is_token_c(b.at(j).to_int()) {
+      j = j + 1
+    }
+    if j - i >= 19 {
+      return j - i
+    }
+  }
+  // AWS access key id: AKIA + >=16 alphanumerics.
+  if i + 4 <= len &&
+    b.at(i).to_int() == 65 &&
+    b.at(i + 1).to_int() == 75 &&
+    b.at(i + 2).to_int() == 73 &&
+    b.at(i + 3).to_int() == 65 {
+    let mut j = i + 4
+    let mut n = 0
+    while j < len && is_word_c(b.at(j).to_int()) {
+      j = j + 1
+      n = n + 1
+    }
+    if n >= 16 {
+      return j - i
+    }
+  }
+  // GitHub: ghp_/gho_/ghs_/ghu_ + >=20, github_pat_ + >=20.
+  if i + 4 <= len &&
+    b.at(i).to_int() == 103 &&
+    b.at(i + 1).to_int() == 104 &&
+    b.at(i + 3).to_int() == 95 {
+    let k = b.at(i + 2).to_int()
+    if k == 112 || k == 111 || k == 115 || k == 117 {
+      let mut j = i + 4
+      while j < len && is_token_c(b.at(j).to_int()) {
+        j = j + 1
+      }
+      if j - i >= 24 {
+        return j - i
+      }
+    }
+  }
+  if i + 11 <= len && bytes_eq_ci(slice(b, i, i + 11), b"github_pat_") {
+    let mut j = i + 11
+    while j < len && is_token_c(b.at(j).to_int()) {
+      j = j + 1
+    }
+    if j - i >= 31 {
+      return j - i
+    }
+  }
+  // Slack: xoxb-/xoxp-/xoxa-/xoxr-/xoxs- + >=10.
+  if i + 5 <= len &&
+    b.at(i).to_int() == 120 &&
+    b.at(i + 1).to_int() == 111 &&
+    b.at(i + 2).to_int() == 120 &&
+    b.at(i + 4).to_int() == 45 {
+    let k = b.at(i + 3).to_int()
+    if k == 98 || k == 112 || k == 97 || k == 114 || k == 115 {
+      let mut j = i + 5
+      while j < len && is_token_c(b.at(j).to_int()) {
+        j = j + 1
+      }
+      if j - i >= 15 {
+        return j - i
+      }
+    }
+  }
+  0
+}
+
+///|
 /// Mask sensitive content in a log value before it is written (2.4). Single
 /// scan, no regex engine; every byte that is not part of a match is copied
 /// verbatim. A `name=value` segment whose field name is in the built-in
@@ -141,18 +251,35 @@ pub fn mask_sensitive(value : Bytes, extra : Array[Bytes]) -> Bytes {
     // 1. sensitive field name=value → name=[REDACTED]
     let mut matched = false
     for name in names {
-      if field_at(value, i, name) {
-        let vstart = i + name.length() + 1
-        let mut j = vstart
-        while j < len && value.at(j).to_int() != 32 {
-          j = j + 1
+      match field_value_start(value, i, name) {
+        Some(vstart) => {
+          // Quoted JSON values run to the closing quote; bare values run to a
+          // space, comma or closing brace.
+          let quoted = vstart > 0 && value.at(vstart - 1).to_int() == 34
+          let mut j = vstart
+          if quoted {
+            while j < len && value.at(j).to_int() != 34 {
+              j = j + 1
+            }
+          } else {
+            while j < len {
+              let c = value.at(j).to_int()
+              if c == 32 || c == 44 || c == 125 {
+                break
+              }
+              j = j + 1
+            }
+          }
+          if j > vstart {
+            out.write_bytes(slice(value, i, vstart))
+            out.write_bytes(redacted_marker)
+            i = j
+            matched = true
+          }
         }
-        if j > vstart {
-          out.write_bytes(slice(value, i, vstart))
-          out.write_bytes(redacted_marker)
-          i = j
-          matched = true
-        }
+        None => ()
+      }
+      if matched {
         break
       }
     }
@@ -170,7 +297,14 @@ pub fn mask_sensitive(value : Bytes, extra : Array[Bytes]) -> Bytes {
       i = j
       continue
     }
-    // 3. JWT (eyJ...d.d.s) → [REDACTED]
+    // 3. Known provider secret prefixes → [REDACTED]
+    let plen = provider_secret_len(value, i)
+    if plen > 0 {
+      out.write_bytes(redacted_marker)
+      i = i + plen
+      continue
+    }
+    // 4. JWT (eyJ...d.d.s) → [REDACTED]
     if jwt_start_at(value, i) {
       let mut j = i
       let mut dots = 0
