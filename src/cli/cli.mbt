@@ -70,16 +70,23 @@
 ///                                    with --idempotent replayed lines whose
 ///                                    (key, value) matches the latest record
 ///                                    are skipped
-///   http <dir> [--port N] [--queue N] [--batch N] [--backlog-alert N]
+///   http <dir> [--port N] [--queue N] [--queue-bytes N] [--batch N]
+///             [--backlog-alert N]
 ///             [--format lines|kv] [--key <name>] [--key-field <name>]
 ///             [--ts-field <name>] [--idempotent]
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
 ///                                    or /push buffers into a bounded queue
 ///                                    and answers 202, or 429 + Retry-After
-///                                    when the backlog is full — explicit
-///                                    backpressure, no silent drops; backlog
-///                                    beyond --backlog-alert warns and is
-///                                    exposed via /stats; /stats also reports
+///                                    when the backlog (or the optional
+///                                    --queue-bytes byte budget) is full —
+///                                    explicit backpressure, no silent drops;
+///                                    backlog beyond --backlog-alert emits one
+///                                    WARN on entry and one RESOLVED when it
+///                                    drains (/stats: pending, pending_peak,
+///                                    rejected_requests/lines, backlog_alerts);
+///                                    backlog drains at full speed with Batch
+///                                    durability (one fsync per --batch);
+///                                    /stats also reports
 ///                                    accepted/written/sampled_out counters;
 ///                                    GET /health, /stats. A connection that
 ///                                    stalls mid-request is bounded by a
@@ -203,6 +210,10 @@ struct IngestOptions {
   // 6.2: the HTTP push server accounts each tenant's write quota when the
   // request is accepted (202), so its drain path must not account again.
   skip_quota : Bool
+  // Durability policy for this ingest pipeline. Commands keep the CLI default
+  // (Always, MOONLOG_SYNC overridable); the HTTP drain uses Batch so backlog
+  // recovery fsyncs once per --batch instead of once per line.
+  sync : @log.SyncPolicy
 }
 
 ///|
@@ -290,16 +301,25 @@ fn parse_partition(s : String) -> Int64 raise @io.IoError {
 }
 
 ///|
-fn open_log(dir : String, partition~ : Int64 = 0) -> CliLog raise @io.IoError {
+fn open_log_sync(
+  dir : String,
+  partition : Int64,
+  policy : @log.SyncPolicy,
+) -> CliLog raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
   let log = @backend_native.open_log_dir(
     dir,
     ROLL_SIZE,
-    sync=desired_sync(),
+    sync=policy,
     partition_ms=partition,
   )
   log.set_cursor_guard(min_cursor_guard(dir))
   log
+}
+
+///|
+fn open_log(dir : String, partition~ : Int64 = 0) -> CliLog raise @io.IoError {
+  open_log_sync(dir, partition, desired_sync())
 }
 
 ///|
@@ -2921,15 +2941,26 @@ fn ingest_lines(
   let mut written = 0
   let mut sampled_out = 0
   let mut i = 0
+  // One lock hold and one metadata write per window of up to 16 batches:
+  // each metadata flush is an atomic MANIFEST/sidecar update with several
+  // fsyncs, so writing it per 256-line chunk made bulk ingest and HTTP
+  // backlog drain fsync-bound (measured ~0.4s per chunk on overlay).
+  // Long streams still release the directory lock between windows.
+  let window = if opts.batch_n > 65536 {
+    opts.batch_n
+  } else {
+    opts.batch_n * 16
+  }
   while i < lines.length() {
-    let chunk_end = if i + opts.batch_n < lines.length() {
-      i + opts.batch_n
+    let remaining = lines.length() - i
+    let window_end = if window < remaining {
+      i + window
     } else {
       lines.length()
     }
-    let mut chunk_written = 0
-    let mut chunk_sampled = 0
-    let mut written_bytes : Int64 = 0
+    let mut window_written = 0
+    let mut window_sampled = 0
+    let mut window_bytes : Int64 = 0
     run_locked(dir, true, () => {
       // 6.2 write/storage quota: the pre-check runs inside the directory lock
       // (the persisted usage file must not race concurrent writers); the
@@ -2938,7 +2969,7 @@ fn ingest_lines(
       let rule = if opts.skip_quota { None } else { active_quota_rule(dir) }
       let mut pre_bytes : Int64 = 0
       let mut j2 = i
-      while j2 < chunk_end {
+      while j2 < window_end {
         pre_bytes = pre_bytes + lines[j2].length().to_int64()
         j2 = j2 + 1
       }
@@ -2946,69 +2977,78 @@ fn ingest_lines(
         Some(msg) => raise @io.IoError::Invalid(msg)
         None => ()
       }
-      let log = open_log(dir, partition=opts.partition_ms)
+      let log = open_log_sync(dir, opts.partition_ms, opts.sync)
       let mut j = i
-      while j < chunk_end {
-        let (raw_k, raw_v, fields) = parse_ingest_line(lines[j], opts)
-        let (k, v, schema_ts) = if opts.schema {
-          schema_transform(raw_k, raw_v, fields, ts_base + j.to_int64())
+      while j < window_end {
+        // Keep the --batch durability boundary (fsync per batch) while the
+        // log itself is opened once per window.
+        let chunk_end = if j + opts.batch_n < window_end {
+          j + opts.batch_n
         } else {
-          (raw_k, raw_v, None)
+          window_end
         }
-        // 2.4: mask sensitive content and append enrichment metadata before
-        // the value reaches the log, so nothing sensitive lands on disk and
-        // idempotent re-delivery sees the same (key, value).
-        let v_masked = if opts.mask {
-          @core.mask_sensitive(v, opts.mask_extra)
-        } else {
-          v
-        }
-        let v = match opts.meta_bytes {
-          Some(m) =>
-            if v_masked.length() == 0 {
-              m
-            } else {
-              v_masked + b" " + m
-            }
-          None => v_masked
-        }
-        let keep = match opts.sampling {
-          Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
-          None => true
-        }
-        if keep {
-          let raw_ts = match schema_ts {
-            Some(t) => t
-            None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
+        while j < chunk_end {
+          let (raw_k, raw_v, fields) = parse_ingest_line(lines[j], opts)
+          let (k, v, schema_ts) = if opts.schema {
+            schema_transform(raw_k, raw_v, fields, ts_base + j.to_int64())
+          } else {
+            (raw_k, raw_v, None)
           }
-          // 2.3 clock-skew correction: a fixed offset (ms) applied to every
-          // record timestamp, compensating a slow/fast source clock.
-          let rec_ts = raw_ts + opts.clock_skew_ms
-          if opts.idempotent {
-            let (added, _) = log.append_idempotent(k, v, rec_ts)
-            if added {
-              chunk_written = chunk_written + 1
-              written_bytes = written_bytes +
-                (k.length() + v.length()).to_int64()
+          // 2.4: mask sensitive content and append enrichment metadata before
+          // the value reaches the log, so nothing sensitive lands on disk and
+          // idempotent re-delivery sees the same (key, value).
+          let v_masked = if opts.mask {
+            @core.mask_sensitive(v, opts.mask_extra)
+          } else {
+            v
+          }
+          let v = match opts.meta_bytes {
+            Some(m) =>
+              if v_masked.length() == 0 {
+                m
+              } else {
+                v_masked + b" " + m
+              }
+            None => v_masked
+          }
+          let keep = match opts.sampling {
+            Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
+            None => true
+          }
+          if keep {
+            let raw_ts = match schema_ts {
+              Some(t) => t
+              None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
+            }
+            // 2.3 clock-skew correction: a fixed offset (ms) applied to every
+            // record timestamp, compensating a slow/fast source clock.
+            let rec_ts = raw_ts + opts.clock_skew_ms
+            if opts.idempotent {
+              let (added, _) = log.append_idempotent(k, v, rec_ts)
+              if added {
+                window_written = window_written + 1
+                window_bytes = window_bytes +
+                  (k.length() + v.length()).to_int64()
+              }
+            } else {
+              ignore(log.append(k, v, rec_ts))
+              window_written = window_written + 1
+              window_bytes = window_bytes + (k.length() + v.length()).to_int64()
             }
           } else {
-            ignore(log.append(k, v, rec_ts))
-            chunk_written = chunk_written + 1
-            written_bytes = written_bytes + (k.length() + v.length()).to_int64()
+            window_sampled = window_sampled + 1
           }
-        } else {
-          chunk_sampled = chunk_sampled + 1
+          j = j + 1
         }
-        j = j + 1
+        log.flush()
       }
-      log.flush()
       @backend_native.flush_meta(dir, log)
       close_log(log)
-      quota_record_write(dir, rule, written_bytes)
+      quota_record_write(dir, rule, window_bytes)
     })
-    written = written + chunk_written
-    sampled_out = sampled_out + chunk_sampled
-    i = chunk_end
+    written = written + window_written
+    sampled_out = sampled_out + window_sampled
+    i = window_end
   }
   (written, sampled_out)
 }
@@ -3295,6 +3335,20 @@ struct HttpQueue {
   batch : Int32
   alert_threshold : Int32
   mut alerts : Int32
+  // Backlog alert state machine: alert once when the backlog crosses the
+  // threshold and resolve once when it drains, instead of printing on every
+  // drain batch (a sustained backlog used to emit one WARN per 256 lines).
+  mut backlog_active : Bool
+  mut backlog_since : Int64
+  mut peak_pending : Int32
+  // Explicit backpressure counters: requests/lines rejected with 429 because
+  // the queue or its byte budget was full (client retries, nothing dropped).
+  mut rejected_requests : Int64
+  mut rejected_lines : Int64
+  // Optional byte budget in addition to the line capacity (0 = unlimited),
+  // so many large lines cannot evict the memory the line count allows.
+  capacity_bytes : Int64
+  mut pending_bytes : Int64
   // End-to-end counters for the push path: lines accepted into the queue,
   // lines actually written by the drain, and lines dropped by the sampler.
   // accepted - written - sampled is the in-flight/duplicate remainder.
@@ -3312,8 +3366,16 @@ struct HttpQueue {
 
 ///|
 /// Offer `lines` to the queue; false when they would exceed the capacity.
-fn http_queue_enqueue(q : HttpQueue, lines : Array[Bytes]) -> Bool {
+fn http_queue_enqueue(
+  q : HttpQueue,
+  lines : Array[Bytes],
+  bytes : Int64,
+) -> Bool {
   if q.pending + lines.length() > q.capacity {
+    return false
+  }
+  if q.capacity_bytes > (0 : Int64) &&
+    q.pending_bytes + bytes > q.capacity_bytes {
     return false
   }
   if q.pending == 0 {
@@ -3325,6 +3387,10 @@ fn http_queue_enqueue(q : HttpQueue, lines : Array[Bytes]) -> Bool {
     q.lines.push(line)
   }
   q.pending = q.pending + lines.length()
+  q.pending_bytes = q.pending_bytes + bytes
+  if q.pending > q.peak_pending {
+    q.peak_pending = q.pending
+  }
   true
 }
 
@@ -3346,6 +3412,10 @@ fn selfmon_report_http(dir : String, q : HttpQueue) -> Unit {
     lag.to_string() +
     ",\"backlog_alerts\":" +
     q.alerts.to_string() +
+    ",\"pending_peak\":" +
+    q.peak_pending.to_string() +
+    ",\"rejected_lines\":" +
+    q.rejected_lines.to_string() +
     "}"
   ignore(
     @backend_native.write_file(dir + "/SELFMON/http.json", @utf8.encode(line)) catch {
@@ -3364,12 +3434,16 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   let take = if q.pending < q.batch { q.pending } else { q.batch }
   let chunk : Array[Bytes] = []
   let mut i = 0
+  let mut freed_bytes : Int64 = 0
   while i < take {
-    chunk.push(q.lines[q.head + i])
+    let line = q.lines[q.head + i]
+    chunk.push(line)
+    freed_bytes = freed_bytes + line.length().to_int64()
     i = i + 1
   }
   q.head = q.head + take
   q.pending = q.pending - take
+  q.pending_bytes = q.pending_bytes - freed_bytes
   let (batch_written, _) = ingest_lines(dir, chunk, q.opts)
   q.written = q.written + batch_written.to_int64()
   if q.head > 4096 && q.head * 2 > q.lines.length() {
@@ -3382,13 +3456,29 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
     q.lines = rest
     q.head = 0
   }
-  if q.pending > q.alert_threshold {
+  // Alert on crossing the threshold, resolve when the backlog drains: one
+  // WARN/RESOLVED pair per backlog episode instead of one WARN per batch.
+  if !q.backlog_active && q.pending > q.alert_threshold {
+    q.backlog_active = true
+    q.backlog_since = now_ms()
     q.alerts = q.alerts + 1
     println(
       "WARN backlog " +
       q.pending.to_string() +
       " lines (threshold " +
       q.alert_threshold.to_string() +
+      "), peak " +
+      q.peak_pending.to_string(),
+    )
+  } else if q.backlog_active && q.pending <= q.alert_threshold {
+    q.backlog_active = false
+    println(
+      "RESOLVED backlog drained to " +
+      q.pending.to_string() +
+      " lines after " +
+      (now_ms() - q.backlog_since).to_string() +
+      " ms (peak " +
+      q.peak_pending.to_string() +
       ")",
     )
   }
@@ -3497,6 +3587,14 @@ fn handle_http_connection(
         q.sampled.to_string() +
         ",\"backlog_alerts\":" +
         q.alerts.to_string() +
+        ",\"pending_peak\":" +
+        q.peak_pending.to_string() +
+        ",\"pending_bytes\":" +
+        q.pending_bytes.to_string() +
+        ",\"rejected_requests\":" +
+        q.rejected_requests.to_string() +
+        ",\"rejected_lines\":" +
+        q.rejected_lines.to_string() +
         "}"
       http_respond(conn, 200, payload)
       close_log(log)
@@ -3566,7 +3664,7 @@ fn handle_http_connection(
         }
         None => ()
       }
-      if http_queue_enqueue(q, kept) {
+      if http_queue_enqueue(q, kept, incoming) {
         quota_record_write(dir, rule, incoming)
         q.accepted = q.accepted + kept.length().to_int64()
         q.sampled = q.sampled + sampled_out.to_int64()
@@ -3584,6 +3682,8 @@ fn handle_http_connection(
       } else {
         // Explicit backpressure: the request was not buffered, so the client
         // can retry the same payload — nothing is dropped silently.
+        q.rejected_requests = q.rejected_requests + (1 : Int64)
+        q.rejected_lines = q.rejected_lines + kept.length().to_int64()
         http_respond(
           conn,
           429,
@@ -3619,6 +3719,7 @@ fn cmd_http(
   dir : String,
   port : String?,
   queue_cap : String?,
+  queue_bytes : String?,
   batch : String?,
   backlog_alert : String?,
   opts : IngestOptions,
@@ -3640,6 +3741,13 @@ fn cmd_http(
       }
     None => 10000
   }
+  let queue_bytes_n : Int64 = match queue_bytes {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid queue bytes: " + s)
+      }
+    None => (0 : Int64)
+  }
   let batch_n = match batch {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -3654,9 +3762,12 @@ fn cmd_http(
       }
     None => 5000
   }
-  if queue_cap_n <= 0 || batch_n <= 0 || backlog_alert_n < 0 {
+  if queue_cap_n <= 0 ||
+    batch_n <= 0 ||
+    backlog_alert_n < 0 ||
+    queue_bytes_n < (0 : Int64) {
     raise @io.IoError::Invalid(
-      "queue and batch must be positive, backlog alert non-negative",
+      "queue and batch must be positive, backlog alert and queue bytes non-negative",
     )
   }
   let listen_fd = @backend_native.tcp_listen(port_n)
@@ -3676,6 +3787,11 @@ fn cmd_http(
     queue_cap_n.to_string() +
     " lines, batch " +
     batch_n.to_string() +
+    (if queue_bytes_n > (0 : Int64) {
+      ", byte budget " + queue_bytes_n.to_string()
+    } else {
+      ""
+    }) +
     ", backlog alert " +
     backlog_alert_n.to_string() +
     ")",
@@ -3688,6 +3804,13 @@ fn cmd_http(
     batch: batch_n,
     alert_threshold: backlog_alert_n,
     alerts: 0,
+    backlog_active: false,
+    backlog_since: 0,
+    peak_pending: 0,
+    rejected_requests: 0,
+    rejected_lines: 0,
+    capacity_bytes: queue_bytes_n,
+    pending_bytes: 0,
     accepted: 0,
     written: 0,
     sampled: 0,
@@ -3699,9 +3822,16 @@ fn cmd_http(
   @backend_native.install_shutdown_handler()
   let mut stopping = false
   while !stopping {
-    // Drain one batch first, so a burst backlog keeps shrinking even while no
-    // new client connects (the accept below times out and loops back here).
-    http_queue_drain(q, dir)
+    // Drain at full speed while a backlog exists. Draining a single batch and
+    // then waiting up to 200ms on accept caps recovery at batch/200ms (~1.3k
+    // lines/s), so a burst would linger for seconds. Bound each round to one
+    // full queue worth of batches so accept (and /health) is not starved.
+    let drain_limit = q.capacity / q.batch + 1
+    let mut drained = 0
+    while q.pending > 0 && drained < drain_limit {
+      http_queue_drain(q, dir)
+      drained = drained + 1
+    }
     stopping = @backend_native.shutdown_requested()
     if !stopping {
       let conn = @backend_native.tcp_accept_timeout(listen_fd, 200)
@@ -3726,7 +3856,13 @@ fn cmd_http(
     q.written.to_string() +
     " written / " +
     q.sampled.to_string() +
-    " sampled out, " +
+    " sampled out, peak " +
+    q.peak_pending.to_string() +
+    " lines, " +
+    q.rejected_requests.to_string() +
+    " rejected / " +
+    q.rejected_lines.to_string() +
+    " lines, " +
     q.alerts.to_string() +
     " backlog alerts total)",
   )
@@ -7866,6 +8002,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           None => 0
         },
         skip_quota: false,
+        sync: desired_sync(),
       }
       cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
     }
@@ -7875,6 +8012,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut port : String? = (None : String?)
       let mut queue_cap : String? = (None : String?)
+      let mut queue_bytes : String? = (None : String?)
       let mut batch : String? = (None : String?)
       let mut backlog_alert : String? = (None : String?)
       let mut format = "lines"
@@ -7903,6 +8041,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--queue" && i + 1 < args.length() {
           queue_cap = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--queue-bytes" && i + 1 < args.length() {
+          queue_bytes = Some(args[i + 1])
           i = i + 1
         } else if a == "--batch" && i + 1 < args.length() {
           batch = Some(args[i + 1])
@@ -8015,8 +8156,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         // 6.2: the HTTP server accounts per-tenant write quota on accept.
         skip_quota: true,
+        sync: @log.SyncPolicy::Batch,
       }
-      cmd_http(args[2], port, queue_cap, batch, backlog_alert, opts)
+      cmd_http(
+        args[2],
+        port,
+        queue_cap,
+        queue_bytes,
+        batch,
+        backlog_alert,
+        opts,
+      )
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {
