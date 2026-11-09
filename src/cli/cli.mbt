@@ -66,12 +66,15 @@
 ///                                    optional fast fsck every N cycles
 ///   follow <dir> [start|-|tail] [--once] [--commit] [--json]
 ///            [--name <cursor>] [--match <text>] [--level-min <lv>]
-///            [--service <svc>]
+///            [--service <svc>] [--flush]
 ///                                    print new records as they are appended
 ///                                    (live tail); the filters narrow the
 ///                                    printed stream without moving the
-///                                    cursor — end-to-end latency is bounded
-///                                    by the poll interval (default 200ms)
+///                                    cursor and understand JSON/KV values —
+///                                    end-to-end latency is bounded by the
+///                                    poll interval (default 200ms), and the
+///                                    closing summary reports filtered count
+///                                    and max live lag
 ///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
 ///                     [--from <bytes>] [--batch N] [--interval ms]
@@ -3322,6 +3325,21 @@ fn follow_interval_ms() -> Int32 {
 }
 
 ///|
+/// ASCII-lowercase a level value so live filtering accepts the uppercase
+/// spellings common in structured logs (`ERROR`, `Warn`) and stays
+/// consistent with the case-insensitive schema comparisons.
+fn follow_lower_ascii(s : Bytes) -> Bytes {
+  let buf = @buffer.Buffer::Buffer()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.at(i).to_int()
+    buf.write_byte((if c >= 65 && c <= 90 { c + 32 } else { c }).to_byte())
+    i = i + 1
+  }
+  buf.to_bytes()
+}
+
+///|
 /// Tail the log: print new records as they are appended, polling the
 /// directory until interrupted. `start` selects the first offset to print
 /// (`-` resumes from the persisted cursor, `tail` starts at the current end,
@@ -3334,11 +3352,18 @@ fn follow_interval_ms() -> Int32 {
 /// what is printed without changing the cursor: `--match <text>` keeps
 /// records whose key or value contains the substring, `--level-min <level>`
 /// keeps records with at least that severity rank (unknown levels are
-/// excluded, same as query), `--service <svc>` keeps records with that key.
+/// excluded, same as query), `--service <svc>` keeps records whose key or
+/// unified-schema service field matches (case-insensitive). Both field
+/// filters understand JSON values (flattened like 2.1) as well as `k=v`
+/// text, so SDK-appended structured logs tail correctly. The closing summary
+/// reports fetched/filtered counts and the maximum observed live lag, and is
+/// printed even when the tail is stopped by SIGTERM/SIGINT.
 /// End-to-end latency is bounded by the poll interval (default 200ms,
-/// `MOONLOG_FOLLOW_INTERVAL`); `--flush` makes every printed record hit
-/// stdout immediately (the C runtime buffers pipes/files) so pipelines and
-/// redirect targets observe records in real time.
+/// `MOONLOG_FOLLOW_INTERVAL`); while records keep arriving the follower
+/// re-polls immediately (1ms yield) instead of sleeping out the interval.
+/// `--flush` makes every printed record hit stdout immediately (the C
+/// runtime buffers pipes/files) so pipelines and redirect targets observe
+/// records in real time.
 fn cmd_follow(
   dir : String,
   start : String,
@@ -3391,9 +3416,14 @@ fn cmd_follow(
     None => None
   }
   let interval = follow_interval_ms()
+  // A long-running tail exits cooperatively on SIGTERM/SIGINT so the closing
+  // summary survives the signal (production live tail).
+  @backend_native.install_shutdown_handler()
   let mut fetched = 0
+  let mut filtered = 0
+  let mut max_lag : Int64 = -1
   let mut go = true
-  while go {
+  while go && !@backend_native.shutdown_requested() {
     let lock = @backend_native.DirLock::acquire_timeout(
       dir,
       false,
@@ -3401,8 +3431,12 @@ fn cmd_follow(
     )
     let log = open_log(dir)
     let next = log.next_offset()
-    if next > from {
+    let had_new = next > from
+    if had_new {
       let recs = log.scan_range(from, next)
+      // One clock read per batch: live lag compares the event timestamp of
+      // each record with the time the follower observed it.
+      let observed_at = now_ms()
       for rec in recs {
         let mut keep = true
         match match_b {
@@ -3414,30 +3448,54 @@ fn cmd_follow(
           None => ()
         }
         if keep {
-          match service_b {
-            Some(sb) => if rec.key != sb { keep = false }
-            None => ()
+          // Structured values (JSON lines / nested JSON from 2.1, flat or
+          // dotted) are flattened so live filters read the same unified
+          // schema fields as query (2.2): `--level-min` accepts level aliases
+          // (severity/lvl/...) and `--service` matches the record key or the
+          // service field, case-insensitively.
+          let needs_fields = match service_b {
+            Some(_) => true
+            None =>
+              match min_rank {
+                Some(_) => true
+                None => false
+              }
           }
-        }
-        if keep {
-          match min_rank {
-            Some(r) => {
-              let mut lv : Bytes? = None
-              for pair in @core.parse_kv_pairs(rec.value) {
-                if pair.0 == b"level" {
-                  lv = Some(pair.1)
+          if needs_fields {
+            let sf = @core.schema_from_fields(
+              ctx_value_fields(rec.value),
+              (0 : Int64),
+            )
+            match service_b {
+              Some(sb) => {
+                let mut sm = ctx_bytes_eq_ci(rec.key, sb)
+                if !sm {
+                  sm = match sf.service {
+                    Some(sv) => ctx_bytes_eq_ci(sv, sb)
+                    None => false
+                  }
+                }
+                if !sm {
+                  keep = false
                 }
               }
-              let lr = match lv {
-                Some(l) => @core.level_rank(l)
-                None => -1
-              }
-              // A level filter requires a known level (same as query).
-              if lr < 0 || lr < r {
-                keep = false
+              None => ()
+            }
+            if keep {
+              match min_rank {
+                Some(r) => {
+                  let lr = match sf.level {
+                    Some(l) => @core.level_rank(follow_lower_ascii(l))
+                    None => -1
+                  }
+                  // A level filter requires a known level (same as query).
+                  if lr < 0 || lr < r {
+                    keep = false
+                  }
+                }
+                None => ()
               }
             }
-            None => ()
           }
         }
         if keep {
@@ -3449,7 +3507,13 @@ fn cmd_follow(
           if flush {
             @backend_native.flush_stdout()
           }
+          let lag = observed_at - rec.timestamp
+          if lag >= 0 && lag > max_lag {
+            max_lag = lag
+          }
           fetched = fetched + 1
+        } else {
+          filtered = filtered + 1
         }
       }
       from = next
@@ -3464,13 +3528,30 @@ fn cmd_follow(
     lock.release()
     if once {
       go = false
+    } else if had_new {
+      // Records were available: poll again immediately (a 1ms yield keeps a
+      // fast writer from starving the follower) instead of waiting out the
+      // full interval. Idle rounds keep the configurable interval.
+      @backend_native.sleep_ms(1)
     } else {
       @backend_native.sleep_ms(interval)
     }
   }
+  let lag_text = if max_lag >= 0 { max_lag.to_string() + "ms" } else { "n/a" }
   println(
-    "(" + fetched.to_string() + " records, cursor " + from.to_string() + ")",
+    "(" +
+    fetched.to_string() +
+    " records, cursor " +
+    from.to_string() +
+    "; " +
+    filtered.to_string() +
+    " filtered, max lag " +
+    lag_text +
+    ")",
   )
+  if flush {
+    @backend_native.flush_stdout()
+  }
 }
 
 ///|
