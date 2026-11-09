@@ -142,6 +142,69 @@ pub fn level_rank(level : Bytes) -> Int32 {
 }
 
 ///|
+/// Severity rank found directly in a raw line (`level=warn`, `level:"warn"`,
+/// `"level":"warn"`) for formats without parsed fields (e.g. `--format lines`).
+/// Returns -1 when absent or unknown.
+fn level_rank_in_line(raw_line : Bytes, level_field : Bytes) -> Int32 {
+  let n = raw_line.length()
+  let m = level_field.length()
+  let mut i = 0
+  while i + m < n {
+    let mut same = true
+    let mut k = 0
+    while k < m {
+      if raw_line.at(i + k) != level_field.at(k) {
+        same = false
+        break
+      }
+      k = k + 1
+    }
+    if same {
+      let prev = if i == 0 { 0 } else { raw_line.at(i - 1).to_int() }
+      let boundary = i == 0 ||
+        prev == 32 ||
+        prev == 34 ||
+        prev == 123 ||
+        prev == 44 ||
+        prev == 9
+      let mut j = i + m
+      if boundary && j < n && raw_line.at(j).to_int() == 34 {
+        j = j + 1
+      }
+      if boundary &&
+        j < n &&
+        (raw_line.at(j).to_int() == 61 || raw_line.at(j).to_int() == 58) {
+        let mut s = j + 1
+        while s < n &&
+              (
+                raw_line.at(s).to_int() == 32 ||
+                raw_line.at(s).to_int() == 34 ||
+                raw_line.at(s).to_int() == 9
+              ) {
+          s = s + 1
+        }
+        let mut e = s
+        while e < n {
+          let c = raw_line.at(e).to_int()
+          if c == 32 || c == 34 || c == 44 || c == 125 || c == 9 || c == 13 {
+            break
+          }
+          e = e + 1
+        }
+        if e > s {
+          let rank = level_rank(slice(raw_line, s, e))
+          if rank >= 0 {
+            return rank
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
 /// FNV-1a 32-bit hash: deterministic per content, so sampling decisions are
 /// stable across replays (the same line always gets the same verdict, which
 /// keeps idempotent replay consistent).
@@ -202,12 +265,22 @@ pub fn sampling_allows(
     return false
   }
   if cfg.min_level >= 0 {
+    let mut matched = false
     for pair in fields {
       if pair.0 == cfg.level_field {
+        matched = true
         let rank = level_rank(pair.1)
         if rank >= 0 && rank < cfg.min_level {
           return false
         }
+      }
+    }
+    // Formats without parsed fields (plain lines) still carry a level in the
+    // raw text: `level=warn`, `level:"warn"` or `"level":"warn"`.
+    if !matched {
+      let rank = level_rank_in_line(raw_line, cfg.level_field)
+      if rank >= 0 && rank < cfg.min_level {
+        return false
       }
     }
   }

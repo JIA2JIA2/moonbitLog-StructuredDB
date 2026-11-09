@@ -68,6 +68,30 @@ test "sample_passes keeps rate 100 and drops rate 0 deterministically" {
 }
 
 ///|
+test "sampling_allows reads level from a plain line without parsed fields" {
+  let cfg : @core.SamplingConfig = {
+    min_level: 2,
+    level_field: b"level",
+    sample_rate: 100,
+    include_text: b"",
+    exclude_text: b"",
+  }
+  let no_fields : Array[(Bytes, Bytes)] = []
+  assert_true(!@core.sampling_allows(b"ts=1 level=debug msg=x", no_fields, cfg))
+  assert_true(!@core.sampling_allows(b"ts=1 level=info msg=x", no_fields, cfg))
+  assert_true(@core.sampling_allows(b"ts=1 level=warn msg=x", no_fields, cfg))
+  assert_true(@core.sampling_allows(b"ts=1 level=error msg=x", no_fields, cfg))
+  assert_true(
+    @core.sampling_allows(
+      b"{\"level\":\"error\",\"msg\":\"x\"}", no_fields, cfg,
+    ),
+  )
+  // Unknown level and a lookalike field name must not be filtered.
+  assert_true(@core.sampling_allows(b"ts=1 level=trace msg=x", no_fields, cfg))
+  assert_true(@core.sampling_allows(b"mylevel=debug msg=x", no_fields, cfg))
+}
+
+///|
 test "sampling_allows applies level include exclude and rate" {
   let cfg : @core.SamplingConfig = {
     min_level: 2,

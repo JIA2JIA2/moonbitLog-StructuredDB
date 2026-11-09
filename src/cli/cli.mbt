@@ -2886,7 +2886,7 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let (written, sampled, dup) = ingest_lines(dir, lines, opts, dedup)
+      let (written, sampled, dup) = ingest_lines(dir, lines, opts, dedup, false)
       duplicates = duplicates + dup
       sampled_out = sampled_out + sampled
       total = total + written
@@ -3159,6 +3159,7 @@ fn ingest_lines(
   lines : Array[Bytes],
   opts : IngestOptions,
   dedup : @hashmap.HashMap[Bytes, Bool]?,
+  skip_sampling : Bool,
 ) -> (Int32, Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
@@ -3237,9 +3238,13 @@ fn ingest_lines(
               }
             None => v_masked
           }
-          let keep = match opts.sampling {
-            Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
-            None => true
+          let keep = if skip_sampling {
+            true
+          } else {
+            match opts.sampling {
+              Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
+              None => true
+            }
           }
           let uid = match dedup {
             Some(_) =>
@@ -3522,7 +3527,9 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, dropped, dup) = ingest_lines(dir, lines, opts, dedup)
+          let (written, dropped, dup) = ingest_lines(
+            dir, lines, opts, dedup, false,
+          )
           total = total + written
           sampled = sampled + dropped
           duplicates = duplicates + dup
@@ -3723,7 +3730,13 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   q.head = q.head + take
   q.pending = q.pending - take
   q.pending_bytes = q.pending_bytes - freed_bytes
-  let (batch_written, _, batch_dup) = ingest_lines(dir, chunk, q.opts, q.dedup)
+  let (batch_written, _, batch_dup) = ingest_lines(
+    dir,
+    chunk,
+    q.opts,
+    q.dedup,
+    true,
+  )
   q.written = q.written + batch_written.to_int64()
   q.duplicates = q.duplicates + batch_dup.to_int64()
   if q.head > 4096 && q.head * 2 > q.lines.length() {
