@@ -124,26 +124,32 @@ pub fn slice(data : Bytes, start : Int32, end : Int32) -> Bytes {
 
 ///|
 /// Encode a record into its append-only on-disk representation.
+///
+/// Layout is unchanged; the fixed-width fields are written in place into one
+/// exactly-sized array (the previous version built two `Buffer`s and copied
+/// twice per record), which is a hot path for bulk appends.
 pub fn Record::encode(self : Record) -> Bytes {
   let flags : Byte = match self.kind {
     RecordKind::Put => 0
     RecordKind::Delete => 1
   }
-  let body = @buffer.Buffer::Buffer()
-  body.write_byte(flags)
-  body.write_uint64_le(self.offset)
-  body.write_int64_le(self.timestamp)
-  body.write_uint_le(self.key.length().reinterpret_as_uint())
-  body.write_uint_le(self.value.length().reinterpret_as_uint())
-  body.write_bytes(self.key)
-  body.write_bytes(self.value)
-  let body_bytes = body.to_bytes()
-  let crc = crc32(body_bytes)
-  let out = @buffer.Buffer::Buffer()
-  out.write_uint_le(body_bytes.length().reinterpret_as_uint())
-  out.write_bytes(body_bytes)
-  out.write_uint_le(crc)
-  out.to_bytes()
+  let key_len = self.key.length()
+  let value_len = self.value.length()
+  let body_len = 25 + key_len + value_len
+  let total = 4 + body_len + 4
+  let arr = FixedArray::make(total, b'\x00')
+  arr.unsafe_write_uint32_le(0, body_len.reinterpret_as_uint())
+  arr[4] = flags
+  arr.unsafe_write_uint64_le(5, self.offset)
+  arr.unsafe_write_uint64_le(13, self.timestamp.reinterpret_as_uint64())
+  arr.unsafe_write_uint32_le(21, key_len.reinterpret_as_uint())
+  arr.unsafe_write_uint32_le(25, value_len.reinterpret_as_uint())
+  arr.blit_from_bytes(29, self.key, 0, key_len)
+  arr.blit_from_bytes(29 + key_len, self.value, 0, value_len)
+  let out = arr.unsafe_reinterpret_as_bytes()
+  let crc = crc32_range(out, 4, 4 + body_len)
+  arr.unsafe_write_uint32_le(4 + body_len, crc)
+  out
 }
 
 ///|

@@ -97,6 +97,21 @@ int32_t moonlog_pwrite(int32_t fd, int64_t offset, moonbit_bytes_t data) {
   return (int32_t)n;
 }
 
+/* Write the live prefix (`len` bytes) of a capacity-sized buffer. */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_pwrite_len(int32_t fd, int64_t offset, moonbit_bytes_t data,
+                           int32_t len) {
+  int32_t cap = Moonbit_array_length(data);
+  if (len <= 0) {
+    return 0;
+  }
+  if (len > cap) {
+    len = cap;
+  }
+  ssize_t n = pwrite(fd, data, (size_t)len, (off_t)offset);
+  return (int32_t)n;
+}
+
 MOONBIT_FFI_EXPORT
 int64_t moonlog_size(int32_t fd) {
   struct stat st;

@@ -15,6 +15,18 @@ extern "C" fn moonlog_pread(fd : Int32, offset : Int64, len : Int32) -> Bytes = 
 extern "C" fn moonlog_pwrite(fd : Int32, offset : Int64, data : Bytes) -> Int32 = "moonlog_pwrite"
 
 ///|
+/// Write only the first `len` bytes of `data` at `offset`. Used by the append
+/// buffer: `data` is a full-capacity view whose live prefix is `len` bytes,
+/// so a write avoids slicing/copying the buffer.
+#borrow(data)
+extern "C" fn moonlog_pwrite_len(
+  fd : Int32,
+  offset : Int64,
+  data : Bytes,
+  len : Int32,
+) -> Int32 = "moonlog_pwrite_len"
+
+///|
 extern "C" fn moonlog_size(fd : Int32) -> Int64 = "moonlog_size"
 
 ///|
@@ -167,7 +179,12 @@ pub(all) struct NativeFileLog {
   path : Bytes
   mut size : Int64
   mut flushed : Int64
-  mut pending : Bytes
+  // Append buffer: a fixed-capacity byte array plus a used length, so adding
+  // a record is a memcpy into the tail instead of reallocating and copying
+  // the whole buffer on every append (the old `pending = pending + chunk`
+  // was O(n^2) per 64KB window).
+  mut pending : FixedArray[Byte]
+  mut pending_len : Int32
   mut closed : Bool
   mut raw : Bytes?
 }
@@ -186,7 +203,8 @@ pub fn NativeFileLog::open(path : String) -> NativeFileLog raise @io.IoError {
     path: bytes,
     size,
     flushed: size,
-    pending: b"",
+    pending: FixedArray::make(0, b'\x00'),
+    pending_len: 0,
     closed: false,
     raw: None,
   }
@@ -208,7 +226,8 @@ pub fn NativeFileLog::open_readonly(
     path: bytes,
     size,
     flushed: size,
-    pending: b"",
+    pending: FixedArray::make(0, b'\x00'),
+    pending_len: 0,
     closed: false,
     raw: None,
   }
@@ -240,7 +259,8 @@ pub fn NativeFileLog::open_compressed(
     path: bytes,
     size: len,
     flushed: len,
-    pending: b"",
+    pending: FixedArray::make(0, b'\x00'),
+    pending_len: 0,
     closed: false,
     raw: Some(raw),
   }
@@ -265,16 +285,23 @@ fn NativeFileLog::write_pending(self : NativeFileLog) -> Unit raise @io.IoError 
     Some(_) => return
     None => ()
   }
-  let data = self.pending
-  if data.length() == 0 {
+  if self.pending_len == 0 {
     return
   }
-  let n = moonlog_pwrite(self.fd, self.flushed, data)
+  let data = self.pending.unsafe_reinterpret_as_bytes()
+  let n = moonlog_pwrite_len(self.fd, self.flushed, data, self.pending_len)
   if n < 0 {
     raise @io.IoError::Syscall(n)
   }
   self.flushed = self.flushed + n.to_int64()
-  self.pending = b""
+  if n < self.pending_len {
+    // Short write: keep the unwritten tail at the head of the buffer.
+    let remain = self.pending_len - n
+    self.pending.blit_from_bytes(0, data, n, remain)
+    self.pending_len = remain
+  } else {
+    self.pending_len = 0
+  }
 }
 
 ///|
@@ -367,15 +394,25 @@ pub impl @io.LogWriter for NativeFileLog with fn append(self, chunk) {
     Some(_) => raise @io.IoError::Closed
     None => ()
   }
-  if self.pending.length() == 0 && chunk.length() >= WRITE_BUFFER_LIMIT {
+  if chunk.length() >= WRITE_BUFFER_LIMIT {
+    // Large chunks bypass the buffer: draining first keeps ordering, then a
+    // single pwrite lands the whole chunk without a copy.
+    self.write_pending()
     let n = moonlog_pwrite(self.fd, self.flushed, chunk)
     if n < 0 {
       raise @io.IoError::Syscall(n)
     }
     self.flushed = self.flushed + n.to_int64()
   } else {
-    self.pending = self.pending + chunk
-    if self.pending.length() >= WRITE_BUFFER_LIMIT {
+    if self.pending.length() == 0 {
+      self.pending = FixedArray::make(WRITE_BUFFER_LIMIT, b'\x00')
+    }
+    if self.pending_len + chunk.length() > WRITE_BUFFER_LIMIT {
+      self.write_pending()
+    }
+    self.pending.blit_from_bytes(self.pending_len, chunk, 0, chunk.length())
+    self.pending_len = self.pending_len + chunk.length()
+    if self.pending_len >= WRITE_BUFFER_LIMIT {
       self.write_pending()
     }
   }
@@ -431,7 +468,7 @@ pub impl @io.LogTruncate for NativeFileLog with fn truncate(self, size) {
     Some(_) => return
     None => ()
   }
-  self.pending = b""
+  self.pending_len = 0
   let r = moonlog_truncate(self.fd, size)
   if r < 0 {
     raise @io.IoError::Syscall(r)

@@ -89,8 +89,11 @@
 ///                                    body is rejected with 400 instead of
 ///                                    persisting a truncated line)
 ///   bench-write <dir> <count> [--batch N] [--sync always|batch|never]
-///                [--prefix <p>]
-///                                    bulk-write benchmark: report throughput,
+///                [--prefix <p>] [--warmup N]
+///                                    bulk-write benchmark: report the
+///                                    write-path throughput (the final
+///                                    durability flush is timed separately),
+///                                    optionally after N warm-up records,
 ///                                    then reopen and verify no record was lost
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off]
@@ -7273,6 +7276,33 @@ fn make_bench_value() -> Bytes {
 }
 
 ///|
+/// Encode `prefix` + decimal `idx` straight into a byte buffer for the write
+/// benchmark: one allocation and in-place digit writes, instead of a
+/// `String` concatenation plus UTF-8 re-encoding per record.
+fn bench_key(prefix : Bytes, idx : Int64) -> Bytes {
+  let mut digits = 1
+  let mut v = idx
+  while v >= (10 : Int64) {
+    v = v / 10
+    digits = digits + 1
+  }
+  let total = prefix.length() + digits
+  let arr = FixedArray::make(total, b'\x00')
+  arr.blit_from_bytes(0, prefix, 0, prefix.length())
+  let mut n = idx
+  let mut pos = total - 1
+  if n == (0 : Int64) {
+    arr[pos] = b'0'
+  }
+  while n > (0 : Int64) {
+    arr[pos] = (48 + (n % 10).to_int()).to_byte()
+    n = n / 10
+    pos = pos - 1
+  }
+  arr.unsafe_reinterpret_as_bytes()
+}
+
+///|
 /// Bulk-write benchmark: append `count` records in batches of `--batch`
 /// (default 1000) under the given `--sync` policy, report throughput, then
 /// reopen the directory and verify that every record survived (exact count,
@@ -7283,6 +7313,7 @@ fn cmd_bench_write(
   count_str : String,
   batch_str : String?,
   sync_str : String?,
+  warmup_str : String?,
   prefix : String,
 ) -> Unit raise @io.IoError {
   let total = @string.parse_int64(count_str) catch {
@@ -7316,41 +7347,91 @@ fn cmd_bench_write(
     "batch"
   }
   let value = make_bench_value()
-  let run_start = now_ms()
+  let prefix_bytes = @utf8.encode(prefix)
+  // Optional warm-up: write N records before starting the clock to report
+  // steady-state throughput. Default 0 times the whole load. The clock always
+  // stops before the final durability flush, which is reported separately.
+  let warmup_n : Int64 = match warmup_str {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid warmup: " + s)
+      }
+    None => (0 : Int64)
+  }
+  let warmup = if warmup_n < (0 : Int64) {
+    (0 : Int64)
+  } else if warmup_n >= total {
+    if total > (1 : Int64) {
+      total - (1 : Int64)
+    } else {
+      (0 : Int64)
+    }
+  } else {
+    warmup_n
+  }
+  let mut run_start = now_ms()
+  let mut run_end = run_start
   run_locked(dir, true, () => {
     let log = @backend_native.open_log_dir(dir, ROLL_SIZE, sync~)
     let ts = now_ms()
     let mut written : Int64 = 0
+    while written < warmup {
+      let remaining = warmup - written
+      let n = if remaining < batch_n { remaining } else { batch_n }
+      let records : Array[(Bytes, Bytes, Int64)] = []
+      let mut i : Int64 = 0
+      while i < n {
+        let idx = written + i
+        records.push((bench_key(prefix_bytes, idx), value, ts + idx))
+        i = i + 1
+      }
+      ignore(log.append_batch(records))
+      written = written + n
+    }
+    // Persist the warm-up load before starting the clock: otherwise the final
+    // flush would fold every warm-up segment's fsync into the timed window.
+    log.flush()
+    run_start = now_ms()
     while written < total {
       let n = if total - written < batch_n { total - written } else { batch_n }
       let records : Array[(Bytes, Bytes, Int64)] = []
       let mut i : Int64 = 0
       while i < n {
         let idx = written + i
-        records.push((@utf8.encode(prefix + idx.to_string()), value, ts + idx))
+        records.push((bench_key(prefix_bytes, idx), value, ts + idx))
         i = i + 1
       }
       ignore(log.append_batch(records))
       written = written + n
     }
+    // Stop the clock before the final durability flush: that flush covers the
+    // whole run (including warm-up segments), so folding it into the timed
+    // window under-reports throughput, especially for a small timed window.
+    run_end = now_ms()
     log.flush()
     @backend_native.flush_meta(dir, log)
     close_log(log)
   })
-  let elapsed = now_ms() - run_start
+  let elapsed = run_end - run_start
+  let flush_ms = now_ms() - run_end
+  let timed_n = total - warmup
   let qps = if elapsed > (0 : Int64) {
-    total * 1000 / elapsed
+    timed_n * 1000 / elapsed
   } else {
-    total * 1000
+    timed_n * 1000
   }
   println(
     "wrote " +
-    total.to_string() +
-    " records in " +
+    timed_n.to_string() +
+    " timed records (+" +
+    warmup.to_string() +
+    " warm-up) in " +
     elapsed.to_string() +
     " ms (" +
     qps.to_string() +
-    " records/s), batch " +
+    " records/s), final flush " +
+    flush_ms.to_string() +
+    " ms, batch " +
     batch_n.to_string() +
     ", sync " +
     sync_label,
@@ -7943,6 +8024,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut batch : String? = (None : String?)
       let mut sync : String? = (None : String?)
+      let mut warmup : String? = (None : String?)
       let mut prefix = "bench:"
       let mut i = 4
       while i < args.length() {
@@ -7953,13 +8035,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--sync" && i + 1 < args.length() {
           sync = Some(args[i + 1])
           i = i + 1
+        } else if a == "--warmup" && i + 1 < args.length() {
+          warmup = Some(args[i + 1])
+          i = i + 1
         } else if a == "--prefix" && i + 1 < args.length() {
           prefix = args[i + 1]
           i = i + 1
         }
         i = i + 1
       }
-      cmd_bench_write(args[2], args[3], batch, sync, prefix)
+      cmd_bench_write(args[2], args[3], batch, sync, warmup, prefix)
     }
   } else if cmd == "search" {
     if args.length() < 4 {
