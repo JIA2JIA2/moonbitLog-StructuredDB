@@ -19,7 +19,7 @@
 - **多源接入**（1.1）：四类来源均可入库——**Agent 采集**（`ingest --follow` 本地文件 agent，断点续采/轮转）、**离线批量导入**（`ingest --once`）、**HTTP 推送**（`http` 服务：`POST /`/`/push` 逐行入库 + `/health`/`/stats`；SDK 直接调用 `Log::append`）、**消息队列订阅**（`ingest --fifo` 订阅命名管道，写者推送批次、跨写者持续采集；也兼容 `curl`/`kcat` 等外部桥接写入）。接入链路健壮性：HTTP 连接有**每读超时 + 10s 请求总期限**（慢/滴漏客户端不会永久占住串行 accept）、短 body 直接 400 不入库、响应半关闭后再 close 防止 RST 截断；`/stats` 暴露 `accepted`/`written`/`sampled_out` 端到端计数；FIFO 订阅收到 SIGTERM/SIGINT 时协作式退出（flush 已接收行后打印终态，不再被信号直接杀死）。
 - **高吞吐写入**（1.2）：append-only 批量写入（`Log::append_batch` 每条自带 timestamp），峰值流量靠 `SyncPolicy::Batch`（批末一次 fsync）与 `--batch N` 分批提交；架构不做逐条随机更新（更新=追加新版本，tombstone 删除）。`bench-write` 现场压测并**两阶段校验无丢失**（写入进程关闭后重开：精确条数 + offset 连续 + verify_fast）。压测口径：**QPS 只计写入路径，最终持久化 flush（全量 fsync + 元数据）单列**——旧口径把这次 flush 也计入窗口，导致数值随预热/段数波动并偏低；`--warmup N` 可选预热。优化后本地参考：1000 条/批 **约 14.7 万 records/s**（final flush ≈0.86s）、5000 条/批 **约 19.3 万/s**、`--sync never` **约 28.4 万/s**、逐批 fsync（`always`）约 585/s；写入缓冲改为定长数组原地追加（消除每条记录复制 64KB 缓冲的 O(n²)），`Record::encode` 固定字段原地编码（每条少两次缓冲分配/复制）。
 - **缓冲与背压**（1.3）：下游过载时**缓冲而非丢弃**——HTTP 推送端点用有界入站队列（`--queue` 行数上限 + 可选 `--queue-bytes` 字节预算）：入队成功返回 **202**（含 pending），队列或字节预算满返回 **429 + Retry-After**（客户端重试，无静默丢数据）；后台按 `--batch` 行分批落库，**有积压时全速连续 drain**（消除每批等 200ms accept 的节拍；drain 用 Batch 持久化，每 `--batch` 一次 fsync），积压超 `--backlog-alert` **进入时打印一次 `WARN backlog`、排空后打印一次 `RESOLVED`**（含持续 ms 与峰值，避免按批刷屏）；`/stats` 暴露 `pending`/`pending_peak`/`pending_bytes`/`backlog_alerts`/`rejected_requests`/`rejected_lines` 与 `accepted`/`written`/`sampled_out`，关闭时打印同口径终态。**SIGTERM/SIGINT 优雅关闭**在退出前清空队列；慢客户端由每读 5s 超时 + 10s 请求总期限兜底。实测：3000 行积压 **109ms 排空**（旧实现 4s+）、一次积压仅 1 条 WARN + 1 条 RESOLVED、字节预算 429 后拆小重试 **1000/1000 条零丢失**、SIGTERM 立即关闭仍全量 drain 3000 条。FIFO 订阅侧由内核管道满自动反压写者。
-- **幂等与重放**（1.4）：`--idempotent`（`put`/`ingest`/`http`）开启写入侧幂等——待写记录的 (key, value) 与该键最新 live 记录完全一致时**识别为重复投递并跳过**（返回既有 offset），否则正常追加；检查骑乘增量维护的 key 索引（O(1) 热路径）。重放文件（`ingest --from 0`）、HTTP 429 重试、批次重投全部幂等：实测重放 2 行 `2 duplicates skipped` 零新增，非幂等对照翻倍至 4。断点续传（采集位点命名游标）与此互补：位点内不重读、位点外的重复投递靠幂等兜底。
+- **幂等与重放**（1.4）：两种去重语义共存——①**内容幂等** `--idempotent`（`put`/`ingest`/`http`）：待写记录的 (key, value) 与该键最新 live 记录完全一致时**识别为重复投递并跳过**（O(1) 骑乘增量 key 索引）；②**显式唯一 ID 去重** `--dedup-field <name>`（`ingest`/`http` 从解析字段取 ID）与 `--dedup-id <id>`（`put`）：已见 ID 一律跳过，**即使同一 ID 的 payload/value 已变化**，修复内容幂等对"同 key 同内容的不同事件"的误去重。已见 ID 持久化在 `<dir>/DEDUP`（`<offset>\t<id>`），每条去重记录把 `__uid=<id>` 内嵌进 value，**DEDUP 只是缓存**：启动时读 sidecar 并扫描其未覆盖的日志尾部补齐，删除/截断 DEDUP 后仍能重建（实测删掉 sidecar 后重放仍 0 新增）。重放文件（`ingest --from 0`）、HTTP 429 重试、批次重投均不产生重复日志：实测 2 行重放 `2 duplicates skipped` 零新增；同 key 交替重放 e1/e2 也 0 新增（不依赖 latest-wins 单条窗口）；对照：同 key 同 value、不同 ID 的两条事件在内容幂等下被误去重为 1 条，唯一 ID 下正确写入 2 条。断点续传（采集位点命名游标）与此互补：位点内不重读、位点外的重复投递靠 ID 兜底。
 - **源头采样限流**（1.5）：`ingest`/`http` 的采样管线（core `SamplingConfig` + `sampling_allows`，单测覆盖）——**按级别** `--min-level debug|info|warn|error|fatal`（kv `--level-field` 字段的严重度阈值，未知级别不参与过滤）、**按比例** `--sample-rate 0-100`（FNV-1a 确定性哈希，同内容判定恒定、与幂等重放一致）、**按规则** `--include`/`--exclude`（原始行子串，ASCII 忽略大小写）。采样在源头（入队/写入前）执行，`ingest` 输出 `(N sampled out)`、HTTP 202 响应含 `sampled_out`——实测 `--min-level warn` 丢 debug/info、`--sample-rate 50` 采样 99/200、`--sample-rate 0` 全丢。
 - **统一 Schema**（2.2）：`ingest`/`http` 的 `--schema` 将解析出的字段归一到**六大基础字段**——时间戳（`ts`/`@timestamp`/`timestamp`/`time`）、级别（`level`/`severity`）、服务名（`service`/`service_name`/`app`/`application`）、主机（`host`/`hostname`）、trace_id（`trace_id`/`traceId`/`trace`）、消息（`message`/`msg`；core `canonical_field` 别名映射，单测覆盖）：**服务名提升为记录键**、标准字段按固定顺序重组为 value（`level=… host=… trace_id=… message=…`）、时间戳取自解析值——不同服务的字段命名习惯入库后口径一致；**联合过滤查询** `query`（`--level`/`--service`/`--host`/`--trace-id`/`--contains` AND 组合 + `--since`/`--until` 时间窗 + `--limit`/`--json`；core `schema_matches` 单测覆盖）——如 `query --trace-id t9` 一次关联多个服务的同一链路；非 schema 记录仍可按 key/contains 过滤，混合目录可查。
 - **时间规范化**（2.3）：采集端时间值经 core `normalize_ts` 归一到 epoch 毫秒——纯数字按位数识别精度（秒 <1e11 / 毫秒 <1e14 / 微秒 <1e17 / 纳秒），其余按 ISO-8601 解析（`Z`/`±HH:MM`/`±HHMM` 时区、`T` 或空格分隔、小数秒截断到毫秒；core `parse_iso8601_ms` 正向 days-from-civil 与 `format_utc` 互逆，单测覆盖）——**跨时区（`+08:00`/`Z`/`-05:00`）同事件归一到同一时间戳**；`ingest`/`http` 增加 `--clock-skew <ms>` 补偿采集端时钟偏移；append-only 保留到达序，`query --sort-by-time` 按**事件时间**排序输出（tie 保持 offset 序）——实测三时区乱序到达后输出正确事件序，秒/毫秒/ISO 三种写法归一为同一值。展示层统一 UTC。
@@ -82,9 +82,12 @@ moon coverage report -f summary               # 覆盖率摘要
 ```
 moonlog <command> <dir> [args...]
 
-  put <dir> <key> <value> [--ts <ms>] [--idempotent] [--partition day|hour]
-                                追加一条 key/value 记录（`--partition` 开启
-                                按天/小时时间分区，跨桶自动滚动新段）
+  put <dir> <key> <value> [--ts <ms>] [--idempotent] [--dedup-id <id>]
+      [--partition day|hour]
+                                追加一条 key/value 记录（`--dedup-id` 为显
+                                式唯一 ID：重复 ID 即使 value 不同也跳过；
+                                `--partition` 开启按天/小时时间分区，跨桶
+                                自动滚动新段）
   put-if <dir> <key> <expected|-> <value>
                                 仅当 live 值等于 expected（`-` 要求不存在）才追加
   put-batch <dir> <k> <v> ...   一次追加多组 key/value 记录
@@ -135,7 +138,8 @@ moonlog <command> <dir> [args...]
                     [--format lines|kv|json|template] [--template <tpl>]
                     [--key <name>] [--key-field <name>] [--value-field <name>]
                     [--ts-field <name>] [--from <bytes>] [--batch N]
-                    [--interval ms] [--idempotent] [--min-level <level>]
+                    [--interval ms] [--idempotent] [--dedup-field <name>]
+                    [--min-level <level>]
                     [--level-field <name>] [--sample-rate 0-100]
                     [--include <text>] [--exclude <text>] [--schema]
                     [--clock-skew <ms>] [--mask] [--mask-fields <csv>]
@@ -147,8 +151,11 @@ moonlog <command> <dir> [args...]
                                 的字面+`<name>` 占位符提取——轻量 Grok 等
                                 价，不含正则）；`--key-field` 字段提升为记
                                 录键、`--value-field` 字段作为 value（缺省
-                                整行）、`--ts-field` 从字段取时间戳；`--idem
-                                 potent` 幂等去重；`--min-level`/`--sample-ra
+整行）、`--ts-field` 从字段取时间戳；`--idem
+                                potent` 内容幂等去重；`--dedup-field <name>`
+                                唯一 ID 去重（该字段已见则跳过，ID 持久化在
+                                DEDUP，payload 变化也不重复）；`--min-level`/
+                                `--sample-ra
                                  te`/`--include`/`--exclude` 源头采样限流；
                                  `--schema` 统一六字段（服务名提升为键、标
                                  准字段重组 value、别名归一，详见下 `query`）；
@@ -175,6 +182,7 @@ moonlog <command> <dir> [args...]
             [--backlog-alert N]
             [--format lines|kv] [--key <name>] [--key-field <name>]
             [--ts-field <name>] [--schema] [--clock-skew <ms>]
+            [--dedup-field <name>]
             [--mask] [--mask-fields <csv>] [--meta <csv>]
             [--partition day|hour]
                                 在 127.0.0.1 上提供 HTTP 推送端点：`POST /`
@@ -191,7 +199,9 @@ moonlog <command> <dir> [args...]
                                 `/stats` 含 `pending`/`pending_peak`/
                                 `pending_bytes`/`backlog_alerts`/
                                 `rejected_requests`/`rejected_lines` 与
-                                `accepted`/`written`/`sampled_out`；SIGTERM/
+                                `accepted`/`written`/`sampled_out`/`duplicates`；
+                                `--dedup-field <name>` 唯一 ID 去重（已见 ID
+                                跳过并计入 duplicates）；SIGTERM/
                                 SIGINT 优雅关闭前会清空队列并打印终态计数；
                                 每连接设 5s 读超时 + 10s 请求总期限（慢/
                                 滴漏客户端不会卡死串行 accept），读 body
@@ -697,6 +707,7 @@ u32 crc32          (仅覆盖 body)
 - M143 多源接入链路健壮性优化（1.1 复核后加固）：针对串行 HTTP 端点与 FIFO 订阅的可用性缺口做四项优化——①**慢客户端防护**：连接 accept 后设 `SO_RCVTIMEO`/`SO_SNDTIMEO`（5s）+ **10s 请求总期限**，慢速滴漏客户端不再永久占住 accept 循环（基线实测：partial body 占住连接时 `/health` 3s 超时失败；优化后 4.76s 内返回 200，且部分 body 不入库）；②**截断/超大 body 拒绝**：短于 `Content-Length` 的请求返回 400 而非持久化半行；③**可靠响应写出**：`conn_write` 循环写全 + 响应后 `shutdown(SHUT_WR)` 再 close，避免短写与 RST 截断；读 body 期间穿插 `http_queue_drain`，大请求不再饿死落盘；④**端到端计数与 FIFO 优雅退出**：`/stats` 新增 `accepted`/`written`/`sampled_out`（与 `pending` 可对账），关闭时打印同样终态；`ingest --fifo` 安装 SIGTERM/SIGINT 协作式 handler（EINTR 打断阻塞 open/read），flush 已接收行后以 exit 0 退出并打印终态（基线为 raw signal death / exit 143）。实测：四类来源均正常入库、正常 POST 3 条 → accepted=3/written=3、慢客户端健康检查恢复、截断请求 0 入库、FIFO 有/无写者时 SIGTERM 均 exit 0；native/wasm 测试全绿。
 - M144 高吞吐写入路径优化（1.2 复核后优化）：定位并修复三类真实开销——①**写入缓冲 O(n²)**：`NativeFileLog` 的 `pending = pending + chunk` 每条记录都重新分配并复制整个 64KB 缓冲，改为**定长 `FixedArray` + 已用长度原地 blit**（新增 `moonlog_pwrite_len` stub 只写有效前缀，短写保留未写尾部）；②**记录编码多次分配**：`Record::encode` 原用两个 `Buffer` + 两次 `to_bytes`，改为按固定布局一次分配并原地写字段/CRC（磁盘格式逐字节不变）；③**压测口径偏差**：`bench-write` 原把最后的全量 durability flush（36 段 fsync + 元数据，实测 0.8–1.0s）计入计时窗口，预热越多、段数越多，QPS 越低（150k 预热后仅 41k/s）。现**计时截止到写入循环结束，final flush 单列**，并加可选 `--warmup N`；压测 key 改为单次分配的数字编码。实测（20 万条）：batch 1000 **14.7 万 records/s**（旧口径 8.7–9.2 万）、batch 5000 **19.3 万**、`--sync never` **28.4 万**、`--sync always` 585/s；final flush 0.86–1.04s 透明展示；所有场景 verify `ok (no loss)`。native/wasm 测试全绿。
 - M145 缓冲与背压优化（1.3 复核后优化）：定位并修复三个真实缺口——①**积压消化被串行节拍拖慢**：主循环每轮只 drain 一批 256 行后再 poll 等 200ms，无新连接时恢复速率被锁死在 ~1.3k 行/s；改为有积压时连续 drain（每轮上限一整队列的批数，避免饿死 accept）。②**drain 逐条 fsync**：`ingest_lines` 走 CLI 默认 `SyncPolicy::Always`，HTTP 过载时每行一次 fsync（实测 3000 行导入 5.2s）；`IngestOptions.sync` 显式化，HTTP drain 用 **Batch**（每 `--batch` 一次），并把日志打开/元数据写入从"每 256 行一次"改为"每窗口（≤16 批）一次"（长流仍按窗口释放目录锁）。③**告警刷屏与反压不可观测**：积压告警改为状态机（进入 WARN 一次、排空 RESOLVED 一次，含持续 ms/峰值）；新增 `--queue-bytes` 字节预算与 `pending_peak`/`pending_bytes`/`rejected_requests`/`rejected_lines` 计数，并入 `/stats` 与关闭终态。实测：3000 行积压 **109ms 排空**（旧 4s+）；一次积压 1 WARN + 1 RESOLVED（旧 9 条 WARN）；字节预算 429 后拆小重试 **1000/1000 零丢失**；SIGTERM 立即关闭仍全量 drain 3000 条；`ingest --follow` 回归通过；native 195/195、wasm 154/154。
+- M146 唯一 ID 幂等与重放（1.4 复核后补齐）：原实现只有 `(key, value)` 内容等值 + latest-wins 去重，不满足"通过唯一 ID / 批次号去重"——同 key 交替重放 e1/e2 会重复，且相同内容的不同事件会被误去重。新增**显式唯一 ID**：`ingest`/`http` 的 `--dedup-field <name>`（从解析字段取 ID）与 `put --dedup-id <id>`，已见 ID 一律跳过（不看 payload/key 是否变化）。持久化 `<dir>/DEDUP`（`<offset>\t<id>`）并把 `__uid=<id>` 内嵌进记录 value，使日志成为权威源：启动时读 sidecar 后扫描其未覆盖的尾部补齐，**删除/截断 DEDUP 后仍能重建**（崩溃窗口收敛）。HTTP `/stats` 与关闭终态新增 `duplicates`。实测：`put` 同 ID 不同 value 跳过、同 value 不同 ID 写入；`ingest --from 0` 重放 2 行 0 新增/2 duplicates；同 key 交替重放 0 新增；删除 DEDUP 与截断 sidecar 后重放仍 0 新增；对照内容幂等把"同 key 同 value 不同 ID"误去重为 1 条、唯一 ID 正确写 2 条；HTTP 同 payload 两次 202（accepted=4）→ written=2/duplicates=2；`ingest --follow` 与断点续传回归正常；native/wasm 全绿。
 - **Live tail**（4.5）：实时流式跟踪由 `follow <dir> tail` 承载（200ms 轮询、游标持久化、`--json`，M104 前既有），本子项补**发布观察/线上调试的过滤与延迟证据**——`follow --match <text>`（key/value 子串）、`--level-min <level>`（严重度下界，未知级别排除，与 query 语义一致）、`--service <svc>`（记录键）：只收窄打印流、**游标照常推进**（被过滤记录视为已消费，--commit 不卡住）；`--flush` 逐条刷新 stdout（C 运行时对管道/文件全缓冲，live tail 管道与重定向观测必需）。**端到端延迟**：约定口径 = 发现延迟 ≤ 轮询间隔（默认 200ms）+ 一轮处理时间；实测（`--flush` + bash 观测，含 put 进程启动开销）记录级 108-196ms、最差 <600ms——**远低于秒级约定**，且 `MOONLOG_FOLLOW_INTERVAL` 可调更紧。实测：三维度过滤（error 级 2 条/db 子串 2 条/orders 服务 2 条）各自正确、过滤 + `--commit` 后游标推进到最新（二次 follow 0 条不重放）、`--level bogus` 报错。
 - **查询保护**（4.6）：`query` 内建三重防线，单条异常查询不拖垮库——①**超时**（执行中熔断）：`--timeout <ms>`（默认 30s，env `MOONLOG_QUERY_TIMEOUT_MS`，0=禁用），`QueryGuard` 在段级 + **每 512 条记录**采样时钟，超限即报错并附扫描统计（段数/字节）；②**扫描预算**（执行前/中熔断）：`MOONLOG_MAX_SCAN_BYTES`（默认 512MB，0=禁用）——时间下推后的扫描集字节累积超限即拒绝（与 4.2/4.3 闭环：窗外段不入账）；③**并发限流**（槽位信号量）：`<dir>/QLOCK.<i>` 非阻塞 flock 槽位（默认 4，`MOONLOG_MAX_CONCURRENT_QUERIES`），全忙等待至锁超时后拒绝 "too many concurrent queries"；槽位生命周期=进程（CLI 短命退出即释放）。范围决策：聚焦 `query`（全保护主入口）；`search` 保持线性流式（`--limit`/`--from/--to` 兜底）。实测：`--timeout 1` → `query timeout after 19 ms (8 segments, 501845 bytes scanned)`、`MOONLOG_MAX_SCAN_BYTES=2000` → `scan budget exceeded: 501845 bytes > 2000`、1 槽 + 长查询占位 → 第二查询 `too many concurrent queries (limit 1)`、异常查询被拒后 put/query 全部正常。
 - **聚合统计：分位数**（5.1）：`aggregate --quantile <field>` 对 value 内数值字段做分布统计——与 `--by`/`--kv-field` 维度组合（每桶独立分布），每桶输出 **count/min/avg/p50/p95/p99/max**（最近邻秩法 `ceil(q*n)-1`，零依赖无 math 库；`@string.parse_double` 解析、非数值或缺字段计入 `skipped`）；无 `--quantile` 时保持纯计数模式（向后兼容）。**秒级验收**：4 万条 latency 数据集上 `aggregate --quantile latency` 实测 **426ms**（<< 1s），分布与理论值吻合（`i%997` 均匀序列：min=0/max=996/P50=496/P95=946/P99=986）；手工验算 10 样本等差序列 P50=35/P95=70/P99=70/avg=38.5 精确正确；`--kv-field level --quantile latency` 正交组合（按级别分组 + 延迟分布）验证通过；count 模式与 trend 回归正常。

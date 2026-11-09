@@ -6,10 +6,12 @@
 ///   moonlog <command> <dir> [args...]
 ///
 /// Commands:
-///   put <dir> <key> <value> [--ts <ms>] [--idempotent]
+///   put <dir> <key> <value> [--ts <ms>] [--idempotent] [--dedup-id <id>]
 ///                                    append a key/value record; with
 ///                                    --idempotent a repeated (key, value) is
-///                                    recognized and skipped
+///                                    recognized and skipped; --dedup-id makes
+///                                    it an explicit unique ID: a repeated ID
+///                                    is skipped even with a different value
 ///   put-if <dir> <key> <expected|-> <value>
 ///                                    append only if live value == expected
 ///   put-batch <dir> <k> <v> ...      append several key/value records at once
@@ -59,7 +61,7 @@
 ///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
 ///                     [--from <bytes>] [--batch N] [--interval ms]
-///                     [--idempotent]
+///                     [--idempotent] [--dedup-field <name>]
 ///                                    parse a log file into records (batch
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
@@ -69,11 +71,14 @@
 ///                                    flushing accepted lines;
 ///                                    with --idempotent replayed lines whose
 ///                                    (key, value) matches the latest record
-///                                    are skipped
+///                                    are skipped; --dedup-field treats that
+///                                    parsed field as a unique record ID (seen
+///                                    IDs persist in <dir>/DEDUP, so a replay
+///                                    is skipped even when its value differs)
 ///   http <dir> [--port N] [--queue N] [--queue-bytes N] [--batch N]
 ///             [--backlog-alert N]
 ///             [--format lines|kv] [--key <name>] [--key-field <name>]
-///             [--ts-field <name>] [--idempotent]
+///             [--ts-field <name>] [--idempotent] [--dedup-field <name>]
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
 ///                                    or /push buffers into a bounded queue
 ///                                    and answers 202, or 429 + Retry-After
@@ -87,7 +92,11 @@
 ///                                    backlog drains at full speed with Batch
 ///                                    durability (one fsync per --batch);
 ///                                    /stats also reports
-///                                    accepted/written/sampled_out counters;
+///                                    accepted/written/sampled_out counters
+///                                    and duplicates; --dedup-field treats
+///                                    that parsed field as a unique record ID
+///                                    (repeated IDs are skipped even if the
+///                                    payload differs);
 ///                                    GET /health, /stats. A connection that
 ///                                    stalls mid-request is bounded by a
 ///                                    per-read timeout plus a 10s request
@@ -199,6 +208,11 @@ struct IngestOptions {
   template_bytes : Bytes?
   batch_n : Int32
   idempotent : Bool
+  // Explicit unique-ID dedup: when set, the parsed field with this name is a
+  // record ID. Seen IDs are kept in `<dir>/DEDUP` and a repeated ID is skipped
+  // even when the payload differs; the ID is also embedded in the value so the
+  // set can be rebuilt from the log after a crash.
+  dedup_field_bytes : Bytes?
   sampling : @core.SamplingConfig?
   from_bytes : Int64?
   schema : Bool
@@ -455,6 +469,7 @@ fn cmd_put(
   value : String,
   ts : String?,
   idempotent : Bool,
+  dedup_id : String?,
   partition : Int64,
 ) -> Unit raise @io.IoError {
   let timestamp = match ts {
@@ -464,28 +479,61 @@ fn cmd_put(
       }
     None => now_ms()
   }
+  let uid : Bytes? = match dedup_id {
+    Some(s) => {
+      let u = @utf8.encode(s)
+      if !dedup_uid_ok(u) {
+        raise @io.IoError::Invalid("dedup id contains a tab/newline")
+      }
+      Some(u)
+    }
+    None => None
+  }
   run_locked(dir, true, () => {
     let rule = active_quota_rule(dir)
     let kb = @utf8.encode(key)
-    let vb = @utf8.encode(value)
+    let vb0 = @utf8.encode(value)
+    let vb = match uid {
+      Some(u) => dedup_attach_uid(vb0, u)
+      None => vb0
+    }
     let incoming : Int64 = (kb.length() + vb.length()).to_int64()
     match quota_write_error(dir, rule, incoming) {
       Some(msg) => raise @io.IoError::Invalid(msg)
       None => ()
     }
     let log = open_log(dir, partition~)
-    let (added, off) = if idempotent {
-      log.append_idempotent(kb, vb, timestamp)
-    } else {
-      let off = log.append(kb, vb, timestamp)
-      (true, off)
+    let seen = match uid {
+      Some(_) => Some(load_dedup_locked(dir, log))
+      None => None
     }
-    if added {
-      quota_record_write(dir, rule, incoming)
-      println("offset " + off.to_string())
-      @backend_native.flush_meta(dir, log)
+    let dup = match (seen, uid) {
+      (Some(s), Some(u)) => s.contains(u)
+      _ => false
+    }
+    if dup {
+      println("skipped (duplicate id)")
     } else {
-      println("skipped " + off.to_string() + " (duplicate)")
+      let (added, off) = if idempotent {
+        log.append_idempotent(kb, vb, timestamp)
+      } else {
+        let off = log.append(kb, vb, timestamp)
+        (true, off)
+      }
+      if added {
+        match (seen, uid) {
+          (Some(s), Some(u)) => {
+            s.set(u, true)
+            dedup_append_entries(dir, [(off, u)])
+          }
+          _ => ()
+        }
+        quota_record_write(dir, rule, incoming)
+        println("offset " + off.to_string())
+        @backend_native.flush_meta(dir, log)
+      } else {
+        println("skipped " + off.to_string() + " (duplicate)")
+      }
     }
     close_log(log)
   })
@@ -2816,6 +2864,10 @@ fn cmd_ingest(
     cmd_ingest_fifo(dir, file, opts)
     return
   }
+  let dedup = match opts.dedup_field_bytes {
+    Some(_) => Some(load_dedup(dir))
+    None => None
+  }
   let cursor_name = "ingest-" + path_basename(file)
   let mut pos : Int64 = match opts.from_bytes {
     Some(b) => b
@@ -2834,8 +2886,8 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let (written, sampled) = ingest_lines(dir, lines, opts)
-      duplicates = duplicates + (lines.length() - written - sampled)
+      let (written, sampled, dup) = ingest_lines(dir, lines, opts, dedup)
+      duplicates = duplicates + dup
       sampled_out = sampled_out + sampled
       total = total + written
       pos = pos + consumed
@@ -2932,14 +2984,186 @@ fn schema_transform(
 /// (severity, include/exclude rules, deterministic rate). Returns `(written,
 /// sampled_out)` — the number of records actually appended and how many the
 /// sampler dropped.
+
+///|
+/// Sidecar cache of unique record IDs seen by the dedup path. The log remains
+/// authoritative: every deduped record carries its ID in the value, so a tail
+/// missed by a crash is rebuilt from the log on the next load.
+const DEDUP_FILE : String = "DEDUP"
+
+///|
+/// Whether `uid` can be stored one-per-line in the sidecar.
+fn dedup_uid_ok(uid : Bytes) -> Bool {
+  if uid.length() == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < uid.length() {
+    let c = uid.at(i).to_int()
+    if c == 9 || c == 10 || c == 13 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Pick the explicit unique ID for a parsed line (`--dedup-field`).
+fn dedup_uid_from_fields(
+  fields : Array[(Bytes, Bytes)],
+  opts : IngestOptions,
+) -> Bytes? {
+  match opts.dedup_field_bytes {
+    None => None
+    Some(name) => {
+      let mut found : Bytes? = None
+      for pair in fields {
+        if pair.0 == name {
+          found = Some(pair.1)
+        }
+      }
+      found
+    }
+  }
+}
+
+///|
+/// The ID embedded in a value by the dedup path, or None. The last marker wins
+/// so a user value containing `__uid=` cannot shadow ours.
+fn dedup_uid_of_value(value : Bytes) -> Bytes? {
+  let needle = b"__uid="
+  let mut start = -1
+  let mut i = 0
+  while i + needle.length() <= value.length() {
+    let mut same = true
+    let mut k = 0
+    while k < needle.length() {
+      if value.at(i + k) != needle.at(k) {
+        same = false
+        break
+      }
+      k = k + 1
+    }
+    if same {
+      start = i + needle.length()
+    }
+    i = i + 1
+  }
+  if start < 0 {
+    None
+  } else {
+    Some(@core.slice(value, start, value.length()))
+  }
+}
+
+///|
+/// Append `__uid=<id>` to the value so the dedup set can be rebuilt from the
+/// log itself (the sidecar is only a cache).
+fn dedup_attach_uid(value : Bytes, uid : Bytes) -> Bytes {
+  let marker = b"__uid=" + uid
+  if value.length() == 0 {
+    marker
+  } else {
+    value + b" " + marker
+  }
+}
+
+///|
+/// Append `<offset>\t<uid>\n` rows to the sidecar in one fsynced write.
+fn dedup_append_entries(
+  dir : String,
+  entries : Array[(UInt64, Bytes)],
+) -> Unit raise @io.IoError {
+  if entries.length() == 0 {
+    return
+  }
+  let buf = @buffer.Buffer::Buffer()
+  for entry in entries {
+    buf.write_bytes(@utf8.encode(entry.0.to_string()))
+    buf.write_byte((9 : Int32).to_byte())
+    buf.write_bytes(entry.1)
+    buf.write_byte((10 : Int32).to_byte())
+  }
+  @backend_native.append_file(dir + "/" + DEDUP_FILE, buf.to_bytes())
+}
+
+///|
+/// Load the dedup set for `dir` while holding the directory lock: read the
+/// sidecar, then rebuild any tail it missed (records are appended before the
+/// sidecar, so a crash can leave it behind).
+fn load_dedup_locked(
+  dir : String,
+  log : CliLog,
+) -> @hashmap.HashMap[Bytes, Bool] raise @io.IoError {
+  let seen : @hashmap.HashMap[Bytes, Bool] = @hashmap.HashMap::HashMap([])
+  let path = dir + "/" + DEDUP_FILE
+  let mut scan_from : UInt64 = (0 : UInt64)
+  let mut have_sidecar = false
+  if @backend_native.file_exists(path) {
+    let data = @backend_native.read_file(path)
+    let (rows, _) = split_complete_lines(data, true)
+    for row in rows {
+      let mut tab = -1
+      let mut i = 0
+      while i < row.length() {
+        if row.at(i).to_int() == 9 {
+          tab = i
+          break
+        }
+        i = i + 1
+      }
+      if tab > 0 {
+        let off_s = @utf8.decode(@core.slice(row, 0, tab)) catch { _ => "0" }
+        let off = @string.parse_int64(off_s) catch { _ => (0 : Int64) }
+        let uid = @core.slice(row, tab + 1, row.length())
+        seen.set(uid, true)
+        let o = off.reinterpret_as_uint64()
+        if !have_sidecar || o >= scan_from {
+          scan_from = o + (1 : UInt64)
+          have_sidecar = true
+        }
+      }
+    }
+  }
+  let pending : Array[(UInt64, Bytes)] = []
+  log.for_each_while(scan_from, log.next_offset(), rec => {
+    match dedup_uid_of_value(rec.value) {
+      Some(uid) =>
+        if !seen.contains(uid) {
+          seen.set(uid, true)
+          pending.push((rec.offset, uid))
+        }
+      None => ()
+    }
+    true
+  })
+  dedup_append_entries(dir, pending)
+  seen
+}
+
+///|
+/// Load the dedup set in its own write transaction (for command entry points).
+fn load_dedup(dir : String) -> @hashmap.HashMap[Bytes, Bool] raise @io.IoError {
+  run_locked(dir, true, () => {
+    let log = open_log(dir)
+    let seen = load_dedup_locked(dir, log)
+    close_log(log)
+    seen
+  })
+}
+
+///|
 fn ingest_lines(
   dir : String,
   lines : Array[Bytes],
   opts : IngestOptions,
-) -> (Int32, Int32) raise @io.IoError {
+  dedup : @hashmap.HashMap[Bytes, Bool]?,
+) -> (Int32, Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
   let mut sampled_out = 0
+  let mut duplicates = 0
   let mut i = 0
   // One lock hold and one metadata write per window of up to 16 batches:
   // each metadata flush is an atomic MANIFEST/sidecar update with several
@@ -2960,7 +3184,9 @@ fn ingest_lines(
     }
     let mut window_written = 0
     let mut window_sampled = 0
+    let mut window_duplicates = 0
     let mut window_bytes : Int64 = 0
+    let window_dedup : Array[(UInt64, Bytes)] = []
     run_locked(dir, true, () => {
       // 6.2 write/storage quota: the pre-check runs inside the directory lock
       // (the persisted usage file must not race concurrent writers); the
@@ -3015,7 +3241,35 @@ fn ingest_lines(
             Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
             None => true
           }
-          if keep {
+          let uid = match dedup {
+            Some(_) =>
+              match dedup_uid_from_fields(fields, opts) {
+                Some(u) =>
+                  if dedup_uid_ok(u) {
+                    Some(u)
+                  } else {
+                    raise @io.IoError::Invalid(
+                      "dedup id contains a tab/newline: " +
+                      (@utf8.decode(u) catch { _ => "" }),
+                    )
+                  }
+                None => None
+              }
+            None => None
+          }
+          let duplicate = match (dedup, uid) {
+            (Some(seen), Some(u)) => seen.contains(u)
+            _ => false
+          }
+          if !keep {
+            window_sampled = window_sampled + 1
+          } else if duplicate {
+            window_duplicates = window_duplicates + 1
+          } else {
+            let v = match uid {
+              Some(u) => dedup_attach_uid(v, u)
+              None => v
+            }
             let raw_ts = match schema_ts {
               Some(t) => t
               None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
@@ -3023,20 +3277,31 @@ fn ingest_lines(
             // 2.3 clock-skew correction: a fixed offset (ms) applied to every
             // record timestamp, compensating a slow/fast source clock.
             let rec_ts = raw_ts + opts.clock_skew_ms
+            let mut wrote = false
+            let mut off : UInt64 = (0 : UInt64)
             if opts.idempotent {
-              let (added, _) = log.append_idempotent(k, v, rec_ts)
+              let (added, existing) = log.append_idempotent(k, v, rec_ts)
               if added {
-                window_written = window_written + 1
-                window_bytes = window_bytes +
-                  (k.length() + v.length()).to_int64()
+                wrote = true
+                off = existing
+              } else {
+                window_duplicates = window_duplicates + 1
               }
             } else {
-              ignore(log.append(k, v, rec_ts))
+              off = log.append(k, v, rec_ts)
+              wrote = true
+            }
+            if wrote {
               window_written = window_written + 1
               window_bytes = window_bytes + (k.length() + v.length()).to_int64()
+              match (dedup, uid) {
+                (Some(seen), Some(u)) => {
+                  seen.set(u, true)
+                  window_dedup.push((off, u))
+                }
+                _ => ()
+              }
             }
-          } else {
-            window_sampled = window_sampled + 1
           }
           j = j + 1
         }
@@ -3044,13 +3309,15 @@ fn ingest_lines(
       }
       @backend_native.flush_meta(dir, log)
       close_log(log)
+      dedup_append_entries(dir, window_dedup)
       quota_record_write(dir, rule, window_bytes)
     })
     written = written + window_written
     sampled_out = sampled_out + window_sampled
+    duplicates = duplicates + window_duplicates
     i = window_end
   }
-  (written, sampled_out)
+  (written, sampled_out, duplicates)
 }
 
 ///|
@@ -3227,8 +3494,13 @@ fn cmd_ingest_fifo(
   opts : IngestOptions,
 ) -> Unit raise @io.IoError {
   @backend_native.install_shutdown_handler()
+  let dedup = match opts.dedup_field_bytes {
+    Some(_) => Some(load_dedup(dir))
+    None => None
+  }
   let mut total = 0
   let mut sampled = 0
+  let mut duplicates = 0
   while !@backend_native.shutdown_requested() {
     let fd = @backend_native.open_read_blocking(path)
     if fd < 0 {
@@ -3250,9 +3522,10 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, dropped) = ingest_lines(dir, lines, opts)
+          let (written, dropped, dup) = ingest_lines(dir, lines, opts, dedup)
           total = total + written
           sampled = sampled + dropped
+          duplicates = duplicates + dup
         }
       }
     }
@@ -3267,7 +3540,9 @@ fn cmd_ingest_fifo(
     total.to_string() +
     " written / " +
     sampled.to_string() +
-    " sampled out, " +
+    " sampled out / " +
+    duplicates.to_string() +
+    " duplicates, " +
     path +
     ")",
   )
@@ -3355,6 +3630,10 @@ struct HttpQueue {
   mut accepted : Int64
   mut written : Int64
   mut sampled : Int64
+  mut duplicates : Int64
+  // Unique-ID dedup set (built once at startup when --dedup-field is set);
+  // the drain skips records whose ID was already written.
+  dedup : @hashmap.HashMap[Bytes, Bool]?
   opts : IngestOptions
   // 6.2 per-tenant write/storage quota policy, loaded once at startup.
   quota_rules : Array[@core.QuotaRule]
@@ -3444,8 +3723,9 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   q.head = q.head + take
   q.pending = q.pending - take
   q.pending_bytes = q.pending_bytes - freed_bytes
-  let (batch_written, _) = ingest_lines(dir, chunk, q.opts)
+  let (batch_written, _, batch_dup) = ingest_lines(dir, chunk, q.opts, q.dedup)
   q.written = q.written + batch_written.to_int64()
+  q.duplicates = q.duplicates + batch_dup.to_int64()
   if q.head > 4096 && q.head * 2 > q.lines.length() {
     let rest : Array[Bytes] = []
     let mut j = q.head
@@ -3585,6 +3865,8 @@ fn handle_http_connection(
         q.written.to_string() +
         ",\"sampled_out\":" +
         q.sampled.to_string() +
+        ",\"duplicates\":" +
+        q.duplicates.to_string() +
         ",\"backlog_alerts\":" +
         q.alerts.to_string() +
         ",\"pending_peak\":" +
@@ -3796,6 +4078,10 @@ fn cmd_http(
     backlog_alert_n.to_string() +
     ")",
   )
+  let dedup = match opts.dedup_field_bytes {
+    Some(_) => Some(load_dedup(dir))
+    None => None
+  }
   let q : HttpQueue = {
     lines: [],
     head: 0,
@@ -3814,6 +4100,8 @@ fn cmd_http(
     accepted: 0,
     written: 0,
     sampled: 0,
+    duplicates: 0,
+    dedup,
     opts,
     quota_rules: load_quota_rules(dir),
     head_ts: 0,
@@ -3856,7 +4144,9 @@ fn cmd_http(
     q.written.to_string() +
     " written / " +
     q.sampled.to_string() +
-    " sampled out, peak " +
+    " sampled out / " +
+    q.duplicates.to_string() +
+    " duplicates, peak " +
     q.peak_pending.to_string() +
     " lines, " +
     q.rejected_requests.to_string() +
@@ -7668,6 +7958,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut ts : String? = (None : String?)
       let mut idempotent = false
+      let mut dedup_id : String? = (None : String?)
       let mut partition_str : String? = (None : String?)
       let mut i = 5
       while i < args.length() {
@@ -7676,6 +7967,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if args[i] == "--idempotent" {
           idempotent = true
+        } else if args[i] == "--dedup-id" && i + 1 < args.length() {
+          dedup_id = Some(args[i + 1])
+          i = i + 1
         } else if args[i] == "--partition" && i + 1 < args.length() {
           partition_str = Some(args[i + 1])
           i = i + 1
@@ -7686,7 +7980,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         Some(s) => parse_partition(s)
         None => 0
       }
-      cmd_put(args[2], args[3], args[4], ts, idempotent, partition)
+      cmd_put(args[2], args[3], args[4], ts, idempotent, dedup_id, partition)
     }
   } else if cmd == "put-if" {
     if args.length() < 6 {
@@ -7857,6 +8151,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
       let mut idempotent = false
+      let mut dedup_field : String? = (None : String?)
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
       let mut mask = false
@@ -7909,6 +8204,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
+        } else if a == "--dedup-field" && i + 1 < args.length() {
+          dedup_field = Some(args[i + 1])
+          i = i + 1
         } else if a == "--min-level" && i + 1 < args.length() {
           min_level = Some(args[i + 1])
           i = i + 1
@@ -7984,6 +8282,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         batch_n,
         idempotent,
+        dedup_field_bytes: match dedup_field {
+          Some(s) => Some(@utf8.encode(s))
+          None => None
+        },
         sampling,
         from_bytes,
         schema,
@@ -8022,6 +8324,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
       let mut idempotent = false
+      let mut dedup_field : String? = (None : String?)
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
       let mut mask = false
@@ -8071,6 +8374,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--idempotent" {
           idempotent = true
+        } else if a == "--dedup-field" && i + 1 < args.length() {
+          dedup_field = Some(args[i + 1])
+          i = i + 1
         } else if a == "--min-level" && i + 1 < args.length() {
           min_level = Some(args[i + 1])
           i = i + 1
@@ -8137,6 +8443,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         batch_n,
         idempotent,
+        dedup_field_bytes: match dedup_field {
+          Some(s) => Some(@utf8.encode(s))
+          None => None
+        },
         sampling,
         from_bytes: None,
         schema,
