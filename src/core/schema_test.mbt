@@ -135,3 +135,70 @@ test "schema_matches applies AND across fields key and contains" {
     ),
   )
 }
+
+///|
+test "canonical_field squashes case and separators (OTel aliases)" {
+  assert_eq(@core.canonical_field(b"service.name"), 2)
+  assert_eq(@core.canonical_field(b"service-name"), 2)
+  assert_eq(@core.canonical_field(b"serviceName"), 2)
+  assert_eq(@core.canonical_field(b"SERVICE_NAME"), 2)
+  assert_eq(@core.canonical_field(b"svc"), 2)
+  assert_eq(@core.canonical_field(b"trace.id"), 4)
+  assert_eq(@core.canonical_field(b"host.name"), 3)
+  assert_eq(@core.canonical_field(b"node"), 3)
+  assert_eq(@core.canonical_field(b"severity_text"), 1)
+  assert_eq(@core.canonical_field(b"body"), 5)
+  assert_eq(@core.canonical_field(b"@timestamp"), 0)
+  assert_eq(@core.canonical_field(b"request.user_id"), -1)
+}
+
+///|
+test "schema_from_fields accepts OTel nested field names" {
+  let fields = @core.parse_kv_pairs(
+    b"@timestamp=2026-11-09T10:00:00Z severity_text=ERROR service.name=orders host.name=node-1 trace.id=t9 body=boom",
+  )
+  let f = @core.schema_from_fields(fields, (0 : Int64))
+  match f.ts {
+    Some(_) => ()
+    None => panic()
+  }
+  match f.level {
+    Some(v) => assert_eq(v, b"ERROR")
+    None => panic()
+  }
+  match f.service {
+    Some(v) => assert_eq(v, b"orders")
+    None => panic()
+  }
+  match f.host {
+    Some(v) => assert_eq(v, b"node-1")
+    None => panic()
+  }
+  match f.trace_id {
+    Some(v) => assert_eq(v, b"t9")
+    None => panic()
+  }
+  match f.message {
+    Some(v) => assert_eq(v, b"boom")
+    None => panic()
+  }
+}
+
+///|
+test "schema_matches compares values case-insensitively and level synonyms" {
+  let fields = @core.parse_kv_pairs(
+    b"level=warn service=Orders host=Node-1 trace_id=T9 msg=boom",
+  )
+  assert_true(
+    @core.schema_matches(
+      fields,
+      b"orders",
+      b"level=warn",
+      Some(b"WARNING"),
+      Some(b"ORDERS"),
+      Some(b"node-1"),
+      Some(b"t9"),
+      None,
+    ),
+  )
+}

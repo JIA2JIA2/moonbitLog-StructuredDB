@@ -932,6 +932,7 @@ fn cmd_parse_check(
   template : String?,
   sample_n : Int32,
   as_json : Bool,
+  schema : Bool,
 ) -> Unit raise @io.IoError {
   if format != "lines" &&
     format != "kv" &&
@@ -957,6 +958,7 @@ fn cmd_parse_check(
   let mut failed = 0
   let mut fields_total = 0
   let mut empty_fields = 0
+  let mut schema_present = 0
   let samples : Array[String] = []
   let json_samples : Array[String] = []
   let mut i = 0
@@ -984,6 +986,36 @@ fn cmd_parse_check(
       parsed = parsed + 1
     } else {
       failed = failed + 1
+    }
+    if schema {
+      let sf = @core.schema_from_fields(fields, (0 : Int64))
+      let norm : Array[(Bytes, Bytes)] = []
+      match sf.ts {
+        Some(t) => norm.push((b"ts", @utf8.encode(t.to_string())))
+        None => ()
+      }
+      match sf.level {
+        Some(v) => norm.push((b"level", v))
+        None => ()
+      }
+      match sf.service {
+        Some(v) => norm.push((b"service", v))
+        None => ()
+      }
+      match sf.host {
+        Some(v) => norm.push((b"host", v))
+        None => ()
+      }
+      match sf.trace_id {
+        Some(v) => norm.push((b"trace_id", v))
+        None => ()
+      }
+      match sf.message {
+        Some(v) => norm.push((b"message", v))
+        None => ()
+      }
+      fields = norm
+      schema_present = schema_present + norm.length()
     }
     fields_total = fields_total + fields.length()
     for pair in fields {
@@ -1048,6 +1080,11 @@ fn cmd_parse_check(
       fields_total.to_string() +
       ",\"empty_fields\":" +
       empty_fields.to_string() +
+      (if schema {
+        ",\"schema_fields\":" + schema_present.to_string()
+      } else {
+        ""
+      }) +
       ",\"samples\":["
     let mut first = true
     for s in json_samples {
@@ -1073,7 +1110,12 @@ fn cmd_parse_check(
       fields_total.to_string() +
       " fields, " +
       empty_fields.to_string() +
-      " empty",
+      " empty" +
+      (if schema {
+        ", schema " + schema_present.to_string() + " fields"
+      } else {
+        ""
+      }),
     )
     for s in samples {
       println(s)
@@ -8667,6 +8709,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut template : String? = (None : String?)
       let mut sample_n = 5
       let mut as_json = false
+      let mut schema = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -8683,10 +8726,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--json" {
           as_json = true
+        } else if a == "--schema" {
+          schema = true
         }
         i = i + 1
       }
-      cmd_parse_check(args[2], format, template, sample_n, as_json)
+      cmd_parse_check(args[2], format, template, sample_n, as_json, schema)
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {
