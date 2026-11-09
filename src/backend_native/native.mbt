@@ -133,6 +133,16 @@ extern "C" fn moonlog_conn_read(fd : Int32, max : Int32) -> Bytes = "moonlog_con
 extern "C" fn moonlog_conn_write(fd : Int32, data : Bytes) -> Int32 = "moonlog_conn_write"
 
 ///|
+extern "C" fn moonlog_conn_set_timeouts(
+  fd : Int32,
+  recv_ms : Int32,
+  send_ms : Int32,
+) -> Int32 = "moonlog_conn_set_timeouts"
+
+///|
+extern "C" fn moonlog_conn_close_graceful(fd : Int32) -> Int32 = "moonlog_conn_close_graceful"
+
+///|
 #borrow(path)
 extern "C" fn moonlog_mkfifo(path : Bytes, mode : Int32) -> Int32 = "moonlog_mkfifo"
 
@@ -1390,9 +1400,26 @@ pub fn conn_read(fd : Int32, max : Int32) -> Bytes {
 }
 
 ///|
-/// Write `data` to a connection; returns the number of bytes written.
+/// Write `data` to a connection; returns the number of bytes written. The
+/// native side loops over short writes, so the return equals `data.length()`
+/// unless the peer fails or the send timeout expires.
 pub fn conn_write(fd : Int32, data : Bytes) -> Int32 {
   moonlog_conn_write(fd, data)
+}
+
+///|
+/// Set receive/send timeouts (milliseconds) on a connection. A stalled client
+/// then fails the read after `recv_ms` instead of blocking the serial accept
+/// loop forever; zero disables that timeout.
+pub fn conn_set_timeouts(fd : Int32, recv_ms : Int32, send_ms : Int32) -> Unit {
+  ignore(moonlog_conn_set_timeouts(fd, recv_ms, send_ms))
+}
+
+///|
+/// Half-close then close a connection so a fully written response is not
+/// truncated by a reset (see the native stub).
+pub fn conn_close_graceful(fd : Int32) -> Unit {
+  ignore(moonlog_conn_close_graceful(fd))
 }
 
 ///|

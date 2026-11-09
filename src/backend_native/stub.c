@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <fcntl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <time.h>
 #include <dirent.h>
@@ -488,8 +489,57 @@ moonbit_bytes_t moonlog_conn_read(int32_t fd, int32_t max) {
 MOONBIT_FFI_EXPORT
 int32_t moonlog_conn_write(int32_t fd, moonbit_bytes_t data) {
   int32_t len = Moonbit_array_length(data);
-  ssize_t n = write(fd, data, (size_t)len);
-  return (int32_t)n;
+  int32_t off = 0;
+  /* Loop until the whole buffer is written: a single write() may be short
+     when the peer's receive window is small or the socket buffer is full. */
+  while (off < len) {
+    /* MSG_NOSIGNAL: a client that vanished mid-request must not kill the
+       server with SIGPIPE when the error response is written; send() then
+       reports EPIPE instead. */
+    ssize_t n = send(fd, data + off, (size_t)(len - off), MSG_NOSIGNAL);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return off > 0 ? off : -1;
+    }
+    off += (int32_t)n;
+  }
+  return off;
+}
+
+/*
+ * Bound how long a slow or stalled client can hold the (serial) HTTP server:
+ * reads fail with EAGAIN after `recv_ms` and writes after `send_ms`, so a
+ * partial request can no longer wedge the accept loop and starve the queue
+ * drain. Zero disables the corresponding timeout.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_conn_set_timeouts(int32_t fd, int32_t recv_ms, int32_t send_ms) {
+  if (recv_ms > 0) {
+    struct timeval tv;
+    tv.tv_sec = recv_ms / 1000;
+    tv.tv_usec = (recv_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  }
+  if (send_ms > 0) {
+    struct timeval tv;
+    tv.tv_sec = send_ms / 1000;
+    tv.tv_usec = (send_ms % 1000) * 1000;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+  return 0;
+}
+
+/*
+ * Half-close the write side before closing. Closing a socket that still has
+ * unread input may send RST instead of FIN, which can truncate the response
+ * the client was about to read; shutdown(SHUT_WR) flushes it first.
+ */
+MOONBIT_FFI_EXPORT
+int32_t moonlog_conn_close_graceful(int32_t fd) {
+  shutdown(fd, SHUT_WR);
+  return close(fd);
 }
 
 /*

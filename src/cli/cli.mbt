@@ -64,7 +64,9 @@
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
 ///                                    cursor; `--fifo` subscribes to a named
-///                                    pipe instead (writers push batches);
+///                                    pipe instead (writers push batches) and
+///                                    exits cleanly on SIGTERM/SIGINT after
+///                                    flushing accepted lines;
 ///                                    with --idempotent replayed lines whose
 ///                                    (key, value) matches the latest record
 ///                                    are skipped
@@ -77,7 +79,15 @@
 ///                                    when the backlog is full — explicit
 ///                                    backpressure, no silent drops; backlog
 ///                                    beyond --backlog-alert warns and is
-///                                    exposed via /stats; GET /health, /stats)
+///                                    exposed via /stats; /stats also reports
+///                                    accepted/written/sampled_out counters;
+///                                    GET /health, /stats. A connection that
+///                                    stalls mid-request is bounded by a
+///                                    per-read timeout plus a 10s request
+///                                    deadline, so one slow client cannot
+///                                    wedge the serial accept loop; a short
+///                                    body is rejected with 400 instead of
+///                                    persisting a truncated line)
 ///   bench-write <dir> <count> [--batch N] [--sync always|batch|never]
 ///                [--prefix <p>]
 ///                                    bulk-write benchmark: report throughput,
@@ -3165,36 +3175,59 @@ fn sampling_filter_lines(
 /// Subscribe to a FIFO (named pipe): block until a writer appears, ingest the
 /// complete lines it writes until it closes, then wait for the next writer.
 /// A partially written trailing line is held until the following chunk.
+/// SIGTERM/SIGINT is handled cooperatively: the blocking open/read is
+/// interrupted (EINTR), the loop notices the shutdown flag, flushes what has
+/// already been written and exits cleanly instead of dying by signal.
 fn cmd_ingest_fifo(
   dir : String,
   path : String,
   opts : IngestOptions,
 ) -> Unit raise @io.IoError {
+  @backend_native.install_shutdown_handler()
   let mut total = 0
-  while true {
+  let mut sampled = 0
+  while !@backend_native.shutdown_requested() {
     let fd = @backend_native.open_read_blocking(path)
     if fd < 0 {
+      if @backend_native.shutdown_requested() {
+        break
+      }
       raise @io.IoError::Syscall(fd)
     }
     let mut leftover = b""
     let mut eof = false
-    while !eof {
+    while !eof && !@backend_native.shutdown_requested() {
       let chunk = @backend_native.read_blocking(fd, 4096)
       if chunk.length() == 0 {
+        // EOF (writer closed) or an interrupted read; a pending shutdown
+        // leaves the loop and closes the descriptor below.
         eof = true
       } else {
         let data = leftover + chunk
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, _) = ingest_lines(dir, lines, opts)
+          let (written, dropped) = ingest_lines(dir, lines, opts)
           total = total + written
+          sampled = sampled + dropped
         }
       }
     }
     @backend_native.close_fd(fd)
+    if @backend_native.shutdown_requested() {
+      break
+    }
     println("ingested " + total.to_string() + " records (fifo " + path + ")")
   }
+  println(
+    "moonlog fifo shut down (" +
+    total.to_string() +
+    " written / " +
+    sampled.to_string() +
+    " sampled out, " +
+    path +
+    ")",
+  )
 }
 
 ///|
@@ -3259,6 +3292,12 @@ struct HttpQueue {
   batch : Int32
   alert_threshold : Int32
   mut alerts : Int32
+  // End-to-end counters for the push path: lines accepted into the queue,
+  // lines actually written by the drain, and lines dropped by the sampler.
+  // accepted - written - sampled is the in-flight/duplicate remainder.
+  mut accepted : Int64
+  mut written : Int64
+  mut sampled : Int64
   opts : IngestOptions
   // 6.2 per-tenant write/storage quota policy, loaded once at startup.
   quota_rules : Array[@core.QuotaRule]
@@ -3328,7 +3367,8 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   }
   q.head = q.head + take
   q.pending = q.pending - take
-  ignore(ingest_lines(dir, chunk, q.opts))
+  let (batch_written, _) = ingest_lines(dir, chunk, q.opts)
+  q.written = q.written + batch_written.to_int64()
   if q.head > 4096 && q.head * 2 > q.lines.length() {
     let rest : Array[Bytes] = []
     let mut j = q.head
@@ -3367,10 +3407,16 @@ fn handle_http_connection(
   conn : Int32,
   q : HttpQueue,
 ) -> Unit raise @io.IoError {
+  // Bound a stalled client: without this a slowloris-style partial request
+  // blocks the serial accept loop (and the queue drain with it). The per-read
+  // timeout stops a silent peer; the wall-clock deadline also stops one that
+  // keeps dribbling bytes forever.
+  @backend_native.conn_set_timeouts(conn, 5000, 5000)
+  let deadline = now_ms() + 10000
   let mut head = b""
   let mut header_end = -1
   let mut rounds = 0
-  while header_end < 0 && rounds < 16 {
+  while header_end < 0 && rounds < 16 && now_ms() < deadline {
     let chunk = @backend_native.conn_read(conn, 4096)
     if chunk.length() == 0 {
       break
@@ -3392,12 +3438,23 @@ fn handle_http_connection(
     }
   }
   let mut body = @core.slice(head, header_end, head.length())
-  while body.length() < request.content_length && body.length() < 1_048_576 {
+  while body.length() < request.content_length &&
+        body.length() < 1_048_576 &&
+        now_ms() < deadline {
+    // Keep writing buffered lines while the body streams in, so a large
+    // upload does not starve the disk writer.
+    http_queue_drain(q, dir)
     let chunk = @backend_native.conn_read(conn, 4096)
     if chunk.length() == 0 {
       break
     }
     body = body + chunk
+  }
+  // A short body means the client stalled (recv timeout) or disconnected:
+  // reject instead of persisting a truncated line.
+  if body.length() < request.content_length {
+    http_respond(conn, 400, "{\"error\":\"truncated or oversized body\"}")
+    return
   }
   let is_get = request.verb == b"GET"
   let is_post = request.verb == b"POST"
@@ -3429,6 +3486,12 @@ fn handle_http_connection(
         log.next_offset().to_string() +
         ",\"pending\":" +
         q.pending.to_string() +
+        ",\"accepted\":" +
+        q.accepted.to_string() +
+        ",\"written\":" +
+        q.written.to_string() +
+        ",\"sampled_out\":" +
+        q.sampled.to_string() +
         ",\"backlog_alerts\":" +
         q.alerts.to_string() +
         "}"
@@ -3502,6 +3565,8 @@ fn handle_http_connection(
       }
       if http_queue_enqueue(q, kept) {
         quota_record_write(dir, rule, incoming)
+        q.accepted = q.accepted + kept.length().to_int64()
+        q.sampled = q.sampled + sampled_out.to_int64()
         http_respond(
           conn,
           202,
@@ -3525,6 +3590,7 @@ fn handle_http_connection(
         )
       }
     } else {
+      q.sampled = q.sampled + sampled_out.to_int64()
       http_respond(
         conn,
         202,
@@ -3619,6 +3685,9 @@ fn cmd_http(
     batch: batch_n,
     alert_threshold: backlog_alert_n,
     alerts: 0,
+    accepted: 0,
+    written: 0,
+    sampled: 0,
     opts,
     quota_rules: load_quota_rules(dir),
     head_ts: 0,
@@ -3635,7 +3704,7 @@ fn cmd_http(
       let conn = @backend_native.tcp_accept_timeout(listen_fd, 200)
       if conn >= 0 {
         handle_http_connection(dir, conn, q)
-        @backend_native.close_fd(conn)
+        @backend_native.conn_close_graceful(conn)
       }
     }
   }
@@ -3649,6 +3718,12 @@ fn cmd_http(
   selfmon_report_http(dir, q)
   println(
     "moonlog http shut down (backlog drained, " +
+    q.accepted.to_string() +
+    " accepted / " +
+    q.written.to_string() +
+    " written / " +
+    q.sampled.to_string() +
+    " sampled out, " +
     q.alerts.to_string() +
     " backlog alerts total)",
   )
