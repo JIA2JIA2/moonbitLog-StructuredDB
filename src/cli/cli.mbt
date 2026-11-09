@@ -169,15 +169,26 @@
 ///                                    by event time (ties keep offset order)
 ///   aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
 ///                    [--match <text>] [--top N] [--json]
-///                    [--quantile <field>]
+///                    [--quantile <field>] [--since <ts>] [--until <ts>]
 ///                                    multi-dimensional count aggregation;
 ///                                    with --quantile, report count/min/avg/
 ///                                    p50/p95/p99/max of the numeric field
-///                                    per bucket instead of counts only
+///                                    per bucket instead of counts only;
+///                                    field values may be KV or JSON;
+///                                    default window is the last 24h
+///                                    (--since 0 for everything), pushed
+///                                    down to segment min_ts/max_ts; shares
+///                                    the query slot/timeout/scan budget and
+///                                    does not hold the writer lock
 ///   cluster <dir> [--match <text>] [--top N]
 ///                                    error clustering by normalized template
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
-///                                    time-bucket histogram as text bars
+///               [--since <ts>] [--until <ts>]
+///                                    time-bucket histogram as text bars;
+///                                    default window is the last 24h
+///                                    (--since 0 for everything), pushed
+///                                    down to segments; shares the query
+///                                    guards and scans without the writer lock
 ///   dashboard <dir> [--last sec] [--bucket minute|hour] [--service <svc>]
 ///            [--quantile-field <f>] [--json]
 ///                                    ops panel for daily inspection:
@@ -6439,6 +6450,12 @@ fn pct_of(sorted : Array[Double], q : Double) -> Double {
 }
 
 ///|
+/// Multi-dimensional count/quantile aggregation (5.1). Group dimensions are
+/// record key/value/kind/UTC hour/key prefix or a value field (`--kv-field`,
+/// KV or JSON-flattened). `--quantile` adds per-bucket count/min/avg/
+/// p50/p95/p99/max. Bounded by `--since`/`--until` (default last 24h,
+/// `--since 0` for everything) with segment min_ts/max_ts pushdown; shares
+/// the 4.6 query slot/timeout/scan budget and scans outside the writer lock.
 fn cmd_aggregate(
   dir : String,
   by : String,
@@ -6447,6 +6464,8 @@ fn cmd_aggregate(
   top : String?,
   json : Bool,
   quantile : String?,
+  since : String?,
+  until : String?,
 ) -> Unit raise @io.IoError {
   let top_n = match top {
     Some(s) =>
@@ -6480,87 +6499,172 @@ fn cmd_aggregate(
     Some(s) => Some(@utf8.encode(s))
     None => None
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  // Time scoping (5.1): aggregations are bounded like query/search (4.3) and
+  // pushed down to segment min_ts/max_ts. `--since 0` is an explicit
+  // full-history aggregation; otherwise the default window applies.
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => {
+      let win = query_window_ms()
+      if !json {
+        println(
+          "INFO aggregate scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+      }
+      Some(now_ms() - win)
+    }
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  // 5.1 production guards: share the 4.6 query slot/guard and scan outside
+  // the writer lock, so a slow aggregation does not stall ingestion.
+  acquire_query_slot(dir)
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: query_timeout_ms(),
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  run_read_snapshot(dir, log => {
     let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
     let qvals : @hashmap.HashMap[Bytes, Array[Double]] = @hashmap.HashMap::HashMap([],
     )
     let mut skipped : Int32 = 0
-    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      let pass = match needle {
-        Some(n) =>
-          match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
-        None => true
+    let mut abort_msg : String? = None
+    for seg in log.segments {
+      if abort_msg is Some(_) {
+        break
       }
-      if pass {
-        let bucket : Bytes = match field {
-          Some(f) => {
-            let pairs = @core.parse_kv_pairs(rec.value)
-            let mut found : Bytes? = None
-            for pair in pairs {
-              if pair.0 == f {
-                found = Some(pair.1)
-              }
-            }
-            match found {
-              Some(v) => v
-              None => b"<missing>"
-            }
-          }
-          None =>
-            if by == "value" {
-              rec.value
-            } else if by == "kind" {
-              if rec.is_delete() {
-                b"delete"
-              } else {
-                b"put"
-              }
-            } else if by == "hour" {
-              @utf8.encode(@core.format_utc(rec.timestamp, "hour"))
-            } else if is_prefix {
-              let len = if prefix_n < rec.key.length() {
-                prefix_n
-              } else {
-                rec.key.length()
-              }
-              @core.slice(rec.key, 0, len)
-            } else {
-              rec.key
-            }
-        }
-        match qfield {
-          Some(qf) => {
-            let qpairs = @core.parse_kv_pairs(rec.value)
-            let mut qv : Bytes? = None
-            for qp in qpairs {
-              if qp.0 == qf {
-                qv = Some(qp.1)
-              }
-            }
-            match qv {
-              Some(raw) => {
-                let d_opt = Some(@string.parse_double(@utf8.decode_lossy(raw))) catch {
-                  _ => None
-                }
-                match d_opt {
-                  Some(d) =>
-                    match qvals.get(bucket) {
-                      Some(arr) => arr.push(d)
-                      None => qvals.set(bucket, [d])
-                    }
-                  None => skipped = skipped + 1
-                }
-              }
-              None => skipped = skipped + 1
-            }
-          }
+      if seg.record_count > 0 {
+        match since_ts {
+          Some(t) => if seg.max_ts < t { continue }
           None => ()
         }
-        bump_bytes(counts, bucket)
+        match until_ts {
+          Some(t) => if seg.min_ts > t { continue }
+          None => ()
+        }
       }
-      true
-    })
+      qg.check(seg.size)
+      let mut seen = 0
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        seen = seen + 1
+        if seen % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => abort_msg = Some(m)
+            None => ()
+          }
+        }
+        if abort_msg is Some(_) {
+          return
+        }
+        let mut in_time = true
+        match since_ts {
+          Some(t) => if rec.timestamp < t { in_time = false }
+          None => ()
+        }
+        match until_ts {
+          Some(t) => if rec.timestamp > t { in_time = false }
+          None => ()
+        }
+        if !in_time {
+          return
+        }
+        let pass = match needle {
+          Some(n) =>
+            match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
+          None => true
+        }
+        if pass {
+          let bucket : Bytes = match field {
+            Some(f) => {
+              let pairs = ctx_value_fields(rec.value)
+              let mut found : Bytes? = None
+              for pair in pairs {
+                if pair.0 == f {
+                  found = Some(pair.1)
+                }
+              }
+              match found {
+                Some(v) => v
+                None => b"<missing>"
+              }
+            }
+            None =>
+              if by == "value" {
+                rec.value
+              } else if by == "kind" {
+                if rec.is_delete() {
+                  b"delete"
+                } else {
+                  b"put"
+                }
+              } else if by == "hour" {
+                @utf8.encode(@core.format_utc(rec.timestamp, "hour"))
+              } else if is_prefix {
+                let len = if prefix_n < rec.key.length() {
+                  prefix_n
+                } else {
+                  rec.key.length()
+                }
+                @core.slice(rec.key, 0, len)
+              } else {
+                rec.key
+              }
+          }
+          match qfield {
+            Some(qf) => {
+              let qpairs = ctx_value_fields(rec.value)
+              let mut qv : Bytes? = None
+              for qp in qpairs {
+                if qp.0 == qf {
+                  qv = Some(qp.1)
+                }
+              }
+              match qv {
+                Some(raw) => {
+                  let d_opt = Some(
+                    @string.parse_double(@utf8.decode_lossy(raw)),
+                  ) catch {
+                    _ => None
+                  }
+                  match d_opt {
+                    Some(d) =>
+                      match qvals.get(bucket) {
+                        Some(arr) => arr.push(d)
+                        None => qvals.set(bucket, [d])
+                      }
+                    None => skipped = skipped + 1
+                  }
+                }
+                None => skipped = skipped + 1
+              }
+            }
+            None => ()
+          }
+          bump_bytes(counts, bucket)
+        }
+      })
+    }
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
     let items : Array[(Bytes, Int32)] = []
     for k in counts.keys() {
       match counts.get(k) {
@@ -6718,7 +6822,6 @@ fn cmd_aggregate(
           println("(" + counts.length().to_string() + " buckets)")
         }
     }
-    close_log(log)
   })
 }
 
@@ -7501,11 +7604,16 @@ fn cmd_cluster(
 /// in chronological order. `--bucket minute|hour|day` (default hour) selects
 /// UTC granularity; `--match <text>` filters records (ASCII case-insensitive,
 /// key or value); `--width N` sets the longest bar width (default 40).
+/// Bounded by `--since`/`--until` (default last 24h, `--since 0` for
+/// everything) with segment min_ts/max_ts pushdown; shares the 4.6 guards and
+/// scans outside the writer lock.
 fn cmd_trend(
   dir : String,
   bucket : String,
   match_text : String?,
   width : String?,
+  since : String?,
+  until : String?,
 ) -> Unit raise @io.IoError {
   if bucket != "minute" && bucket != "hour" && bucket != "day" {
     raise @io.IoError::Invalid(
@@ -7523,20 +7631,99 @@ fn cmd_trend(
     Some(s) => Some(@utf8.encode(s))
     None => None
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  // Time scoping and guards (5.1): the histogram is bounded by the same
+  // default window as query/search and pushed down to segment min_ts/max_ts;
+  // it also shares the 4.6 slot/guard and scans outside the writer lock.
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => {
+      let win = query_window_ms()
+      println(
+        "INFO trend scoped to the last " +
+        (win / (1000 : Int64)).to_string() +
+        "s (default window; pass --since to override, --since 0 for everything)",
+      )
+      Some(now_ms() - win)
+    }
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  acquire_query_slot(dir)
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: query_timeout_ms(),
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  run_read_snapshot(dir, log => {
     let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
-    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      let pass = match needle {
-        Some(n) =>
-          match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
-        None => true
+    let mut abort_msg : String? = None
+    for seg in log.segments {
+      if abort_msg is Some(_) {
+        break
       }
-      if pass {
-        bump_string(counts, @core.format_utc(rec.timestamp, bucket))
+      if seg.record_count > 0 {
+        match since_ts {
+          Some(t) => if seg.max_ts < t { continue }
+          None => ()
+        }
+        match until_ts {
+          Some(t) => if seg.min_ts > t { continue }
+          None => ()
+        }
       }
-      true
-    })
+      qg.check(seg.size)
+      let mut seen = 0
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        seen = seen + 1
+        if seen % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => abort_msg = Some(m)
+            None => ()
+          }
+        }
+        if abort_msg is Some(_) {
+          return
+        }
+        let mut in_time = true
+        match since_ts {
+          Some(t) => if rec.timestamp < t { in_time = false }
+          None => ()
+        }
+        match until_ts {
+          Some(t) => if rec.timestamp > t { in_time = false }
+          None => ()
+        }
+        if !in_time {
+          return
+        }
+        let pass = match needle {
+          Some(n) =>
+            match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
+          None => true
+        }
+        if pass {
+          bump_string(counts, @core.format_utc(rec.timestamp, bucket))
+        }
+      })
+    }
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
     let labels : Array[String] = []
     for k in counts.keys() {
       labels.push(k)
@@ -7571,7 +7758,6 @@ fn cmd_trend(
       labels.length().to_string() +
       " buckets)",
     )
-    close_log(log)
   })
 }
 
@@ -10031,6 +10217,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut match_text : String? = (None : String?)
       let mut top : String? = (None : String?)
       let mut quantile : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
       let mut json = false
       let mut i = 3
       while i < args.length() {
@@ -10052,10 +10240,26 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--top" && i + 1 < args.length() {
           top = Some(args[i + 1])
           i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
-      cmd_aggregate(args[2], by, kv_field, match_text, top, json, quantile)
+      cmd_aggregate(
+        args[2],
+        by,
+        kv_field,
+        match_text,
+        top,
+        json,
+        quantile,
+        since,
+        until,
+      )
     }
   } else if cmd == "cluster" {
     if args.length() < 3 {
@@ -10087,6 +10291,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut bucket = "hour"
       let mut match_text : String? = (None : String?)
       let mut width : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -10099,10 +10305,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--width" && i + 1 < args.length() {
           width = Some(args[i + 1])
           i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
-      cmd_trend(args[2], bucket, match_text, width)
+      cmd_trend(args[2], bucket, match_text, width, since, until)
     }
   } else if cmd == "dashboard" {
     if args.length() < 3 {
