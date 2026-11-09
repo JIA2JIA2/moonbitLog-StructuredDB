@@ -36,9 +36,22 @@
 ///                                    incrementally mirror the source log into
 ///                                    a complete replica directory (--follow
 ///                                    repeats on an interval and only warns
-///                                    while the source is down); failover =
-///                                    point readers/writers at the replica,
-///                                    rebalance = replicate back
+///                                    while the source is down); a promoted
+///                                    replica rejects forward sync so outage
+///                                    writes are never trimmed
+///   ha-failover <primary> <replica> [--active <link>] [--json]
+///                                    promote the replica (role=primary),
+///                                    mark a reachable old primary standby and
+///                                    atomically repoint the stable link
+///   ha-status <primary> <replica> [--json]
+///                                    show roles, reachability and switch time
+///   ha-rebalance <old-primary> <new-primary> [--json]
+///                                    mirror the promoted primary back onto the
+///                                    old directory and mark it standby
+///   ha-watch <primary> <replica> --active <link>
+///            [--interval ms] [--fail-threshold N] [--json] [--once]
+///                                    promote automatically after N failed
+///                                    probes; exits after a promotion
 ///   archive <dir> <file> [--list] [--extract --into <dir>]
 ///                                    pack a log directory into a single
 ///                                    self-contained archive file (CRC32) for
@@ -262,7 +275,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.3"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -2831,9 +2844,86 @@ fn replicate_interval_ms() -> Int32 {
 /// would otherwise silently rebuild an empty primary and the following
 /// backup pass would then prune the replica down to that empty state,
 /// destroying the failover copy.
+
+///|
+/// Directory role marker used by the HA helpers (3.5): `<dir>/HA_STATE` with
+/// `role=primary|standby`, `switched_at=<ms>`, `switched_from=<path>`.
+const HA_STATE_FILE : String = "HA_STATE"
+
+///|
+fn ha_state_path(dir : String) -> String {
+  dir + "/" + HA_STATE_FILE
+}
+
+///|
+/// Read a directory's HA role marker. Returns (role, switched_at, from).
+fn load_ha_state(dir : String) -> (String?, Int64, String?) {
+  let path = ha_state_path(dir)
+  let mut role : String? = None
+  let mut at : Int64 = 0
+  let mut from : String? = None
+  if !@backend_native.file_exists(path) {
+    return (role, at, from)
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  for line in lines {
+    for pair in @core.parse_kv_pairs(line) {
+      if pair.0 == b"role" {
+        role = Some(@utf8.decode_lossy(pair.1))
+      } else if pair.0 == b"switched_at" {
+        at = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+          _ => (0 : Int64)
+        }
+      } else if pair.0 == b"switched_from" {
+        from = Some(@utf8.decode_lossy(pair.1))
+      }
+    }
+  }
+  (role, at, from)
+}
+
+///|
+fn save_ha_state(
+  dir : String,
+  role : String,
+  from : String,
+) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  @backend_native.write_file(
+    ha_state_path(dir),
+    @utf8.encode(
+      "role=" +
+      role +
+      "\nswitched_at=" +
+      now_ms().to_string() +
+      "\nswitched_from=" +
+      from +
+      "\n",
+    ),
+  )
+}
+
+///|
 fn replicate_pass(src : String, dst : String) -> Int32 raise @io.IoError {
   if !@backend_native.file_exists(src) {
     raise @io.IoError::Invalid("source unavailable: " + src)
+  }
+  // HA safety (3.5): a target promoted by ha-failover must never be trimmed by
+  // a stale forward sync after the old primary returns — that would delete
+  // writes made on the replica during the outage. Require an explicit
+  // ha-rebalance / ha-failover role change instead.
+  let (dst_role, _, _) = load_ha_state(dst)
+  match dst_role {
+    Some(r) =>
+      if r == "primary" {
+        raise @io.IoError::Invalid(
+          "replicate target " +
+          dst +
+          " is promoted to primary; run ha-rebalance or ha-failover",
+        )
+      }
+    None => ()
   }
   run_locked(src, true, () => {
     let log = open_log(src)
@@ -2856,6 +2946,192 @@ fn replicate_pass(src : String, dst : String) -> Int32 raise @io.IoError {
 /// writes at the replica (single-writer by convention — no automatic
 /// arbitration), and rebalance by running `replicate` back from the promoted
 /// replica once the old primary returns.
+
+///|
+/// Promote `replica` to primary after the primary becomes unreachable (3.5
+/// automatic failover = this command driven by `ha-watch` or a supervisor).
+/// The replica is marked `role=primary`; a reachable old primary is marked
+/// `role=standby`, and a later stale `replicate old new` is refused by
+/// replicate_pass so replica writes are never trimmed. `--active <link>`
+/// atomically repoints the link at the replica, giving clients one stable
+/// path across failover.
+fn cmd_ha_failover(
+  primary : String,
+  replica : String,
+  active : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  if !@backend_native.file_exists(replica) {
+    raise @io.IoError::Invalid("replica not found: " + replica)
+  }
+  save_ha_state(replica, "primary", primary)
+  if @backend_native.file_exists(primary) {
+    save_ha_state(primary, "standby", replica)
+  }
+  match active {
+    Some(link) => @backend_native.replace_symlink(replica, link)
+    None => ()
+  }
+  if json {
+    println(
+      "{\"failover\":true,\"primary\":\"" +
+      json_escape_str(replica) +
+      "\",\"from\":\"" +
+      json_escape_str(primary) +
+      "\",\"active\":" +
+      (match active {
+        Some(l) => "\"" + json_escape_str(l) + "\""
+        None => "null"
+      }) +
+      "}",
+    )
+  } else {
+    println("promoted " + replica + " to primary (from " + primary + ")")
+    match active {
+      Some(l) => println("active path now points at " + replica + " via " + l)
+      None => ()
+    }
+  }
+}
+
+///|
+fn cmd_ha_status(primary : String, replica : String, json : Bool) -> Unit {
+  let p_exists = @backend_native.file_exists(primary)
+  let r_exists = @backend_native.file_exists(replica)
+  let (p_role, p_at, p_from) = load_ha_state(primary)
+  let (r_role, r_at, r_from) = load_ha_state(replica)
+  let pname = match p_role {
+    Some(r) => r
+    None => if p_exists { "primary" } else { "down" }
+  }
+  let rname = match r_role {
+    Some(r) => r
+    None => if r_exists { "replica" } else { "down" }
+  }
+  if json {
+    println(
+      "{\"primary\":{\"path\":\"" +
+      json_escape_str(primary) +
+      "\",\"exists\":" +
+      (if p_exists { "true" } else { "false" }) +
+      ",\"role\":\"" +
+      json_escape_str(pname) +
+      "\",\"switched_at\":" +
+      p_at.to_string() +
+      ",\"switched_from\":" +
+      (match p_from {
+        Some(f) => "\"" + json_escape_str(f) + "\""
+        None => "null"
+      }) +
+      "},\"replica\":{\"path\":\"" +
+      json_escape_str(replica) +
+      "\",\"exists\":" +
+      (if r_exists { "true" } else { "false" }) +
+      ",\"role\":\"" +
+      json_escape_str(rname) +
+      "\",\"switched_at\":" +
+      r_at.to_string() +
+      ",\"switched_from\":" +
+      (match r_from {
+        Some(f) => "\"" + json_escape_str(f) + "\""
+        None => "null"
+      }) +
+      "}}",
+    )
+  } else {
+    println(
+      "primary " +
+      primary +
+      " role=" +
+      pname +
+      " exists=" +
+      (if p_exists { "yes" } else { "no" }),
+    )
+    println(
+      "replica " +
+      replica +
+      " role=" +
+      rname +
+      " exists=" +
+      (if r_exists { "yes" } else { "no" }),
+    )
+  }
+}
+
+///|
+/// Rebalance after failover: mirror the promoted primary back onto the old
+/// primary directory (single-writer: the new primary wins), then mark the old
+/// directory as a standby so a later forward sync is still refused.
+fn cmd_ha_rebalance(
+  old_primary : String,
+  new_primary : String,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  if !@backend_native.file_exists(new_primary) {
+    raise @io.IoError::Invalid("new primary not found: " + new_primary)
+  }
+  // Mark the old directory as a standby first so replicate_pass accepts it as
+  // a target even if it carried a stale primary marker.
+  save_ha_state(old_primary, "standby", new_primary)
+  let n = replicate_pass(new_primary, old_primary)
+  if json {
+    println(
+      "{\"rebalanced\":true,\"target\":\"" +
+      json_escape_str(old_primary) +
+      "\",\"from\":\"" +
+      json_escape_str(new_primary) +
+      "\",\"segments\":" +
+      n.to_string() +
+      "}",
+    )
+  } else {
+    println(
+      "rebalanced " +
+      old_primary +
+      " from " +
+      new_primary +
+      " (" +
+      n.to_string() +
+      " segment(s))",
+    )
+    println("old primary is now a standby; new primary remains authoritative")
+  }
+}
+
+///|
+/// Watch the primary and promote the replica when the primary directory has
+/// been unreachable for `fail_threshold` consecutive probes. Intended to run
+/// under a supervisor; exits after a promotion so a restart cannot silently
+/// re-promote.
+fn cmd_ha_watch(
+  primary : String,
+  replica : String,
+  active : String,
+  interval : Int32,
+  fail_threshold : Int32,
+  json : Bool,
+  once : Bool,
+) -> Unit raise @io.IoError {
+  let mut fails : Int32 = 0
+  while true {
+    if @backend_native.file_exists(primary) {
+      fails = 0
+    } else {
+      fails = fails + 1
+    }
+    if fails >= fail_threshold {
+      cmd_ha_failover(primary, replica, Some(active), json)
+      println("ha-watch: primary unreachable, failover complete")
+      return
+    }
+    if once {
+      return
+    }
+    @backend_native.sleep_ms(interval)
+  }
+}
+
+///|
 fn cmd_replicate(
   src : String,
   dst : String,
@@ -9568,6 +9844,74 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_ttl_expire(args[2], dry, json)
+    }
+  } else if cmd == "ha-failover" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      let mut active : String? = (None : String?)
+      let mut json = false
+      let mut i = 4
+      while i < args.length() {
+        if args[i] == "--active" && i + 1 < args.length() {
+          active = Some(args[i + 1])
+          i = i + 1
+        } else if args[i] == "--json" {
+          json = true
+        }
+        i = i + 1
+      }
+      cmd_ha_failover(args[2], args[3], active, json)
+    }
+  } else if cmd == "ha-status" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_ha_status(args[2], args[3], args.length() > 4 && args[4] == "--json")
+    }
+  } else if cmd == "ha-rebalance" {
+    if args.length() < 4 {
+      println(USAGE)
+    } else {
+      cmd_ha_rebalance(
+        args[2],
+        args[3],
+        args.length() > 4 && args[4] == "--json",
+      )
+    }
+  } else if cmd == "ha-watch" {
+    if args.length() < 5 {
+      println(USAGE)
+    } else {
+      let mut active : String? = (None : String?)
+      let mut interval = 1000
+      let mut threshold = 3
+      let mut json = false
+      let mut once = false
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--active" && i + 1 < args.length() {
+          active = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--interval" && i + 1 < args.length() {
+          interval = @string.parse_int(args[i + 1]) catch { _ => 1000 }
+          i = i + 1
+        } else if a == "--fail-threshold" && i + 1 < args.length() {
+          threshold = @string.parse_int(args[i + 1]) catch { _ => 3 }
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        } else if a == "--once" {
+          once = true
+        }
+        i = i + 1
+      }
+      match active {
+        Some(link) =>
+          cmd_ha_watch(args[2], args[3], link, interval, threshold, json, once)
+        None => raise @io.IoError::Invalid("ha-watch requires --active <link>")
+      }
     }
   } else if cmd == "replicate" {
     if args.length() < 4 {

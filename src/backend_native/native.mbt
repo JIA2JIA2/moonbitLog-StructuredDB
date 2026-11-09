@@ -1410,6 +1410,24 @@ pub fn symlink(target : String, link_path : String) -> Bool {
 }
 
 ///|
+/// Atomically point `link_path` at `target`: create `link_path.tmp`, rename it
+/// over the existing link. A reader resolving the link sees either the old or
+/// the new target, never a missing link (used by `ha-failover --active`).
+pub fn replace_symlink(
+  target : String,
+  link_path : String,
+) -> Unit raise @io.IoError {
+  let tmp = link_path + ".tmp"
+  ignore(remove_file(tmp))
+  if !symlink(target, tmp) {
+    raise @io.IoError::Syscall(-1)
+  }
+  if !rename_file(tmp, link_path) {
+    raise @io.IoError::Syscall(-1)
+  }
+}
+
+///|
 /// Run a shell command and return its exit status (0 on success). The caller
 /// must shell-quote any user-provided arguments (see `@core.shell_quote`);
 /// used for webhook-style notification delivery.
