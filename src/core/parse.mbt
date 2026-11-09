@@ -288,6 +288,264 @@ pub fn sampling_allows(
 }
 
 ///|
+/// A compiled template placeholder. `<name>` captures up to the next literal
+/// (the original M115 behavior). `<name:pattern>` adds a restricted
+/// Grok-style field pattern: one character class plus an optional quantifier,
+/// e.g. `<status:\d+>`, `<msg:[^"]+>`, `<ws:\s*>`, `<path:\S+?>`.
+priv struct TemplateField {
+  name : Bytes
+  class : Bytes
+  min_len : Int32
+  max_len : Int32
+  greedy : Bool
+}
+
+///|
+/// Split a placeholder body into name and a parsed field pattern. A pattern
+/// with more than one token falls back to the default capture so the parser
+/// stays linear and predictable (no backtracking engine).
+fn template_field(body : Bytes) -> TemplateField {
+  let mut colon = -1
+  let mut i = 0
+  while i < body.length() {
+    if body.at(i).to_int() == 58 {
+      colon = i
+      break
+    }
+    i = i + 1
+  }
+  if colon < 0 {
+    return { name: body, class: b"", min_len: 0, max_len: -1, greedy: false, }
+  }
+  let name = slice(body, 0, colon)
+  let pat = slice(body, colon + 1, body.length())
+  let mut cls : Bytes = b""
+  let mut j = 0
+  if pat.length() == 0 {
+    ()
+  } else if pat.at(0).to_int() == 91 {
+    let mut k = 1
+    while k < pat.length() && pat.at(k).to_int() != 93 {
+      k = k + 1
+    }
+    if k < pat.length() {
+      cls = slice(pat, 0, k + 1)
+      j = k + 1
+    } else {
+      return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
+    }
+  } else if pat.at(0).to_int() == 92 {
+    if pat.length() < 2 {
+      return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
+    }
+    cls = slice(pat, 0, 2)
+    j = 2
+  } else {
+    cls = slice(pat, 0, 1)
+    j = 1
+  }
+  let mut min_len = 1
+  let mut max_len = 1
+  let mut greedy = true
+  if j < pat.length() {
+    let q = pat.at(j).to_int()
+    if q == 63 {
+      min_len = 0
+      j = j + 1
+    } else if q == 42 {
+      min_len = 0
+      max_len = -1
+      j = j + 1
+    } else if q == 43 {
+      max_len = -1
+      j = j + 1
+    }
+    if j < pat.length() && pat.at(j).to_int() == 63 {
+      greedy = false
+      j = j + 1
+    }
+  }
+  if j < pat.length() {
+    // Multi-token pattern: fall back to the default capture.
+    return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
+  }
+  { name, class: cls, min_len, max_len, greedy, }
+}
+
+///|
+/// Whether `c` belongs to a compiled character class (`\d`, `\w`, `\s`,
+/// `\S`, `.`, `[a-z]`, `[^...]`, or a single literal byte).
+fn template_class_matches(cls : Bytes, c : Int32) -> Bool {
+  if cls.length() == 0 {
+    return true
+  }
+  let first = cls.at(0).to_int()
+  if first == 46 {
+    return true
+  }
+  if first == 92 && cls.length() == 2 {
+    let k = cls.at(1).to_int()
+    if k == 100 {
+      return c >= 48 && c <= 57
+    }
+    if k == 119 {
+      return (c >= 48 && c <= 57) ||
+        (c >= 65 && c <= 90) ||
+        (c >= 97 && c <= 122) ||
+        c == 95
+    }
+    if k == 115 {
+      return c == 32 || c == 9 || c == 13
+    }
+    if k == 83 {
+      return !(c == 32 || c == 9 || c == 13)
+    }
+    return c == k
+  }
+  if first == 91 {
+    let mut neg = false
+    let mut i = 1
+    if cls.length() > 1 && cls.at(1).to_int() == 94 {
+      neg = true
+      i = 2
+    }
+    let mut hit = false
+    while i < cls.length() && cls.at(i).to_int() != 93 {
+      if cls.at(i).to_int() == 92 && i + 1 < cls.length() {
+        // Escaped shorthands are allowed inside a class (`[\d.]`, `[^\s]`).
+        let k = cls.at(i + 1).to_int()
+        if k == 100 {
+          if c >= 48 && c <= 57 {
+            hit = true
+          }
+        } else if k == 119 {
+          if (c >= 48 && c <= 57) ||
+            (c >= 65 && c <= 90) ||
+            (c >= 97 && c <= 122) ||
+            c == 95 {
+            hit = true
+          }
+        } else if k == 115 {
+          if c == 32 || c == 9 || c == 13 {
+            hit = true
+          }
+        } else if k == 83 {
+          if !(c == 32 || c == 9 || c == 13) {
+            hit = true
+          }
+        } else if c == k {
+          hit = true
+        }
+        i = i + 2
+      } else if i + 2 < cls.length() &&
+        cls.at(i + 1).to_int() == 45 &&
+        cls.at(i + 2).to_int() != 93 {
+        if c >= cls.at(i).to_int() && c <= cls.at(i + 2).to_int() {
+          hit = true
+        }
+        i = i + 3
+      } else {
+        if c == cls.at(i).to_int() {
+          hit = true
+        }
+        i = i + 1
+      }
+    }
+    return if neg { !hit } else { hit }
+  }
+  c == first
+}
+
+///|
+/// Match one placeholder at `pos`, given the literal that follows it (empty
+/// for a trailing placeholder). Returns the captured end position.
+fn template_capture_end(
+  line : Bytes,
+  pos : Int32,
+  field : TemplateField,
+  next_literal : Bytes,
+) -> Int32? {
+  if field.class.length() == 0 {
+    // Default placeholder: capture up to the first occurrence of the next
+    // literal, or to the end of the line when there is none.
+    if next_literal.length() == 0 {
+      return Some(line.length())
+    }
+    let n = next_literal.length()
+    let mut scan = pos
+    while scan + n <= line.length() {
+      let mut j = 0
+      let mut ok = true
+      while j < n && ok {
+        if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
+          ok = false
+        }
+        j = j + 1
+      }
+      if ok {
+        return Some(scan)
+      }
+      scan = scan + 1
+    }
+    return None
+  }
+  // Pattern capture: consume the class greedily, then honour the quantifier
+  // and the following literal (greedy searches the literal right-to-left).
+  let mut e = pos
+  while e < line.length() &&
+        template_class_matches(field.class, line.at(e).to_int()) {
+    e = e + 1
+    if field.max_len >= 0 && e - pos >= field.max_len {
+      break
+    }
+  }
+  let min_end = pos + field.min_len
+  if e < min_end {
+    return None
+  }
+  if next_literal.length() == 0 {
+    return Some(if field.greedy { e } else { min_end })
+  }
+  let n = next_literal.length()
+  if field.greedy {
+    let mut scan = e
+    while scan >= min_end {
+      if scan + n <= line.length() {
+        let mut j = 0
+        let mut ok = true
+        while j < n && ok {
+          if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
+            ok = false
+          }
+          j = j + 1
+        }
+        if ok {
+          return Some(scan)
+        }
+      }
+      scan = scan - 1
+    }
+  } else {
+    let mut scan = min_end
+    while scan <= e && scan + n <= line.length() {
+      let mut j = 0
+      let mut ok = true
+      while j < n && ok {
+        if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
+          ok = false
+        }
+        j = j + 1
+      }
+      if ok {
+        return Some(scan)
+      }
+      scan = scan + 1
+    }
+  }
+  None
+}
+
+///|
 /// Tokenize a template into literal and placeholder (`<name>`) segments.
 fn template_segments(template : Bytes) -> Array[(Bool, Bytes)] {
   let out : Array[(Bool, Bytes)] = []
@@ -317,11 +575,13 @@ fn template_segments(template : Bytes) -> Array[(Bool, Bytes)] {
 }
 
 ///|
-/// Parse a raw line against a template of literal text and `<name>`
-/// placeholders (a lightweight, regex-free Grok equivalent): each placeholder
-/// captures up to the next literal token, and the last placeholder captures to
-/// the end of the line. Returns the extracted `name=value` pairs, or None when
-/// a literal in the template does not match the line at the expected position.
+/// Parse a raw line against a template of literal text and placeholders
+/// (a lightweight, regex-free Grok equivalent). `<name>` captures up to the
+/// next literal token (the last placeholder captures to end of line);
+/// `<name:pattern>` adds a restricted pattern over one character class and
+/// quantifier, e.g. `<status:\d+>`, `<msg:[^"]+>`, `<ws:\s*>`, `<path:\S+?>`.
+/// Returns the extracted `name=value` pairs, or None when a literal or
+/// pattern does not match the line at the expected position.
 pub fn parse_by_template(
   line : Bytes,
   template : Bytes,
@@ -347,34 +607,19 @@ pub fn parse_by_template(
       }
       pos = pos + n
     } else {
-      let mut end = line.length()
-      if i + 1 < segments.length() {
-        // Next literal: capture up to its first occurrence at/after pos.
-        let next = segments[i + 1].1
-        let n = next.length()
-        let mut found = -1
-        let mut scan = pos
-        while scan + n <= line.length() && found < 0 {
-          let mut j = 0
-          let mut ok = true
-          while j < n && ok {
-            if line.at(scan + j).to_int() != next.at(j).to_int() {
-              ok = false
-            }
-            j = j + 1
-          }
-          if ok {
-            found = scan
-          }
-          scan = scan + 1
-        }
-        if found < 0 {
-          return None
-        }
-        end = found
+      let field = template_field(text)
+      let next_literal = if i + 1 < segments.length() && !segments[i + 1].0 {
+        segments[i + 1].1
+      } else {
+        b""
       }
-      out.push((text, slice(line, pos, end)))
-      pos = end
+      match template_capture_end(line, pos, field, next_literal) {
+        Some(end) => {
+          out.push((field.name, slice(line, pos, end)))
+          pos = end
+        }
+        None => return None
+      }
     }
     i = i + 1
   }
@@ -382,11 +627,41 @@ pub fn parse_by_template(
 }
 
 ///|
-/// Flatten a top-level JSON object into `name=value` field pairs (the same
-/// Bytes model as the kv ingest format). Non-object JSON yields an empty
+/// Recursively flatten a JSON value: nested objects become dotted field names
+/// (`a.b.c`), arrays serialize as compact JSON, scalars render as text.
+fn flatten_json_value(
+  prefix : String,
+  value : Json,
+  out : Array[(Bytes, Bytes)],
+) -> Unit {
+  match value {
+    Object(map) =>
+      for name, v in map {
+        let key = if prefix.length() == 0 { name } else { prefix + "." + name }
+        flatten_json_value(key, v, out)
+      }
+    _ => {
+      let text = match value {
+        String(s) => s
+        Number(n, ..) => n.to_string()
+        True => "true"
+        False => "false"
+        Null => "null"
+        _ => value.stringify()
+      }
+      out.push((@utf8.encode(prefix), @utf8.encode(text)))
+    }
+  }
+}
+
+///|
+/// Flatten a JSON object into `name=value` field pairs (the same Bytes model
+/// as the kv ingest format). Nested objects are flattened with dotted names
+/// (`request.user_id`), so structured logs keep nested fields addressable;
+/// arrays serialize as compact JSON text. Non-object JSON yields an empty
 /// array; malformed JSON raises ParseError (the caller decides whether to
 /// keep the raw line). String values are kept verbatim; numbers, booleans and
-/// null render as text; nested arrays/objects serialize as compact JSON.
+/// null render as text.
 pub fn json_object_fields(
   line : Bytes,
 ) -> Array[(Bytes, Bytes)] raise @json.ParseError {
@@ -394,18 +669,7 @@ pub fn json_object_fields(
   let parsed = @json.parse(text)
   let out : Array[(Bytes, Bytes)] = []
   match parsed {
-    Object(map) =>
-      for name, value in map {
-        let v = match value {
-          String(s) => s
-          Number(n, ..) => n.to_string()
-          True => "true"
-          False => "false"
-          Null => "null"
-          _ => value.stringify()
-        }
-        out.push((@utf8.encode(name), @utf8.encode(v)))
-      }
+    Object(_) => flatten_json_value("", parsed, out)
     _ => ()
   }
   out

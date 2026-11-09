@@ -104,6 +104,13 @@
 ///                                    wedge the serial accept loop; a short
 ///                                    body is rejected with 400 instead of
 ///                                    persisting a truncated line)
+///   parse-check <file> [--format lines|kv|json|template] [--template <tpl>]
+///               [--sample N] [--json]
+///                                    parse a sample log file with the same
+///                                    extractors as ingest and report per-line
+///                                    fields plus accuracy (parsed / lines);
+///                                    read-only, useful to validate a template
+///                                    or JSON shape before wiring a source
 ///   bench-write <dir> <count> [--batch N] [--sync always|batch|never]
 ///                [--prefix <p>] [--warmup N]
 ///                                    bulk-write benchmark: report the
@@ -237,7 +244,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.3"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -914,6 +921,167 @@ fn cmd_partitions(
 /// including per-segment and total compression sizes (`bytes` is the logical
 /// record size, `disk` what the segment occupies on disk). With a second
 /// argument of `json`, emit the same information as JSON.
+
+///|
+/// Parse a sample file with the same field extractors used by ingest and
+/// report per-line extraction plus an accuracy summary. Read-only: use it to
+/// validate `--format json|kv|template` and a template before wiring a source.
+fn cmd_parse_check(
+  file : String,
+  format : String,
+  template : String?,
+  sample_n : Int32,
+  as_json : Bool,
+) -> Unit raise @io.IoError {
+  if format != "lines" &&
+    format != "kv" &&
+    format != "json" &&
+    format != "template" {
+    raise @io.IoError::Invalid(
+      "invalid format: " + format + " (lines|kv|json|template)",
+    )
+  }
+  let tpl = match template {
+    Some(s) => @utf8.encode(s)
+    None => b""
+  }
+  if format == "template" && tpl.length() == 0 {
+    raise @io.IoError::Invalid("template format requires --template")
+  }
+  if !@backend_native.file_exists(file) {
+    raise @io.IoError::Invalid("file not found: " + file)
+  }
+  let data = @backend_native.read_file(file)
+  let (rows, _) = split_complete_lines(data, true)
+  let mut parsed = 0
+  let mut failed = 0
+  let mut fields_total = 0
+  let mut empty_fields = 0
+  let samples : Array[String] = []
+  let json_samples : Array[String] = []
+  let mut i = 0
+  while i < rows.length() {
+    let line = rows[i]
+    let mut ok = true
+    let mut fields : Array[(Bytes, Bytes)] = []
+    if format == "json" {
+      let maybe : Array[(Bytes, Bytes)]? = Some(@core.json_object_fields(line)) catch {
+        _ => None
+      }
+      match maybe {
+        Some(f) => fields = f
+        None => ok = false
+      }
+    } else if format == "template" {
+      match @core.parse_by_template(line, tpl) {
+        Some(f) => fields = f
+        None => ok = false
+      }
+    } else if format == "kv" {
+      fields = @core.parse_kv_pairs(line)
+    }
+    if ok {
+      parsed = parsed + 1
+    } else {
+      failed = failed + 1
+    }
+    fields_total = fields_total + fields.length()
+    for pair in fields {
+      if pair.1.length() == 0 {
+        empty_fields = empty_fields + 1
+      }
+    }
+    if samples.length() < sample_n {
+      let mut text = "line " + (i + 1).to_string() + ": "
+      if !ok {
+        text = text + "<unparsed>"
+      } else if fields.length() == 0 {
+        text = text + "<no fields>"
+      } else {
+        let mut first = true
+        for pair in fields {
+          if !first {
+            text = text + " "
+          }
+          first = false
+          text = text +
+            (@utf8.decode(pair.0) catch { _ => "" }) +
+            "=" +
+            (@utf8.decode(pair.1) catch { _ => "" })
+        }
+      }
+      samples.push(text)
+      let mut js = "{\"line\":" +
+        (i + 1).to_string() +
+        ",\"ok\":" +
+        (if ok { "true" } else { "false" }) +
+        ",\"fields\":["
+      let mut first_field = true
+      for pair in fields {
+        if !first_field {
+          js = js + ","
+        }
+        first_field = false
+        js = js +
+          "[\"" +
+          json_escape_str(@utf8.decode(pair.0) catch { _ => "" }) +
+          "\",\"" +
+          json_escape_str(@utf8.decode(pair.1) catch { _ => "" }) +
+          "\"]"
+      }
+      js = js + "]}"
+      json_samples.push(js)
+    }
+    i = i + 1
+  }
+  let pct = if rows.length() == 0 { 100 } else { parsed * 100 / rows.length() }
+  if as_json {
+    let mut out = "{\"lines\":" +
+      rows.length().to_string() +
+      ",\"parsed\":" +
+      parsed.to_string() +
+      ",\"failed\":" +
+      failed.to_string() +
+      ",\"accuracy_pct\":" +
+      pct.to_string() +
+      ",\"fields\":" +
+      fields_total.to_string() +
+      ",\"empty_fields\":" +
+      empty_fields.to_string() +
+      ",\"samples\":["
+    let mut first = true
+    for s in json_samples {
+      if !first {
+        out = out + ","
+      }
+      first = false
+      out = out + s
+    }
+    out = out + "]}"
+    println(out)
+  } else {
+    println(
+      "parse-check: " +
+      rows.length().to_string() +
+      " lines, " +
+      parsed.to_string() +
+      " parsed (" +
+      pct.to_string() +
+      "%), " +
+      failed.to_string() +
+      " failed, " +
+      fields_total.to_string() +
+      " fields, " +
+      empty_fields.to_string() +
+      " empty",
+    )
+    for s in samples {
+      println(s)
+    }
+  }
+}
+
+///|
 fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -8490,6 +8658,35 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         backlog_alert,
         opts,
       )
+    }
+  } else if cmd == "parse-check" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut format = "json"
+      let mut template : String? = (None : String?)
+      let mut sample_n = 5
+      let mut as_json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--format" && i + 1 < args.length() {
+          format = args[i + 1]
+          i = i + 1
+        } else if a == "--template" && i + 1 < args.length() {
+          template = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--sample" && i + 1 < args.length() {
+          sample_n = @string.parse_int(args[i + 1]) catch {
+            _ => raise @io.IoError::Invalid("invalid sample: " + args[i + 1])
+          }
+          i = i + 1
+        } else if a == "--json" {
+          as_json = true
+        }
+        i = i + 1
+      }
+      cmd_parse_check(args[2], format, template, sample_n, as_json)
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {

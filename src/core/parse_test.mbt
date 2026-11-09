@@ -203,3 +203,51 @@ test "json_object_fields flattens top-level object fields" {
   }
   assert_true(raised)
 }
+
+///|
+test "parse_by_template supports restricted grok patterns" {
+  let tpl = b"<ip:[\\d.]+> - <user:\\S+> [<ts:[0-9A-Za-z/:+ -]+>] \"<method:\\w+> <path:\\S+> <proto:\\S+>\" <status:\\d+> <size:\\d+>"
+  let line = b"127.0.0.1 - frank [10/Oct/2000:13:55:36 -0700] \"GET /a.gif HTTP/1.0\" 200 2326"
+  match @core.parse_by_template(line, tpl) {
+    Some(f) => {
+      assert_eq(f.length(), 8)
+      assert_eq(f[0], (b"ip", b"127.0.0.1"))
+      assert_eq(f[1], (b"user", b"frank"))
+      assert_eq(f[2], (b"ts", b"10/Oct/2000:13:55:36 -0700"))
+      assert_eq(f[3], (b"method", b"GET"))
+      assert_eq(f[4], (b"path", b"/a.gif"))
+      assert_eq(f[5], (b"proto", b"HTTP/1.0"))
+      assert_eq(f[6], (b"status", b"200"))
+      assert_eq(f[7], (b"size", b"2326"))
+    }
+    None => panic()
+  }
+}
+
+///|
+test "parse_by_template non-greedy pattern stops at the first literal" {
+  match @core.parse_by_template(b"a\"b\"", b"<msg:\\S+?>\"") {
+    Some(f) => assert_eq(f[0], (b"msg", b"a"))
+    None => panic()
+  }
+}
+
+///|
+test "json_object_fields flattens nested objects with dotted names" {
+  let fields = @core.json_object_fields(
+    b"{\"level\":\"error\",\"request\":{\"user_id\":\"u1\",\"path\":\"/x\"},\"code\":500}",
+  )
+  let mut found = 0
+  for pair in fields {
+    if pair.0 == b"request.user_id" && pair.1 == b"u1" {
+      found = found + 1
+    } else if pair.0 == b"request.path" && pair.1 == b"/x" {
+      found = found + 1
+    } else if pair.0 == b"level" && pair.1 == b"error" {
+      found = found + 1
+    } else if pair.0 == b"code" && pair.1 == b"500" {
+      found = found + 1
+    }
+  }
+  assert_eq(found, 4)
+}
