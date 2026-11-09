@@ -149,12 +149,15 @@
 ///                                    default window (--since 0 for everything,
 ///                                    --require-time rejects unbounded scans)
 ///   context <dir> <offset> [--before N] [--after N]
-///                                    [--trace-id <id|auto>] [--service <svc>]
+///                           [--trace-id <id|auto>] [--thread-id <id|auto>]
+///                           [--service <svc>] [--sort-by-time]
 ///                                    print the records around one offset; with
 ///                                    correlation options only records sharing
-///                                    the trace (auto = extracted from the
-///                                    anchor) or service are part of the
-///                                    context, skipping interleaved traffic
+///                                    the trace/thread (auto = extracted from
+///                                    the anchor, KV or JSON) and service are
+///                                    part of the context, skipping interleaved
+///                                    traffic; --sort-by-time orders the window
+///                                    by event time (ties keep offset order)
 ///   aggregate <dir> [--by key|value|kind|hour|prefix:N] [--kv-field <name>]
 ///                    [--match <text>] [--top N] [--json]
 ///                    [--quantile <field>]
@@ -558,6 +561,94 @@ fn print_json_record(rec : @core.Record) -> Unit {
     json_escape_str(bytes_to_string(rec.value)) +
     "\"}",
   )
+}
+
+///|
+fn ctx_is_sep(c : Int32) -> Bool {
+  c == 46 || c == 45 || c == 95 || c == 64
+}
+
+///|
+/// ASCII case-insensitive byte equality for correlation identifiers.
+fn ctx_bytes_eq_ci(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    let ca = a.at(i).to_int()
+    let cb = b.at(i).to_int()
+    let la = if ca >= 65 && ca <= 90 { ca + 32 } else { ca }
+    let lb = if cb >= 65 && cb <= 90 { cb + 32 } else { cb }
+    if la != lb {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Compare field names after ASCII lowercasing and dropping `.`, `-`, `_` and
+/// `@`, so `trace_id`, `traceId` and `trace.id` are equivalent (same
+/// normalization as the unified schema, 2.2).
+fn ctx_name_eq(a : Bytes, b : Bytes) -> Bool {
+  let mut ia = 0
+  let mut ib = 0
+  while true {
+    while ia < a.length() && ctx_is_sep(a.at(ia).to_int()) {
+      ia = ia + 1
+    }
+    while ib < b.length() && ctx_is_sep(b.at(ib).to_int()) {
+      ib = ib + 1
+    }
+    if ia >= a.length() || ib >= b.length() {
+      return ia >= a.length() && ib >= b.length()
+    }
+    let ca = a.at(ia).to_int()
+    let cb = b.at(ib).to_int()
+    let la = if ca >= 65 && ca <= 90 { ca + 32 } else { ca }
+    let lb = if cb >= 65 && cb <= 90 { cb + 32 } else { cb }
+    if la != lb {
+      return false
+    }
+    ia = ia + 1
+    ib = ib + 1
+  }
+  false
+}
+
+///|
+/// Parse a record value into field pairs: JSON objects are flattened (2.1),
+/// anything else uses the kv parser.
+fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
+  if value.length() > 0 && value.at(0).to_int() == 123 {
+    return @core.json_object_fields(value) catch { _ => [] }
+  }
+  @core.parse_kv_pairs(value)
+}
+
+///|
+fn ctx_field_from_pairs(
+  fields : Array[(Bytes, Bytes)],
+  names : Array[Bytes],
+) -> Bytes? {
+  for pair in fields {
+    for name in names {
+      if ctx_name_eq(pair.0, name) {
+        return Some(pair.1)
+      }
+    }
+  }
+  None
+}
+
+///|
+/// Extract the first matching correlation field from a record value. KV pairs
+/// are scanned first; JSON-object values are flattened (2.1) only then, so
+/// `{"trace_id":"t9"}` works for `--trace-id auto` without a schema.
+fn ctx_field_value(value : Bytes, names : Array[Bytes]) -> Bytes? {
+  ctx_field_from_pairs(ctx_value_fields(value), names)
 }
 
 ///|
@@ -5874,6 +5965,8 @@ fn cmd_context(
   after : String?,
   trace_id : String?,
   service : String?,
+  thread_id : String?,
+  sort_by_time : Bool,
 ) -> Unit raise @io.IoError {
   let target = parse_offset(offset)
   let b = match before {
@@ -5895,22 +5988,41 @@ fn cmd_context(
     if target >= log.next_offset() {
       raise @io.IoError::Invalid("offset out of range: " + offset)
     }
-    // Correlation predicate (4.4): explicit values, or `--trace-id auto`
-    // extracted from the anchor record's own trace_id field.
+    // Correlation predicates (4.4): explicit values, or `auto` extracted from
+    // the anchor record (KV or JSON, with field-name normalization).
+    let trace_auto = match trace_id {
+      Some(t) => t == "auto"
+      None => false
+    }
+    let thread_auto = match thread_id {
+      Some(t) => t == "auto"
+      None => false
+    }
+    let mut anchor_value : Bytes? = None
+    if trace_auto || thread_auto {
+      let anchor = log.get(target) catch { _ => None }
+      match anchor {
+        Some(rec) => anchor_value = Some(rec.value)
+        None => ()
+      }
+    }
     let trace_filter : Bytes? = match trace_id {
       Some(t) =>
         if t == "auto" {
-          let anchor = log.get(target) catch { _ => None }
-          match anchor {
-            Some(rec) => {
-              let mut tv : Bytes? = None
-              for pair in @core.parse_kv_pairs(rec.value) {
-                if pair.0 == b"trace_id" {
-                  tv = Some(pair.1)
-                }
-              }
-              tv
-            }
+          match anchor_value {
+            Some(v) => ctx_field_value(v, [b"trace_id", b"trace"])
+            None => None
+          }
+        } else {
+          Some(@utf8.encode(t))
+        }
+      None => None
+    }
+    let thread_filter : Bytes? = match thread_id {
+      Some(t) =>
+        if t == "auto" {
+          match anchor_value {
+            Some(v) => ctx_field_value(v, [b"thread_id", b"thread"])
             None => None
           }
         } else {
@@ -5925,42 +6037,38 @@ fn cmd_context(
     let correlating = match trace_filter {
       Some(_) => true
       None =>
-        match service_filter {
+        match thread_filter {
           Some(_) => true
-          None => false
+          None =>
+            match service_filter {
+              Some(_) => true
+              None => false
+            }
         }
     }
     let before_n = b
     let after_n = a
     let ring : Array[@core.Record] = []
     let mut out_after = 0
-    let mut printed = 0
+    let window : Array[@core.Record] = []
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
       if rec.offset == target {
         for r in ring {
-          print_record(r)
-          printed = printed + 1
+          window.push(r)
         }
-        print_record(rec)
-        printed = printed + 1
+        window.push(rec)
         return true
       }
       let mut m = true
       if correlating {
-        let mut rtv : Bytes? = None
-        let mut rsv : Bytes? = None
-        for pair in @core.parse_kv_pairs(rec.value) {
-          if pair.0 == b"trace_id" {
-            rtv = Some(pair.1)
-          }
-          if pair.0 == b"service" {
-            rsv = Some(pair.1)
-          }
-        }
+        let fields = ctx_value_fields(rec.value)
+        let rtv = ctx_field_from_pairs(fields, [b"trace_id", b"trace"])
+        let rsv = ctx_field_from_pairs(fields, [b"service"])
+        let rth = ctx_field_from_pairs(fields, [b"thread_id", b"thread"])
         match trace_filter {
           Some(tv) =>
             match rtv {
-              Some(v) => if v != tv { m = false }
+              Some(v) => if !ctx_bytes_eq_ci(v, tv) { m = false }
               None => m = false
             }
           None => ()
@@ -5968,12 +6076,22 @@ fn cmd_context(
         if m {
           match service_filter {
             Some(sv) =>
-              if rec.key != sv &&
+              if !ctx_bytes_eq_ci(rec.key, sv) &&
                 (match rsv {
-                  Some(v) => v != sv
+                  Some(v) => !ctx_bytes_eq_ci(v, sv)
                   None => true
                 }) {
                 m = false
+              }
+            None => ()
+          }
+        }
+        if m {
+          match thread_filter {
+            Some(tv) =>
+              match rth {
+                Some(v) => if !ctx_bytes_eq_ci(v, tv) { m = false }
+                None => m = false
               }
             None => ()
           }
@@ -5988,10 +6106,9 @@ fn cmd_context(
           }
         }
       } else {
-        // After the anchor: print the first `after_n` matching records.
+        // After the anchor: collect the first `after_n` matching records.
         if m && out_after < after_n {
-          print_record(rec)
-          printed = printed + 1
+          window.push(rec)
           out_after = out_after + 1
         }
         if out_after >= after_n {
@@ -6000,7 +6117,28 @@ fn cmd_context(
       }
       true
     })
-    println("(" + printed.to_string() + " records)")
+    // Event-time order (4.4) for out-of-order delivery; ties keep offset order.
+    if sort_by_time {
+      window
+      .mut_view()
+      .sort_by(fn(x, y) {
+        if x.timestamp < y.timestamp {
+          -1
+        } else if x.timestamp > y.timestamp {
+          1
+        } else if x.offset < y.offset {
+          -1
+        } else if x.offset > y.offset {
+          1
+        } else {
+          0
+        }
+      })
+    }
+    for r in window {
+      print_record(r)
+    }
+    println("(" + window.length().to_string() + " records)")
     close_log(log)
   })
 }
@@ -9620,6 +9758,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut after : String? = (None : String?)
       let mut trace_id : String? = (None : String?)
       let mut service : String? = (None : String?)
+      let mut thread_id : String? = (None : String?)
+      let mut sort_by_time = false
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -9635,10 +9775,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--service" && i + 1 < args.length() {
           service = Some(args[i + 1])
           i = i + 1
+        } else if a == "--thread-id" && i + 1 < args.length() {
+          thread_id = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--sort-by-time" {
+          sort_by_time = true
         }
         i = i + 1
       }
-      cmd_context(args[2], args[3], before, after, trace_id, service)
+      cmd_context(
+        args[2],
+        args[3],
+        before,
+        after,
+        trace_id,
+        service,
+        thread_id,
+        sort_by_time,
+      )
     }
   } else if cmd == "aggregate" {
     if args.length() < 3 {
