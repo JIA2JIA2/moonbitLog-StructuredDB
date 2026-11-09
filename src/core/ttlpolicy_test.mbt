@@ -84,3 +84,25 @@ test "ttl policy rejects malformed lines and supports default-less files" {
     None => panic()
   }
 }
+
+///|
+test "ttl scope matching is case-insensitive for service and level" {
+  let p = @core.parse_ttl_policy(
+    b"service Orders 1\nlevel ERROR 2\nprefix t/ 3\n",
+  )
+  match p {
+    Some(policy) => {
+      // Service scope: record key `orders` still hits the `Orders` rule.
+      assert_eq(@core.ttl_days_of(policy, b"orders", None), 1L)
+      // Level scope: record level `error`/`Error` hits the `ERROR` rule.
+      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"error")), 2L)
+      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"Error")), 2L)
+      // Prefix scope stays byte-exact (tenant namespaces).
+      assert_eq(@core.ttl_days_of(policy, b"t/a", None), 3L)
+      assert_eq(@core.ttl_days_of(policy, b"T/a", None), -1L)
+    }
+    None => panic()
+  }
+  // `Level=` field names are case-insensitive too.
+  assert_eq(@core.ttl_record_level(b"Level=error msg=x"), Some(b"error"))
+}

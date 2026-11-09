@@ -114,6 +114,28 @@ fn bytes_has_prefix(data : Bytes, prefix : Bytes) -> Bool {
 }
 
 ///|
+/// ASCII case-insensitive byte equality for TTL scope matching: service and
+/// level identifiers are case-insensitive so `Service=Orders` / `Level=ERROR`
+/// still hit the configured rules; prefix scopes stay byte-exact.
+fn ttl_bytes_eq_ci(a : Bytes, b : Bytes) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    let ca = a.at(i).to_int()
+    let cb = b.at(i).to_int()
+    let la = if ca >= 65 && ca <= 90 { ca + 32 } else { ca }
+    let lb = if cb >= 65 && cb <= 90 { cb + 32 } else { cb }
+    if la != lb {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 /// Effective retention days for a record: the service scope matches the
 /// record key, the level scope matches the parsed `level` field and the
 /// prefix scope matches the key's leading bytes (tenant namespaces, 6.2);
@@ -126,10 +148,10 @@ pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
   for rule in policy.rules {
     let (scope, name, d) = rule
     let hit = if scope == b"service" {
-      key == name
+      ttl_bytes_eq_ci(key, name)
     } else if scope == b"level" {
       match level {
-        Some(l) => l == name
+        Some(l) => ttl_bytes_eq_ci(l, name)
         None => false
       }
     } else if scope == b"prefix" {
@@ -156,7 +178,7 @@ pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
 pub fn ttl_record_level(value : Bytes) -> Bytes? {
   let mut found : Bytes? = None
   for pair in parse_kv_pairs(value) {
-    if pair.0 == b"level" {
+    if ttl_bytes_eq_ci(pair.0, b"level") {
       found = Some(pair.1)
     }
   }

@@ -28,7 +28,8 @@
 ///   prune-before <dir> <timestamp>   drop segments last updated before a time
 ///   prune-expired <dir> <ttl>        drop segments last updated before now-ttl
 ///   prune-superseded <dir>           drop segments fully superseded by later records
-///   ttl-expire <dir> [--dry-run]     differentiated-TTL expiry per <dir>/TTL
+///   ttl-expire <dir> [--dry-run] [--json]
+///                                    differentiated-TTL expiry per <dir>/TTL
 ///                                    (default/service/level rules); applied
 ///                                    runs append to TTL_AUDIT.log
 ///   replicate <src> <dst> [--follow]
@@ -1448,11 +1449,15 @@ fn append_ttl_audit(
   policy_text : String,
   dropped : Int32,
   expired : Int32,
+  trigger : String,
 ) -> Unit {
   let path = ttl_audit_path(dir)
   let line = "{\"ts\":" +
     now_ms().to_string() +
     ",\"event\":\"ttl_expire\"" +
+    ",\"trigger\":\"" +
+    json_escape_str(trigger) +
+    "\"" +
     ",\"segments_dropped\":" +
     dropped.to_string() +
     ",\"records_expired\":" +
@@ -1486,11 +1491,23 @@ fn ttl_audit_path(dir : String) -> String {
 /// parsed level field; the stricter one wins, default otherwise) and drop
 /// segments whose records have all expired. `--dry-run` prints the plan
 /// without touching data; every applied run appends a JSONL event to
-/// `<dir>/TTL_AUDIT.log` so cleanup stays auditable.
-fn cmd_ttl_expire(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
+/// `<dir>/TTL_AUDIT` so cleanup stays auditable.
+fn cmd_ttl_expire(
+  dir : String,
+  dry_run : Bool,
+  json : Bool,
+) -> Unit raise @io.IoError {
   let ppath = dir + "/TTL"
   if !@backend_native.file_exists(ppath) {
-    println("no TTL policy file (" + ppath + ") — nothing to do")
+    if json {
+      println(
+        "{\"policy\":false,\"dry_run\":" +
+        (if dry_run { "true" } else { "false" }) +
+        ",\"segments_dropped\":0,\"records_expired\":0}",
+      )
+    } else {
+      println("no TTL policy file (" + ppath + ") — nothing to do")
+    }
     return
   }
   let raw = @backend_native.read_file(ppath)
@@ -1514,7 +1531,22 @@ fn cmd_ttl_expire(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
     )
     @backend_native.flush_meta(dir, log)
     close_log(log)
-    if dry_run {
+    if !dry_run {
+      append_ttl_audit(dir, @utf8.decode_lossy(raw), dropped, expired, "cli")
+    }
+    if json {
+      println(
+        "{\"policy\":true,\"dry_run\":" +
+        (if dry_run { "true" } else { "false" }) +
+        ",\"segments_dropped\":" +
+        dropped.to_string() +
+        ",\"records_expired\":" +
+        expired.to_string() +
+        ",\"audited\":" +
+        (if dry_run { "false" } else { "true" }) +
+        "}",
+      )
+    } else if dry_run {
       println(
         "dry-run: would drop " +
         dropped.to_string() +
@@ -1523,7 +1555,6 @@ fn cmd_ttl_expire(dir : String, dry_run : Bool) -> Unit raise @io.IoError {
         " record(s) expired",
       )
     } else {
-      append_ttl_audit(dir, @utf8.decode_lossy(raw), dropped, expired)
       println(
         "dropped " +
         dropped.to_string() +
@@ -1636,7 +1667,13 @@ fn run_maintenance(
             @backend_native.remove_segment_files(dir, seg.base_offset)
             seg.writer.close()
           })
-          append_ttl_audit(dir, @utf8.decode_lossy(raw_policy), td, te)
+          append_ttl_audit(
+            dir,
+            @utf8.decode_lossy(raw_policy),
+            td,
+            te,
+            "maintain",
+          )
         }
         None => ()
       }
@@ -9520,14 +9557,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut dry = false
+      let mut json = false
       let mut i = 3
       while i < args.length() {
         if args[i] == "--dry-run" {
           dry = true
+        } else if args[i] == "--json" {
+          json = true
         }
         i = i + 1
       }
-      cmd_ttl_expire(args[2], dry)
+      cmd_ttl_expire(args[2], dry, json)
     }
   } else if cmd == "replicate" {
     if args.length() < 4 {
