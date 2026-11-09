@@ -143,6 +143,7 @@
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off] [--inverted] [--wildcard]
 ///                       [--since <ms>] [--until <ms>] [--require-time]
+///                       [--timeout <ms>]
 ///                                    full-text search over keys and/or values
 ///                                    (substring; --wildcard adds * and ?;
 ///                                    --inverted uses the ASCII term index for
@@ -150,7 +151,12 @@
 ///                                    take the exact substring path); without
 ///                                    --since the search is scoped to the
 ///                                    default window (--since 0 for everything,
-///                                    --require-time rejects unbounded scans)
+///                                    --require-time rejects unbounded scans);
+///                                    shares the 4.6 guards with query
+///                                    (concurrency slot, timeout, scan budget)
+///                                    and stops at MOONLOG_MAX_RESULTS (default
+///                                    1000) unless --limit is given
+///                                    (--limit -1 removes the cap)
 ///   context <dir> <offset> [--before N] [--after N]
 ///                           [--trace-id <id|auto>] [--thread-id <id|auto>]
 ///                           [--service <svc>] [--sort-by-time]
@@ -474,6 +480,31 @@ fn[T] run_locked(
   )
   let result = action()
   lock.release()
+  result
+}
+
+///|
+/// Open the log under a short shared lock, release the lock, then run the
+/// read action against the opened snapshot (4.6). Segments are append-only
+/// and the reader keeps its fds, so a scan no longer holds the directory
+/// lock: one slow query cannot stall ingestion. New records appended after
+/// the snapshot are simply outside this query's view (snapshot semantics);
+/// a concurrent compaction may unlink a segment file, but the open fd keeps
+/// the snapshot readable.
+fn[T] run_read_snapshot(
+  dir : String,
+  action : (CliLog) -> T raise @io.IoError,
+) -> T raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  let lock = @backend_native.DirLock::acquire_timeout(
+    dir,
+    false,
+    lock_timeout_ms(),
+  )
+  let log = open_log(dir)
+  lock.release()
+  let result = action(log)
+  close_log(log)
   result
 }
 
@@ -5088,6 +5119,11 @@ fn match_needle(hay : Bytes, needle : Bytes, ignore_case : Bool) -> Bool {
 /// `--wildcard` switches the linear path to wildcard semantics: `*` matches
 /// any byte sequence, `?` exactly one byte (byte-level — CJK patterns work
 /// with one `?` per UTF-8 byte); mutually exclusive with `--inverted`.
+/// Query protection (4.6): search takes the same concurrency slot, timeout
+/// and scan budget as `query` (segment-level checks plus every-512-record
+/// sampling; `--timeout <ms>` overrides the env default), and stops at
+/// `MOONLOG_MAX_RESULTS` (default 1000) when `--limit` is absent — the
+/// summary says when the cap stopped the scan, and `--limit -1` removes it.
 fn cmd_search(
   dir : String,
   text : String,
@@ -5101,6 +5137,7 @@ fn cmd_search(
   since : String?,
   until : String?,
   require_time : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   if inverted && wildcard {
     raise @io.IoError::Invalid(
@@ -5168,12 +5205,29 @@ fn cmd_search(
       @string.parse_int(s) catch {
         _ => raise @io.IoError::Invalid("invalid limit: " + s)
       }
-    None => -1
+    None => default_max_results()
+  }
+  // 4.6 query protection: search is a retrieval entry point too, so it takes
+  // the same concurrency slot, timeout and scan budget as `query`. Without
+  // this, a large `search` (linear or inverted) bypasses every guard.
+  acquire_query_slot(dir)
+  let timeout_val : Int64 = match timeout {
+    Some(t) =>
+      @string.parse_int64(t) catch {
+        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
+      }
+    None => query_timeout_ms()
+  }
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: timeout_val,
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
   }
   if inverted && !refine {
     let toks = @segment.tokenize(@utf8.encode(text), 16)
-    run_locked(dir, false, () => {
-      let log = open_log(dir)
+    run_read_snapshot(dir, log => {
       let lo = match from {
         Some(s) => parse_offset(s)
         None => (0 : UInt64)
@@ -5184,10 +5238,16 @@ fn cmd_search(
       }
       let mut hits = 0
       let mut stop = false
+      let mut truncated = false
+      let mut abort_msg : String? = None
       for seg in log.segments {
         if stop {
           break
         }
+        if abort_msg is Some(_) {
+          break
+        }
+        qg.check(seg.size)
         seg.ensure_inv_index()
         if !@backend_native.has_segment_inv(dir, seg.base_offset) {
           match seg.inv_index {
@@ -5223,8 +5283,20 @@ fn cmd_search(
             0
           }
         })
+        let mut seen_cands = 0
         for off in cands {
+          seen_cands = seen_cands + 1
+          if seen_cands % 512 == 0 {
+            match qg.check_soft(0) {
+              Some(m) => abort_msg = Some(m)
+              None => ()
+            }
+          }
+          if abort_msg is Some(_) {
+            break
+          }
           if max_hits >= 0 && hits >= max_hits {
+            truncated = true
             stop = true
             break
           }
@@ -5249,13 +5321,15 @@ fn cmd_search(
           }
         }
       }
-      println("(" + hits.to_string() + " matches) (inverted)")
-      close_log(log)
+      match abort_msg {
+        Some(m) => raise @io.IoError::Invalid(m)
+        None => ()
+      }
+      println(matches_summary(hits, truncated, max_hits) + " (inverted)")
     })
     return
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  run_read_snapshot(dir, log => {
     let lo = match from {
       Some(s) => parse_offset(s)
       None => (0 : UInt64)
@@ -5265,7 +5339,30 @@ fn cmd_search(
       None => log.next_offset()
     }
     let mut hits = 0
+    let mut truncated = false
+    let mut seen = 0
+    let mut abort_msg : String? = None
+    // Segment-level scan budget: account the [lo, hi) segments before the
+    // stream starts, so an oversized query is rejected before doing work.
+    for seg in log.segments {
+      if seg.next_offset <= lo || seg.base_offset >= hi {
+        continue
+      }
+      qg.check(seg.size)
+    }
     log.for_each_while(lo, hi, rec => {
+      seen = seen + 1
+      // Record-granularity timeout sampling (4.6): segment-level checks alone
+      // miss a runaway scan inside one huge segment.
+      if seen % 512 == 0 {
+        match qg.check_soft(0) {
+          Some(m) => abort_msg = Some(m)
+          None => ()
+        }
+      }
+      if abort_msg is Some(_) {
+        return false
+      }
       let hit = if wildcard {
         if field == "key" {
           @core.wildcard_contains(rec.key, needle, ignore_case)
@@ -5295,11 +5392,18 @@ fn cmd_search(
       if hit && in_time {
         print_record(rec)
         hits = hits + 1
+        if max_hits >= 0 && hits >= max_hits {
+          truncated = true
+          return false
+        }
       }
-      max_hits < 0 || hits < max_hits
+      true
     })
-    println("(" + hits.to_string() + " matches)")
-    close_log(log)
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
+    println(matches_summary(hits, truncated, max_hits))
   })
 }
 
@@ -5333,6 +5437,41 @@ fn max_scan_bytes() -> Int64 {
   match @env.get_env_var("MOONLOG_MAX_SCAN_BYTES") {
     Some(v) => @string.parse_int64(v) catch { _ => 536870912 }
     None => 536870912
+  }
+}
+
+///|
+/// Default result-set cap (4.6): `query` and `search` stop after this many
+/// matches when no `--limit` is given, so a forgotten limit cannot dump an
+/// unbounded result set. `--limit -1` (or `MOONLOG_MAX_RESULTS=0`) removes
+/// the cap. Default 1000.
+fn default_max_results() -> Int32 {
+  match @env.get_env_var("MOONLOG_MAX_RESULTS") {
+    Some(v) => {
+      let n = @string.parse_int(v) catch { _ => 1000 }
+      if n <= 0 {
+        -1
+      } else {
+        n
+      }
+    }
+    None => 1000
+  }
+}
+
+///|
+/// Closing line for a query result set: counts matches and, when the cap
+/// stopped the scan, makes the truncation explicit so callers can retry with
+/// `--limit -1` (or a higher `MOONLOG_MAX_RESULTS`).
+fn matches_summary(hits : Int32, truncated : Bool, max_hits : Int32) -> String {
+  if truncated {
+    "(" +
+    hits.to_string() +
+    " matches, stopped at limit " +
+    max_hits.to_string() +
+    " (pass --limit -1 for all))"
+  } else {
+    "(" + hits.to_string() + " matches)"
   }
 }
 
@@ -5449,7 +5588,10 @@ fn query_window_ms() -> Int64 {
 /// the default window (last 24h, `MOONLOG_QUERY_WINDOW_MS`) instead of
 /// scanning unbounded; with `--require-time` such a query is rejected
 /// outright. `--since 0` is an explicit full scan and bypasses both.
-/// `--limit` stops early. With `--sort-by-time`, matches are collected and
+/// `--limit` stops early; without it the result set is capped at
+/// `MOONLOG_MAX_RESULTS` (default 1000, `--limit -1` removes the cap) and
+/// the summary marks the truncation. With `--sort-by-time`, matches are
+/// collected and
 /// printed ordered by event time (ties keep offset order) instead of the
 /// arrival (offset) order — the standard answer to out-of-order delivery.
 /// With `--indexed`, **every** equality/range condition is pushed down: each
@@ -5595,7 +5737,7 @@ fn cmd_query(
       @string.parse_int(s) catch {
         _ => raise @io.IoError::Invalid("invalid limit: " + s)
       }
-    None => -1
+    None => default_max_results()
   }
   // --indexed: the most selective given condition (equality or a level rank
   // range expanded over the five known levels) preselects candidates through
@@ -5669,10 +5811,10 @@ fn cmd_query(
     pushed = pushed + (@utf8.decode(f.0) catch { _ => "" })
   }
   if idx_filters.length() > 0 {
-    run_locked(dir, false, () => {
-      let log = open_log(dir)
+    run_read_snapshot(dir, log => {
       let mut hits = 0
       let mut stop = false
+      let mut truncated = false
       let mut abort_msg : String? = None
       let mut total_cands : Int64 = 0
       let mut skipped : Int32 = 0
@@ -5788,6 +5930,7 @@ fn cmd_query(
             break
           }
           if max_hits >= 0 && hits >= max_hits {
+            truncated = true
             stop = true
             break
           }
@@ -5880,16 +6023,15 @@ fn cmd_query(
           ")",
         )
       }
-      println("(" + hits.to_string() + " matches) (indexed)")
-      close_log(log)
+      println(matches_summary(hits, truncated, max_hits) + " (indexed)")
     })
     return
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  run_read_snapshot(dir, log => {
     let mut hits = 0
     let collected : Array[@core.Record] = []
     let mut stop = false
+    let mut truncated = false
     let mut abort_msg : String? = None
     for seg in log.segments {
       if stop {
@@ -5993,6 +6135,7 @@ fn cmd_query(
           }
           hits = hits + 1
           if max_hits >= 0 && hits >= max_hits {
+            truncated = true
             stop = true
           }
         }
@@ -6030,8 +6173,7 @@ fn cmd_query(
         }
       }
     }
-    println("(" + hits.to_string() + " matches)")
-    close_log(log)
+    println(matches_summary(hits, truncated, max_hits))
   })
 }
 
@@ -9695,6 +9837,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
       let mut require_time = false
+      let mut timeout : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -9724,6 +9867,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--require-time" {
           require_time = true
+        } else if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
@@ -9740,6 +9886,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         since,
         until,
         require_time,
+        timeout,
       )
     }
   } else if cmd == "query" {
