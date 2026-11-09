@@ -200,6 +200,14 @@
 ///                                    verify integrity; --fix repairs what it
 ///                                    can; --dry-run only prints the repair plan
 ///   stats <dir> [json]               print record/segment counts (optionally JSON)
+///   partitions <dir> [--unit day|hour] [--json]
+///                                    group segments by event-time partition
+///                                    bucket (segment count/records/bytes/UTC span)
+///   partition-policy <dir> [day|hour|off] [--json]
+///                                    show or persist the directory-level
+///                                    partition policy: write commands without
+///                                    --partition then roll partitions
+///                                    automatically (explicit flags override)
 ///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
 /// CLI invocation never observes a half-written directory.
@@ -253,7 +261,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.3"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -319,15 +327,65 @@ fn min_cursor_guard(dir : String) -> UInt64? {
 ///|
 
 ///|
-/// Partition unit in ms for `--partition day|hour` (0 = time partitioning off).
+/// Partition unit in ms for `--partition day|hour|off` (0 = time partitioning
+/// off).
 fn parse_partition(s : String) -> Int64 raise @io.IoError {
   if s == "day" {
     (86_400_000 : Int64)
   } else if s == "hour" {
     (3_600_000 : Int64)
+  } else if s == "off" {
+    (0 : Int64)
   } else {
-    raise @io.IoError::Invalid("invalid partition: " + s + " (day|hour)")
+    raise @io.IoError::Invalid("invalid partition: " + s + " (day|hour|off)")
   }
+}
+
+///|
+/// Directory-level partition policy `<dir>/PARTITION` (one line: day|hour|off).
+/// Persisting it lets every write command roll partitions without repeating
+/// `--partition`; an explicit flag still overrides it. A missing or malformed
+/// file means off (safe fallback, no data impact).
+const PARTITION_FILE : String = "PARTITION"
+
+///|
+fn partition_unit_name(ms : Int64) -> String {
+  if ms == (86_400_000 : Int64) {
+    "day"
+  } else if ms == (3_600_000 : Int64) {
+    "hour"
+  } else {
+    "off"
+  }
+}
+
+///|
+fn load_partition_policy(dir : String) -> Int64 {
+  let path = dir + "/" + PARTITION_FILE
+  if !@backend_native.file_exists(path) {
+    return (0 : Int64)
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  for line in lines {
+    let s = @utf8.decode_lossy(line).trim()
+    if s == "day" {
+      return (86_400_000 : Int64)
+    }
+    if s == "hour" {
+      return (3_600_000 : Int64)
+    }
+  }
+  (0 : Int64)
+}
+
+///|
+fn save_partition_policy(dir : String, unit : String) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  @backend_native.write_file(
+    dir + "/" + PARTITION_FILE,
+    @utf8.encode(unit + "\n"),
+  )
 }
 
 ///|
@@ -795,6 +853,36 @@ struct PartitionStat {
 /// prune-expired) drops whole segments, so with partitioned writes a bucket
 /// can be discarded as a unit; the prune only touches the dropped files and
 /// readers on the shared lock are never blocked by it.
+
+///|
+/// Show or set the directory-level partition policy (`PARTITION`). With no
+/// unit it prints the current policy; `day|hour|off` persists it so later
+/// write commands roll partitions without repeating `--partition`.
+fn cmd_partition_policy(
+  dir : String,
+  unit : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  match unit {
+    Some(u) => {
+      if u != "day" && u != "hour" && u != "off" {
+        raise @io.IoError::Invalid(
+          "invalid partition: " + u + " (day|hour|off)",
+        )
+      }
+      save_partition_policy(dir, u)
+    }
+    None => ()
+  }
+  let name = partition_unit_name(load_partition_policy(dir))
+  if json {
+    println("{\"partition\":\"" + name + "\"}")
+  } else {
+    println("partition: " + name + " (dir " + dir + ")")
+  }
+}
+
+///|
 fn cmd_partitions(
   dir : String,
   unit : String,
@@ -872,7 +960,13 @@ fn cmd_partitions(
     }
     if json {
       let out = StringBuilder()
-      out.write_string("{\"unit\":\"" + unit + "\",\"partitions\":[")
+      out.write_string(
+        "{\"unit\":\"" +
+        unit +
+        "\",\"policy\":\"" +
+        partition_unit_name(load_partition_policy(dir)) +
+        "\",\"partitions\":[",
+      )
       let mut first_p = true
       for pair in parts {
         let (b, p) = pair
@@ -918,7 +1012,13 @@ fn cmd_partitions(
         )
       }
       println(
-        "(" + parts.length().to_string() + " partitions, unit " + unit + ")",
+        "(" +
+        parts.length().to_string() +
+        " partitions, unit " +
+        unit +
+        ", policy " +
+        partition_unit_name(load_partition_policy(dir)) +
+        ")",
       )
     }
     close_log(log)
@@ -2005,7 +2105,8 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name.has_suffix(".log.inv") ||
       name == "RBAC" ||
       name == "TTL" ||
-      name == "QUOTA" {
+      name == "QUOTA" ||
+      name == "PARTITION" {
       out.push(name)
     }
   }
@@ -2545,7 +2646,7 @@ fn remove_tree(path : String) -> Unit {
 /// otherwise — a diverging policy would silently change retention or
 /// access behavior on the restored copy.
 fn drill_config_check(dir : String, rst : String) -> String {
-  let files = ["RBAC", "TTL", "QUOTA"]
+  let files = ["RBAC", "TTL", "QUOTA", "PARTITION"]
   let mut result = "absent"
   for f in files {
     let src_has = @backend_native.file_exists(dir + "/" + f)
@@ -8237,7 +8338,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       }
       let partition = match partition_str {
         Some(s) => parse_partition(s)
-        None => 0
+        None => load_partition_policy(args[2])
       }
       cmd_put(args[2], args[3], args[4], ts, idempotent, dedup_id, partition)
     }
@@ -8299,6 +8400,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   } else if cmd == "stats" {
     let json = args.length() > 3 && args[3] == "json"
     cmd_stats(args[2], json)
+  } else if cmd == "partition-policy" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut unit : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a == "day" || a == "hour" || a == "off" {
+          unit = Some(a)
+        }
+        i = i + 1
+      }
+      cmd_partition_policy(args[2], unit, json)
+    }
   } else if cmd == "partitions" {
     if args.length() < 3 {
       println(USAGE)
@@ -8568,7 +8687,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         partition_ms: match partition_str {
           Some(s) => parse_partition(s)
-          None => 0
+          None => load_partition_policy(args[2])
         },
         skip_quota: false,
         sync: desired_sync(),
@@ -8737,7 +8856,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         partition_ms: match partition_str {
           Some(s) => parse_partition(s)
-          None => 0
+          None => load_partition_policy(args[2])
         },
         // 6.2: the HTTP server accounts per-tenant write quota on accept.
         skip_quota: true,
