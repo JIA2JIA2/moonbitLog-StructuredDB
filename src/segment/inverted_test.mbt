@@ -179,3 +179,20 @@ test "inv sidecar front coding roundtrips shared-prefix keys" {
   assert_eq(decoded.fields.get(b"__key__=svc"), ix.fields.get(b"__key__=svc"))
   assert_true(raw.length() > 0)
 }
+
+///|
+test "tokenize emits UTF-8 character unigrams for CJK" {
+  let t = @segment.tokenize(b"数据库连接", 16)
+  assert_eq(t.length(), 5)
+  assert_eq(t[0], b"数")
+  assert_eq(t[1], b"据")
+  assert_eq(t[2], b"库")
+  assert_eq(t[3], b"连")
+  assert_eq(t[4], b"接")
+  // ASCII words are still tokenized as words alongside CJK characters.
+  assert_eq(@segment.tokenize(b"数据库 error 42", 16), [
+    b"数", b"据", b"库", b"error", b"42",
+  ])
+  // ASCII whitespace never produces a token.
+  assert_eq(@segment.tokenize(b"  ", 16).length(), 0)
+}

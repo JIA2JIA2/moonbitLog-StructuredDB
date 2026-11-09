@@ -138,9 +138,12 @@
 ///                                    optionally after N warm-up records,
 ///                                    then reopen and verify no record was lost
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
-///                       [--from off] [--to off]
-///                                    full-text search (linear scan) over keys
-///                                    and/or values
+///                       [--from off] [--to off] [--inverted] [--wildcard]
+///                                    full-text search over keys and/or values
+///                                    (substring; --wildcard adds * and ?;
+///                                    --inverted uses the ASCII term index for
+///                                    single tokens; phrases and CJK queries
+///                                    take the exact substring path)
 ///   context <dir> <offset> [--before N] [--after N]
 ///                                    [--trace-id <id|auto>] [--service <svc>]
 ///                                    print the records around one offset; with
@@ -4929,6 +4932,20 @@ fn cmd_search(
     raise @io.IoError::Invalid("invalid field: " + field + " (both|key|value)")
   }
   let needle = @utf8.encode(text)
+  // Phrase (spaces) and non-ASCII (CJK) queries need substring refinement:
+  // the term index ANDs tokens, which does not imply adjacency or order, and
+  // CJK unigram tokens only narrow candidates. Refine candidates by the
+  // original substring (same semantics as the linear path) and fall back to a
+  // linear scan when the index yields no candidates (e.g. an old sidecar).
+  let mut refine = false
+  let mut ri = 0
+  while ri < needle.length() {
+    let c = needle.at(ri).to_int()
+    if c == 32 || c >= 128 {
+      refine = true
+    }
+    ri = ri + 1
+  }
   let max_hits = match limit {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -4936,7 +4953,7 @@ fn cmd_search(
       }
     None => -1
   }
-  if inverted {
+  if inverted && !refine {
     let toks = @segment.tokenize(@utf8.encode(text), 16)
     run_locked(dir, false, () => {
       let log = open_log(dir)

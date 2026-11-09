@@ -14,7 +14,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 3
+const INV_VERSION : UInt32 = 4
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -51,6 +51,33 @@ pub fn tokenize(b : Bytes, max_terms : Int32) -> Array[Bytes] {
       cur = @buffer.Buffer::Buffer()
       if tok.length() >= 1 && tok.length() <= 32 && out.length() < max_terms {
         out.push(tok)
+      }
+      if c >= 128 {
+        // Non-ASCII (CJK etc.): index each UTF-8 character as a unigram token
+        // so Chinese queries hit the inverted index without a dictionary.
+        let mut clen = 1
+        if c >= 240 {
+          clen = 4
+        } else if c >= 224 {
+          clen = 3
+        } else if c >= 192 {
+          clen = 2
+        }
+        let end = if i + clen <= n { i + clen } else { n }
+        let mut ok = true
+        let mut k = i + 1
+        while k < end {
+          let cc = b.at(k).to_int()
+          if cc < 128 || cc > 191 {
+            ok = false
+            break
+          }
+          k = k + 1
+        }
+        if ok && end - i <= 32 && out.length() < max_terms {
+          out.push(@core.slice(b, i, end))
+        }
+        i = end - 1
       }
     }
     i = i + 1
