@@ -139,11 +139,15 @@
 ///                                    then reopen and verify no record was lost
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off] [--inverted] [--wildcard]
+///                       [--since <ms>] [--until <ms>] [--require-time]
 ///                                    full-text search over keys and/or values
 ///                                    (substring; --wildcard adds * and ?;
 ///                                    --inverted uses the ASCII term index for
 ///                                    single tokens; phrases and CJK queries
-///                                    take the exact substring path)
+///                                    take the exact substring path); without
+///                                    --since the search is scoped to the
+///                                    default window (--since 0 for everything,
+///                                    --require-time rejects unbounded scans)
 ///   context <dir> <offset> [--before N] [--after N]
 ///                                    [--trace-id <id|auto>] [--service <svc>]
 ///                                    print the records around one offset; with
@@ -4922,6 +4926,9 @@ fn cmd_search(
   to : String?,
   inverted : Bool,
   wildcard : Bool,
+  since : String?,
+  until : String?,
+  require_time : Bool,
 ) -> Unit raise @io.IoError {
   if inverted && wildcard {
     raise @io.IoError::Invalid(
@@ -4930,6 +4937,44 @@ fn cmd_search(
   }
   if field != "both" && field != "key" && field != "value" {
     raise @io.IoError::Invalid("invalid field: " + field + " (both|key|value)")
+  }
+  // Forced time range (4.3): searches without an explicit --since are scoped
+  // to the default window unless --since 0 is given; --require-time rejects
+  // unbounded scans outright. `--from/--to` remain offset bounds.
+  let mut since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  match since_ts {
+    Some(_) => ()
+    None =>
+      if require_time {
+        raise @io.IoError::Invalid(
+          "search requires --since (unbounded scans are disabled by --require-time); pass --since 0 to scan everything explicitly",
+        )
+      } else {
+        let win = query_window_ms()
+        println(
+          "INFO search scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+        since_ts = Some(now_ms() - win)
+      }
   }
   let needle = @utf8.encode(text)
   // Phrase (spaces) and non-ASCII (CJK) queries need substring refinement:
@@ -5014,8 +5059,19 @@ fn cmd_search(
           let rec = log.get(off) catch { _ => None }
           match rec {
             Some(r) => {
-              print_record(r)
-              hits = hits + 1
+              let mut in_time = true
+              match since_ts {
+                Some(t) => if r.timestamp < t { in_time = false }
+                None => ()
+              }
+              match until_ts {
+                Some(t) => if r.timestamp > t { in_time = false }
+                None => ()
+              }
+              if in_time {
+                print_record(r)
+                hits = hits + 1
+              }
             }
             None => ()
           }
@@ -5055,7 +5111,16 @@ fn cmd_search(
         match_needle(rec.key, needle, ignore_case) ||
         match_needle(rec.value, needle, ignore_case)
       }
-      if hit {
+      let mut in_time = true
+      match since_ts {
+        Some(t) => if rec.timestamp < t { in_time = false }
+        None => ()
+      }
+      match until_ts {
+        Some(t) => if rec.timestamp > t { in_time = false }
+        None => ()
+      }
+      if hit && in_time {
         print_record(rec)
         hits = hits + 1
       }
@@ -5281,11 +5346,13 @@ fn cmd_query(
         )
       } else {
         let win = query_window_ms()
-        println(
-          "INFO query scoped to the last " +
-          (win / (1000 : Int64)).to_string() +
-          "s (default window; pass --since to override, --since 0 for everything)",
-        )
+        if !json {
+          println(
+            "INFO query scoped to the last " +
+            (win / (1000 : Int64)).to_string() +
+            "s (default window; pass --since to override, --since 0 for everything)",
+          )
+        }
         Some(now_ms() - win)
       }
   }
@@ -9406,6 +9473,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut limit : String? = (None : String?)
       let mut from : String? = (None : String?)
       let mut to : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
+      let mut require_time = false
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -9427,6 +9497,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--to" && i + 1 < args.length() {
           to = Some(args[i + 1])
           i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--require-time" {
+          require_time = true
         }
         i = i + 1
       }
@@ -9440,6 +9518,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         to,
         inverted,
         wildcard,
+        since,
+        until,
+        require_time,
       )
     }
   } else if cmd == "query" {
