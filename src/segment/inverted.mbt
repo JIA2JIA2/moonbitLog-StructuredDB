@@ -14,7 +14,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 2
+const INV_VERSION : UInt32 = 3
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -209,24 +209,71 @@ fn inv_read_varint(
 }
 
 ///|
+/// Lexicographic byte compare for front-coded key ordering.
+fn inv_bytes_compare(a : Bytes, b : Bytes) -> Int32 {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n {
+    let ca = a.at(i).to_int()
+    let cb = b.at(i).to_int()
+    if ca < cb {
+      return -1
+    }
+    if ca > cb {
+      return 1
+    }
+    i = i + 1
+  }
+  if a.length() < b.length() {
+    -1
+  } else if a.length() > b.length() {
+    1
+  } else {
+    0
+  }
+}
+
+///|
+fn inv_shared_prefix(a : Bytes, b : Bytes) -> Int32 {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n && a.at(i).to_int() == b.at(i).to_int() {
+    i = i + 1
+  }
+  i
+}
+
+///|
 fn inv_encode_table(
   body : @buffer.Buffer,
   map : @hashmap.HashMap[Bytes, Array[Int32]],
 ) -> Unit {
-  body.write_uint_le(map.length().reinterpret_as_uint())
-  map.each(fn(k, arr) {
-    body.write_uint_le(k.length().reinterpret_as_uint())
-    body.write_bytes(k)
-    body.write_uint_le(arr.length().reinterpret_as_uint())
-    // Columnar compression (3.3): postings are strictly increasing record
-    // indices — store the deltas as varints (1-2 bytes vs a fixed 4-byte
-    // word), shrinking the sidecar and the IO it costs on load.
-    let mut prev : Int32 = 0
+  // Front coding (3.3 v3): entries are written in lexicographic key order and
+  // each key stores only its shared-prefix length plus the remaining suffix.
+  // Field columns like `trace_id=t12345` share long prefixes across entries,
+  // and terms like `evt-123` / `t123` share one as well, so this shrinks the
+  // sidecar noticeably versus repeating every key in full.
+  let entries : Array[(Bytes, Array[Int32])] = []
+  map.each(fn(k, arr) { entries.push((k, arr)) })
+  entries.mut_view().sort_by(fn(a, b) { inv_bytes_compare(a.0, b.0) })
+  body.write_uint_le(entries.length().reinterpret_as_uint())
+  let mut prev : Bytes = b""
+  for entry in entries {
+    let k = entry.0
+    let shared = inv_shared_prefix(prev, k)
+    inv_write_varint(body, shared)
+    let suffix = @core.slice(k, shared, k.length())
+    inv_write_varint(body, suffix.length())
+    body.write_bytes(suffix)
+    let arr = entry.1
+    inv_write_varint(body, arr.length())
+    let mut last : Int32 = 0
     for idx in arr {
-      inv_write_varint(body, idx - prev)
-      prev = idx
+      inv_write_varint(body, idx - last)
+      last = idx
     }
-  })
+    prev = k
+  }
 }
 
 ///|
@@ -253,35 +300,40 @@ fn inv_decode_table(
 ) -> (Int32, @hashmap.HashMap[Bytes, Array[Int32]]) raise @core.MetaError {
   let map : @hashmap.HashMap[Bytes, Array[Int32]] = @hashmap.HashMap::HashMap([])
   let count = meta_u32(data, pos).reinterpret_as_int()
+  if count < 0 {
+    raise @core.MetaError::Truncated(pos)
+  }
   let mut p = pos + 4
+  let mut prev : Bytes = b""
   let mut i = 0
   while i < count {
-    if p + 8 > body_end {
-      raise @core.MetaError::Truncated(p)
+    // Entry layout (matching inv_encode_table v3): shared prefix length,
+    // suffix length, suffix bytes, posting count, postings as varint deltas.
+    let (shared, p1) = inv_read_varint(data, p, body_end)
+    if shared < 0 || shared > prev.length() {
+      raise @core.MetaError::Truncated(p1)
     }
-    // Entry layout (matching inv_encode_table): klen, key bytes, posting
-    // count, then the postings as varint deltas of the strictly increasing
-    // record indices (3.3 columnar compression, sidecar format version 2).
-    let klen = meta_u32(data, p).reinterpret_as_int()
-    if klen < 0 {
-      raise @core.MetaError::Truncated(p)
+    let (slen, p2) = inv_read_varint(data, p1, body_end)
+    if p2 > body_end || slen < 0 || slen > body_end - p2 {
+      raise @core.MetaError::Truncated(p2)
     }
-    let pcount_at = p + 4 + klen
-    if pcount_at + 4 > body_end {
-      raise @core.MetaError::Truncated(p)
+    let suffix = @core.slice(data, p2, p2 + slen)
+    // Rebuild the front-coded key in one exactly-sized array (no Buffer
+    // growth); the zero-copy Bytes view becomes the hashmap key.
+    let key_bytes = FixedArray::make(shared + slen, b'\x00')
+    if shared > 0 {
+      key_bytes.blit_from_bytes(0, prev, 0, shared)
     }
-    let n = meta_u32(data, pcount_at).reinterpret_as_int()
+    key_bytes.blit_from_bytes(shared, suffix, 0, slen)
+    let key = key_bytes.unsafe_reinterpret_as_bytes()
+    let p3 = p2 + slen
+    let (n, p4) = inv_read_varint(data, p3, body_end)
     if n < 0 || n > INV_MAX_POSTINGS {
-      raise @core.MetaError::Truncated(p)
+      raise @core.MetaError::Truncated(p4)
     }
-    let kstart = p + 4
-    if kstart + klen > body_end {
-      raise @core.MetaError::Truncated(p)
-    }
-    let key = @core.slice(data, kstart, kstart + klen)
     let arr : Array[Int32] = []
     let mut cur : Int32 = 0
-    let mut dp = pcount_at + 4
+    let mut dp = p4
     let mut j = 0
     while j < n {
       let (d, np) = inv_read_varint(data, dp, body_end)
@@ -291,6 +343,7 @@ fn inv_decode_table(
       j = j + 1
     }
     map.set(key, arr)
+    prev = key
     p = dp
     i = i + 1
   }

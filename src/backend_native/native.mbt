@@ -816,7 +816,11 @@ fn load_segment_inv(
     }
     match decoded {
       Some(ix) => seg.inv_index = Some(ix)
-      None => ()
+      // A sidecar written by an older sidecar version (v2 before 3.3's front
+      // coding) or one failing CRC cannot be used. Drop it so the next
+      // indexed query rebuilds and persists the current format instead of
+      // rebuilding on every run.
+      None => ignore(remove_file(ip))
     }
   }
 }

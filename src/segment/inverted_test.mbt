@@ -145,3 +145,37 @@ test "inv sidecar uses columnar varint postings (3.3)" {
   assert_eq(decoded.terms.get(b"level"), ix.terms.get(b"level"))
   assert_eq(decoded.terms.get(b"info"), ix.terms.get(b"info"))
 }
+
+///|
+test "inv sidecar front coding roundtrips shared-prefix keys" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  let ids : Array[Bytes] = [b"t1", b"t2", b"t10", b"t11"]
+  for id in ids {
+    ignore(
+      seg.append(b"svc", b"trace_id=" + id + b" msg=ok", (1 : Int64)) catch {
+        _ => panic()
+      },
+    )
+  }
+  seg.build_inv_index()
+  let ix = match seg.inv_index {
+    Some(ix) => ix
+    None => panic()
+  }
+  let raw = ix.encode()
+  let decoded = @segment.decode_inv_index(raw) catch { _ => panic() }
+  for id in ids {
+    let field = b"trace_id=" + id
+    assert_eq(decoded.fields.get(field), ix.fields.get(field))
+    assert_eq(decoded.terms.get(id), ix.terms.get(id))
+  }
+  assert_eq(decoded.terms.get(b"msg"), ix.terms.get(b"msg"))
+  assert_eq(decoded.terms.get(b"trace"), ix.terms.get(b"trace"))
+  assert_eq(decoded.fields.get(b"__key__=svc"), ix.fields.get(b"__key__=svc"))
+  assert_true(raw.length() > 0)
+}
