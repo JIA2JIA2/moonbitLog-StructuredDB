@@ -1,12 +1,49 @@
 ///|
+/// True when `value[start, end)` begins with `prefix`.
+fn starts_at(value : Bytes, start : Int32, end : Int32, prefix : Bytes) -> Bool {
+  if start + prefix.length() > end {
+    return false
+  }
+  let mut k = 0
+  while k < prefix.length() {
+    if value.at(start + k).to_int() != prefix.at(k).to_int() {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///|
+/// True when `value[start, end)` ends with `suffix`.
+fn ends_at(value : Bytes, start : Int32, end : Int32, suffix : Bytes) -> Bool {
+  if end - start < suffix.length() {
+    return false
+  }
+  let mut k = 0
+  while k < suffix.length() {
+    if value.at(end - suffix.length() + k).to_int() != suffix.at(k).to_int() {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///|
 /// True when a log value looks like one line of a multi-line stack trace,
 /// so it can be merged into the cluster of the exception header that
 /// precedes it (5.2). Recognized shapes (after trimming):
-/// - Java frame: `at com.foo.Bar.m(Bar.java:12)` — "at " prefix plus a
-///   "(...:...)" parenthesized location;
+/// - Java / .NET / Node frame: `at com.foo.Bar.m(Bar.java:12)` — "at "
+///   prefix plus a "(...:...)" parenthesized location;
 /// - Python frame: `File "/app/x.py", line 42, in foo`;
-/// - exception-chain head: `Caused by: <anything>` — it continues the same
-///   stack cluster rather than opening a new one.
+/// - Rust frame: `at ./src/main.rs:12:5` (no parentheses), `   0:
+///   std::panicking::begin_panic`;
+/// - Go frame: `goroutine 1 [running]:`, `created by main.main`,
+///   `main.handler(0xc0000140a0)`, or a `.../x.go:12 +0x1d` line;
+/// - exception-chain lines: `Caused by: ...`, `Suppressed: ...`, and the
+///   JVM tail `... 23 more` — they continue the same cluster rather than
+///   opening a new one.
 pub fn is_stack_frame(value : Bytes) -> Bool {
   let n = value.length()
   // trim leading spaces/tabs
@@ -33,52 +70,60 @@ pub fn is_stack_frame(value : Bytes) -> Bool {
   if len < 4 {
     return false
   }
-  let at_i = i + 3
-  // Java frame: "at " prefix
-  if value.at(i).to_int() == 97 &&
-    value.at(i + 1).to_int() == 116 &&
-    value.at(i + 2).to_int() == 32 &&
-    len > 6 {
-    // requires a "(...:...)" location somewhere after the "at "
-    let mut has_paren = false
-    let mut has_colon = false
-    let mut j = at_i
-    while j < e {
-      let c = value.at(j).to_int()
-      if c == 40 {
-        has_paren = true
-      }
-      if c == 58 {
-        has_colon = true
-      }
-      j = j + 1
-    }
+  let part = slice(value, i, e)
+  // Java / .NET / Node frame: "at " with a "(...:...)" location.
+  if starts_at(value, i, e, b"at ") {
+    let has_paren = bytes_contains(part, b"(")
+    let has_colon = bytes_contains(part, b":")
     if has_paren && has_colon {
+      return true
+    }
+    // Rust backtrace location: "at ./src/main.rs:12:5" (no parentheses).
+    if has_colon && (bytes_contains(part, b"/") || bytes_contains(part, b".")) {
       return true
     }
   }
   // Python frame: File "..." prefix
-  if e - i > 6 &&
-    value.at(i).to_int() == 70 &&
-    value.at(i + 1).to_int() == 105 &&
-    value.at(i + 2).to_int() == 108 &&
-    value.at(i + 3).to_int() == 101 &&
-    value.at(i + 4).to_int() == 32 &&
-    value.at(i + 5).to_int() == 34 {
+  if starts_at(value, i, e, b"File \"") {
     return true
   }
-  // Exception chain: "Caused by: ..."
-  if len > 11 &&
-    value.at(i).to_int() == 67 &&
-    value.at(i + 1).to_int() == 97 &&
-    value.at(i + 2).to_int() == 117 &&
-    value.at(i + 3).to_int() == 115 &&
-    value.at(i + 4).to_int() == 101 &&
-    value.at(i + 5).to_int() == 100 &&
-    value.at(i + 6).to_int() == 32 &&
-    value.at(i + 7).to_int() == 98 &&
-    value.at(i + 8).to_int() == 121 &&
-    value.at(i + 9).to_int() == 58 {
+  // Exception chain: "Caused by: ..." and "Suppressed: ...".
+  if starts_at(value, i, e, b"Caused by: ") ||
+    starts_at(value, i, e, b"Suppressed: ") {
+    return true
+  }
+  // Go runtime backtrace.
+  if starts_at(value, i, e, b"goroutine ") && bytes_contains(part, b"[") {
+    return true
+  }
+  if starts_at(value, i, e, b"created by ") {
+    return true
+  }
+  if bytes_contains(part, b"+0x") && bytes_contains(part, b".go:") {
+    return true
+  }
+  if bytes_contains(part, b"(0x") {
+    return true
+  }
+  // Rust numbered frame: "   0: std::panicking::begin_panic".
+  let mut d = i
+  while d < e {
+    let c = value.at(d).to_int()
+    if c >= 48 && c <= 57 {
+      d = d + 1
+    } else {
+      break
+    }
+  }
+  if d > i &&
+    d + 2 <= e &&
+    value.at(d).to_int() == 58 &&
+    value.at(d + 1).to_int() == 32 &&
+    bytes_contains(slice(value, d + 2, e), b"::") {
+    return true
+  }
+  // JVM omitted-frames tail: "... 23 more".
+  if starts_at(value, i, e, b"... ") && ends_at(value, i, e, b" more") {
     return true
   }
   false

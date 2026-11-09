@@ -180,8 +180,20 @@
 ///                                    down to segment min_ts/max_ts; shares
 ///                                    the query slot/timeout/scan budget and
 ///                                    does not hold the writer lock
-///   cluster <dir> [--match <text>] [--top N]
-///                                    error clustering by normalized template
+///   cluster <dir> [--match <text>] [--top N] [--stacks] [--json]
+///               [--since <ts>] [--until <ts>]
+///                                    error clustering by normalized template;
+///                                    --stacks merges frame lines into the
+///                                    nearest matched header (frames are kept
+///                                    even when they do not match --match),
+///                                    recognizes Java/Python/.NET/Node/Rust/Go
+///                                    frames, and clusters JSON records by
+///                                    their embedded stack field; --json
+///                                    emits machine-readable clusters;
+///                                    default window is the last 24h
+///                                    (--since 0 for everything), pushed down
+///                                    to segments; shares the query guards and
+///                                    scans without the writer lock
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
 ///               [--since <ts>] [--until <ts>]
 ///                                    time-bucket histogram as text bars;
@@ -7485,11 +7497,75 @@ fn cmd_anomalies(
 /// content collapses into message shapes. `--match` (default "error") selects
 /// lines (ASCII case-insensitive, key or value; an empty string matches
 /// everything). `--top N` prints the N most frequent templates (default 20).
+/// With `--stacks`, stack-frame lines are merged into the nearest preceding
+/// matching header **regardless of `--match`** (frames rarely contain the
+/// needle, so the default filter used to drop them); a non-matching header
+/// closes the chain. JSON records with a `stack`/`stacktrace`/`exception`
+/// field are clustered by their normalized stack (so the same stack with
+/// different messages/ids collapses) and count their frame lines. Bounded by
+/// `--since`/`--until` (default last 24h, `--since 0` for everything) with
+/// segment pushdown; shares the 4.6 slot/guard and scans outside the writer
+/// lock. `--json` emits the clusters as machine-readable JSON.
+fn cluster_json_stack(value : Bytes) -> (Bytes, Int32, Bytes)? {
+  if value.length() == 0 || value.at(0).to_int() != 123 {
+    return None
+  }
+  let fields = @core.json_object_fields(value) catch { _ => return None }
+  let stack_names : Array[Bytes] = [
+    b"stack", b"stacktrace", b"exception", b"exceptionstacktrace", b"errorstack",
+    b"errstack",
+  ]
+  let mut msg : Bytes? = None
+  let mut stack : Bytes? = None
+  for pair in fields {
+    if msg is None && @core.canonical_field(pair.0) == 5 {
+      msg = Some(pair.1)
+    }
+    if stack is None {
+      for name in stack_names {
+        if ctx_name_eq(pair.0, name) {
+          stack = Some(pair.1)
+        }
+      }
+    }
+  }
+  match stack {
+    Some(s) => {
+      if s.length() == 0 {
+        return None
+      }
+      // Count frame lines; the exception-class header does not count.
+      let mut frames : Int32 = 0
+      let mut start = 0
+      let mut i = 0
+      while i <= s.length() {
+        if i == s.length() || s.at(i).to_int() == 10 {
+          if i > start && @core.is_stack_frame(@core.slice(s, start, i)) {
+            frames = frames + 1
+          }
+          start = i + 1
+        }
+        i = i + 1
+      }
+      let sample = match msg {
+        Some(m) => m
+        None => value
+      }
+      Some((@core.normalize_log_template(s), frames, sample))
+    }
+    None => None
+  }
+}
+
+///|
 fn cmd_cluster(
   dir : String,
   match_text : String?,
   top : String?,
   stacks : Bool,
+  json : Bool,
+  since : String?,
+  until : String?,
 ) -> Unit raise @io.IoError {
   let top_n = match top {
     Some(s) =>
@@ -7504,99 +7580,221 @@ fn cmd_cluster(
       None => "error"
     },
   )
-  if stacks {
-    // Stack-aware clustering (5.2): a stack-frame line (Java "at ...",
-    // Python "File ...", "Caused by: ...") is merged into the cluster of the
-    // nearest preceding non-frame record (its exception header), so the same
-    // exception raised with different ids/line numbers collapses into one
-    // cluster with a frame count. Orphan frames (no preceding header) fall
-    // back to their own template clusters.
-    run_locked(dir, false, () => {
-      let log = open_log(dir)
-      let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
-      let frames : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
-      let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
-      let mut current : Bytes? = None
-      log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-        let pass = match_needle(rec.key, needle, true) ||
-          match_needle(rec.value, needle, true)
-        if pass {
-          if @core.is_stack_frame(rec.value) {
-            match current {
-              Some(k) => bump_bytes(frames, k)
-              None =>
-                bump_bytes(counts, @core.normalize_log_template(rec.value))
-            }
-          } else {
-            let tpl = @core.normalize_log_template(rec.value)
-            bump_bytes(counts, tpl)
-            current = Some(tpl)
-            match samples.get(tpl) {
-              None => samples.set(tpl, rec.value)
-              Some(_) => ()
-            }
-          }
+  // Time scoping + guards (5.2): same window/pushdown/slot/guard template
+  // as query/search/aggregate; clustering scans outside the writer lock.
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => {
+      let win = query_window_ms()
+      if !json {
+        println(
+          "INFO cluster scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+      }
+      Some(now_ms() - win)
+    }
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  acquire_query_slot(dir)
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: query_timeout_ms(),
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+  let frames : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+  let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
+  run_read_snapshot(dir, log => {
+    let mut current : Bytes? = None
+    let mut abort_msg : String? = None
+    for seg in log.segments {
+      if abort_msg is Some(_) {
+        break
+      }
+      if seg.record_count > 0 {
+        match since_ts {
+          Some(t) => if seg.max_ts < t { continue }
+          None => ()
         }
-        true
-      })
-      let items : Array[(Bytes, Int32)] = []
-      for k in counts.keys() {
-        match counts.get(k) {
-          Some(c) => items.push((k, c))
+        match until_ts {
+          Some(t) => if seg.min_ts > t { continue }
           None => ()
         }
       }
-      let shown = top_counts(items, top_n)
-      println("count  frames  template  | sample")
-      for item in shown {
+      qg.check(seg.size)
+      let mut seen = 0
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        seen = seen + 1
+        if seen % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => abort_msg = Some(m)
+            None => ()
+          }
+        }
+        if abort_msg is Some(_) {
+          return
+        }
+        let mut in_time = true
+        match since_ts {
+          Some(t) => if rec.timestamp < t { in_time = false }
+          None => ()
+        }
+        match until_ts {
+          Some(t) => if rec.timestamp > t { in_time = false }
+          None => ()
+        }
+        if !in_time {
+          return
+        }
+        let pass = match_needle(rec.key, needle, true) ||
+          match_needle(rec.value, needle, true)
+        if stacks {
+          // JSON records carry their stack inline: cluster by the normalized
+          // stack (same stack + different messages/ids collapses) and count
+          // the frame lines inside that record.
+          match cluster_json_stack(rec.value) {
+            Some((tpl, fr, sample)) =>
+              if pass {
+                bump_bytes(counts, tpl)
+                let prev = match frames.get(tpl) {
+                  Some(v) => v
+                  None => 0
+                }
+                if fr > 0 {
+                  frames.set(tpl, prev + fr)
+                }
+                match samples.get(tpl) {
+                  None => samples.set(tpl, sample)
+                  Some(_) => ()
+                }
+              } else {
+                current = None
+              }
+            None =>
+              // Frames merge into the nearest matched header even when the
+              // frame line itself does not contain the needle (the default
+              // "error" filter used to drop every frame); a non-matching
+              // header closes the chain.
+              if @core.is_stack_frame(rec.value) {
+                match current {
+                  Some(k) => bump_bytes(frames, k)
+                  None =>
+                    bump_bytes(counts, @core.normalize_log_template(rec.value))
+                }
+              } else if pass {
+                let tpl = @core.normalize_log_template(rec.value)
+                bump_bytes(counts, tpl)
+                current = Some(tpl)
+                match samples.get(tpl) {
+                  None => samples.set(tpl, rec.value)
+                  Some(_) => ()
+                }
+              } else {
+                current = None
+              }
+          }
+        } else if pass {
+          bump_bytes(counts, @core.normalize_log_template(rec.value))
+        }
+      })
+    }
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
+  })
+  let items : Array[(Bytes, Int32)] = []
+  for k in counts.keys() {
+    match counts.get(k) {
+      Some(c) => items.push((k, c))
+      None => ()
+    }
+  }
+  let shown = top_counts(items, top_n)
+  if json {
+    let mut s = if stacks {
+      "{\"mode\":\"stacks\",\"clusters\":["
+    } else {
+      "{\"mode\":\"templates\",\"clusters\":["
+    }
+    let mut first = true
+    for item in shown {
+      if !first {
+        s = s + ","
+      }
+      first = false
+      s = s +
+        "{\"count\":" +
+        item.1.to_string() +
+        ",\"template\":\"" +
+        json_escape_str(bytes_to_string(item.0)) +
+        "\""
+      if stacks {
         let fr = match frames.get(item.0) {
           Some(f) => f
           None => 0
         }
         let sample = match samples.get(item.0) {
-          Some(sv) => bytes_to_string(sv)
-          None => ""
+          Some(sv) => sv
+          None => b""
         }
-        println(
-          item.1.to_string() +
-          "  " +
+        s = s +
+          ",\"frames\":" +
           fr.to_string() +
-          "  " +
-          bytes_to_string(item.0) +
-          "  | " +
-          sample,
-        )
+          ",\"sample\":\"" +
+          json_escape_str(bytes_to_string(sample)) +
+          "\""
       }
-      println("(" + counts.length().to_string() + " clusters)")
-      close_log(log)
-    })
-    return
-  }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
-    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      if match_needle(rec.key, needle, true) ||
-        match_needle(rec.value, needle, true) {
-        bump_bytes(counts, @core.normalize_log_template(rec.value))
-      }
-      true
-    })
-    let items : Array[(Bytes, Int32)] = []
-    for k in counts.keys() {
-      match counts.get(k) {
-        Some(c) => items.push((k, c))
-        None => ()
-      }
+      s = s + "}"
     }
-    let shown = top_counts(items, top_n)
+    s = s + "],\"total\":" + counts.length().to_string() + "}"
+    println(s)
+  } else if stacks {
+    println("count  frames  template  | sample")
+    for item in shown {
+      let fr = match frames.get(item.0) {
+        Some(f) => f
+        None => 0
+      }
+      let sample = match samples.get(item.0) {
+        Some(sv) => bytes_to_string(sv)
+        None => ""
+      }
+      println(
+        item.1.to_string() +
+        "  " +
+        fr.to_string() +
+        "  " +
+        bytes_to_string(item.0) +
+        "  | " +
+        sample,
+      )
+    }
+    println("(" + counts.length().to_string() + " clusters)")
+  } else {
     println("count  template")
     for item in shown {
       println(item.1.to_string() + "  " + bytes_to_string(item.0))
     }
     println("(" + counts.length().to_string() + " templates)")
-    close_log(log)
-  })
+  }
 }
 
 ///|
@@ -10268,6 +10466,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut match_text : String? = (None : String?)
       let mut top : String? = (None : String?)
       let mut stacks = false
+      let mut json = false
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -10279,10 +10480,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--stacks" {
           stacks = true
+        } else if a == "--json" {
+          json = true
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown cluster option: " + a)
         }
         i = i + 1
       }
-      cmd_cluster(args[2], match_text, top, stacks)
+      cmd_cluster(args[2], match_text, top, stacks, json, since, until)
     }
   } else if cmd == "trend" {
     if args.length() < 3 {
