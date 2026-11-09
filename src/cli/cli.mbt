@@ -62,6 +62,7 @@
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
 ///                     [--from <bytes>] [--batch N] [--interval ms]
 ///                     [--idempotent] [--dedup-field <name>]
+///                     [--clock-skew <ms>] [--clock-skew-field <name>]
 ///                                    parse a log file into records (batch
 ///                                    import, or follow appended lines);
 ///                                    resumable via the `ingest-<basename>`
@@ -74,11 +75,15 @@
 ///                                    are skipped; --dedup-field treats that
 ///                                    parsed field as a unique record ID (seen
 ///                                    IDs persist in <dir>/DEDUP, so a replay
-///                                    is skipped even when its value differs)
+///                                    is skipped even when its value differs);
+///                                    --clock-skew adds a fixed timestamp
+///                                    offset, --clock-skew-field reads a
+///                                    per-record offset from that field (ms)
 ///   http <dir> [--port N] [--queue N] [--queue-bytes N] [--batch N]
 ///             [--backlog-alert N]
 ///             [--format lines|kv] [--key <name>] [--key-field <name>]
 ///             [--ts-field <name>] [--idempotent] [--dedup-field <name>]
+///             [--clock-skew <ms>] [--clock-skew-field <name>]
 ///                                    HTTP push endpoint on 127.0.0.1 (POST /
 ///                                    or /push buffers into a bounded queue
 ///                                    and answers 202, or 429 + Retry-After
@@ -224,6 +229,10 @@ struct IngestOptions {
   from_bytes : Int64?
   schema : Bool
   clock_skew_ms : Int64
+  // Per-record clock-skew offset field (milliseconds), added on top of the
+  // global --clock-skew: deployments with several agents can carry each
+  // source's drift in the line instead of one fixed offset.
+  clock_skew_field_bytes : Bytes?
   mask : Bool
   mask_extra : Array[Bytes]
   meta_bytes : Bytes?
@@ -3165,6 +3174,31 @@ fn ingest_timestamp(
 }
 
 ///|
+/// Per-record clock-skew offset from a parsed field (milliseconds), layered
+/// on top of the global `--clock-skew`. A missing/unparsable value
+/// contributes 0, so mixed sources without the field keep the global
+/// behavior.
+fn ingest_clock_skew(
+  fields : Array[(Bytes, Bytes)],
+  opts : IngestOptions,
+) -> Int64 {
+  match opts.clock_skew_field_bytes {
+    Some(name) => {
+      let mut out : Int64 = 0
+      for pair in fields {
+        if pair.0 == name {
+          out = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+            _ => (0 : Int64)
+          }
+        }
+      }
+      out
+    }
+    None => (0 : Int64)
+  }
+}
+
+///|
 /// Unified-schema transform for one parsed line: extract the six canonical
 /// fields, promote `service` to the record key, re-serialize the standard
 /// fields into the value, and pick up the schema timestamp when present.
@@ -3491,7 +3525,9 @@ fn ingest_lines(
             }
             // 2.3 clock-skew correction: a fixed offset (ms) applied to every
             // record timestamp, compensating a slow/fast source clock.
-            let rec_ts = raw_ts + opts.clock_skew_ms
+            let rec_ts = raw_ts +
+              opts.clock_skew_ms +
+              ingest_clock_skew(fields, opts)
             let mut wrote = false
             let mut off : UInt64 = (0 : UInt64)
             if opts.idempotent {
@@ -8377,6 +8413,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut dedup_field : String? = (None : String?)
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
+      let mut clock_skew_field : String? = (None : String?)
       let mut mask = false
       let mut mask_fields : String? = (None : String?)
       let mut meta_str : String? = (None : String?)
@@ -8450,6 +8487,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
+        } else if a == "--clock-skew-field" && i + 1 < args.length() {
+          clock_skew_field = Some(args[i + 1])
+          i = i + 1
         } else if a == "--mask" {
           mask = true
         } else if a == "--mask-fields" && i + 1 < args.length() {
@@ -8513,6 +8553,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         from_bytes,
         schema,
         clock_skew_ms: skew_ms,
+        clock_skew_field_bytes: match clock_skew_field {
+          Some(s) => Some(@utf8.encode(s))
+          None => None
+        },
         mask,
         mask_extra: match mask_fields {
           Some(s) => csv_to_bytes_list(s)
@@ -8550,6 +8594,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut dedup_field : String? = (None : String?)
       let mut schema = false
       let mut clock_skew : String? = (None : String?)
+      let mut clock_skew_field : String? = (None : String?)
       let mut mask = false
       let mut mask_fields : String? = (None : String?)
       let mut meta_str : String? = (None : String?)
@@ -8620,6 +8665,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
+        } else if a == "--clock-skew-field" && i + 1 < args.length() {
+          clock_skew_field = Some(args[i + 1])
+          i = i + 1
         } else if a == "--mask" {
           mask = true
         } else if a == "--mask-fields" && i + 1 < args.length() {
@@ -8674,6 +8722,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         from_bytes: None,
         schema,
         clock_skew_ms: skew_ms,
+        clock_skew_field_bytes: match clock_skew_field {
+          Some(s) => Some(@utf8.encode(s))
+          None => None
+        },
         mask,
         mask_extra: match mask_fields {
           Some(s) => csv_to_bytes_list(s)

@@ -58,10 +58,8 @@ test "parse_iso8601_ms anchors and zone offsets" {
     @core.parse_iso8601_ms(b"2026-11-06T12:00:00X", (7 : Int64)),
     (7 : Int64),
   )
-  assert_eq(
-    @core.parse_iso8601_ms(b"2026/11/06T12:00:00Z", (7 : Int64)),
-    (7 : Int64),
-  )
+  // Slash-separated dates are a common log shape (M150).
+  assert_eq(@core.parse_iso8601_ms(b"2026/11/06T12:00:00Z", (7 : Int64)), z)
 }
 
 ///|
@@ -75,4 +73,31 @@ test "normalize_ts routes ISO-8601 with any zone" {
     1793966400250L,
   )
   assert_eq(@core.normalize_ts(b"12/06/2026", (7 : Int64)), (7 : Int64))
+}
+
+///|
+test "parse_iso8601_ms accepts comma fractions, UTC/GMT and minutes-only" {
+  let z = 1793966400000L
+  // Java/log4j comma milliseconds.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-06 12:00:00,123", (7 : Int64)),
+    z + 123L,
+  )
+  // UTC / GMT suffix (case-insensitive, separated by a space).
+  assert_eq(@core.parse_iso8601_ms(b"2026-11-06 12:00:00 UTC", (7 : Int64)), z)
+  assert_eq(@core.parse_iso8601_ms(b"2026-11-06 12:00:00 gmt", (7 : Int64)), z)
+  // Seconds are optional.
+  assert_eq(@core.parse_iso8601_ms(b"2026-11-06 12:00", (7 : Int64)), z)
+  // Hour-only zone offset.
+  assert_eq(@core.parse_iso8601_ms(b"2026-11-06T20:00:00+08", (7 : Int64)), z)
+  // Two-digit fraction is 120 ms, not 12 ms.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-06T12:00:00.12Z", (7 : Int64)),
+    z + 120L,
+  )
+  // Unknown zone tags still fail.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-06 12:00:00 XYZ", (7 : Int64)),
+    (7 : Int64),
+  )
 }
