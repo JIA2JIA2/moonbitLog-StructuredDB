@@ -4588,6 +4588,17 @@ fn cmd_search(
           break
         }
         seg.ensure_inv_index()
+        if !@backend_native.has_segment_inv(dir, seg.base_offset) {
+          match seg.inv_index {
+            Some(ix) =>
+              @backend_native.save_segment_inv(
+                dir,
+                seg.base_offset,
+                ix.encode(),
+              )
+            None => ()
+          }
+        }
         let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
         for tok in toks {
           for idx in seg.inv_term_postings(tok) {
@@ -5051,6 +5062,20 @@ fn cmd_query(
           }
           qg.check(seg.size)
           seg.ensure_inv_index()
+          // Persist the lazily built index so a later process loads the
+          // sidecar instead of rebuilding (atomic replace, safe under the
+          // shared reader lock).
+          if !@backend_native.has_segment_inv(dir, seg.base_offset) {
+            match seg.inv_index {
+              Some(ix) =>
+                @backend_native.save_segment_inv(
+                  dir,
+                  seg.base_offset,
+                  ix.encode(),
+                )
+              None => ()
+            }
+          }
           let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([],
           )
           for v in fvals {

@@ -783,6 +783,24 @@ fn segment_inv_path(dir : String, base : UInt64) -> String {
 }
 
 ///|
+/// Persist a segment's inverted/field-column index sidecar atomically. Queries
+/// build it lazily under a shared lock; an atomic replace keeps concurrent
+/// readers from observing a torn file, and the next process can load it
+/// instead of rebuilding.
+pub fn save_segment_inv(
+  dir : String,
+  base : UInt64,
+  data : Bytes,
+) -> Unit raise @io.IoError {
+  write_file_atomic(dir, segment_inv_name(base), data)
+}
+
+///|
+pub fn has_segment_inv(dir : String, base : UInt64) -> Bool {
+  file_exists(segment_inv_path(dir, base))
+}
+
+///|
 /// Load a segment's persisted inverted/field-column index into memory. A
 /// missing or invalid sidecar is fine — the index is rebuilt lazily on the
 /// first indexed query.
@@ -1656,6 +1674,12 @@ fn quarantine_segment(dir : String, base : UInt64) -> Unit {
       segment_keys_path(dir, base) + ".corrupt",
     ),
   )
+  ignore(
+    rename_file(
+      segment_inv_path(dir, base),
+      segment_inv_path(dir, base) + ".corrupt",
+    ),
+  )
   ignore(fsync_dir(dir) catch { _ => () })
 }
 
@@ -1887,6 +1911,10 @@ pub fn repair_log_dir(
           } else {
             if seg.size < before {
               truncated = truncated + 1
+              // The inverted sidecar indexed the pre-truncation records; drop
+              // it so the next indexed query rebuilds from the recovered
+              // segment instead of loading stale postings every time.
+              ignore(remove_file(segment_inv_path(dir, base)))
             }
             segs.push(seg)
           }

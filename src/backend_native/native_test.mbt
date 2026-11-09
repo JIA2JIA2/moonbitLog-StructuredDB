@@ -1387,6 +1387,11 @@ test "repair quarantines a segment failing its stored checksum" {
   }
   assert_true(log.segment_count() >= 2)
   let total_segments = log.segment_count()
+  for seg in log.segments {
+    seg.build_inv_index() catch {
+      _ => panic()
+    }
+  }
   @backend_native.flush_meta(dir, log) catch {
     _ => panic()
   }
@@ -1415,6 +1420,12 @@ test "repair quarantines a segment failing its stored checksum" {
   assert_true(
     @backend_native.file_exists(
       dir + "/" + @segment.segment_file_name((0 : UInt64)) + ".corrupt",
+    ),
+  )
+  // The inverted sidecar is quarantined along with data/index/keys.
+  assert_true(
+    @backend_native.file_exists(
+      dir + "/" + @segment.segment_file_name((0 : UInt64)) + ".inv.corrupt",
     ),
   )
   // The surviving log reopens with holes tolerated and stays appendable.
