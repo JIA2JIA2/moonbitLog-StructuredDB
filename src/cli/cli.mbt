@@ -77,12 +77,14 @@
 ///                                    and max live lag
 ///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
+///                     [--cursor-name <name>]
 ///                     [--from <bytes>] [--batch N] [--interval ms]
 ///                     [--idempotent] [--dedup-field <name>]
 ///                     [--clock-skew <ms>] [--clock-skew-field <name>]
 ///                                    parse a log file into records (batch
 ///                                    import, or follow appended lines);
-///                                    resumable via the `ingest-<basename>`
+///                                    resumable via a path-encoded
+///                                    `ingest-<encoded source path>` cursor
 ///                                    cursor; `--fifo` subscribes to a named
 ///                                    pipe instead (writers push batches) and
 ///                                    exits cleanly on SIGTERM/SIGINT after
@@ -3941,6 +3943,49 @@ fn path_basename(path : String) -> String {
 /// With `include_tail`, a trailing fragment without a newline is also a line
 /// and counts as consumed; without it the fragment is left for the next read
 /// so a poller never ingests a half-written line.
+
+///|
+/// Percent-encode a string into a filesystem-safe cursor component:
+/// `[A-Za-z0-9._-]` pass through, everything else becomes `%XX` — so cursor
+/// names derived from source paths stay unambiguous and single-component.
+fn encode_cursor_component(s : String) -> String {
+  let bytes = @utf8.encode(s)
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < bytes.length() {
+    let c = bytes[i].to_int()
+    let safe = (c >= 97 && c <= 122) ||
+      (c >= 65 && c <= 90) ||
+      (c >= 48 && c <= 57) ||
+      c == 46 ||
+      c == 45 ||
+      c == 95
+    if safe {
+      sb.write_string(@utf8.decode_lossy(@core.slice(bytes, i, i + 1)))
+    } else {
+      let hex = [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E",
+        "F",
+      ]
+      sb.write_string("%" + hex[(c >> 4) & 15] + hex[c & 15])
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Agent ingest cursor name (1.1): default is the percent-encoded source
+/// path, so same-named files in different directories no longer share one
+/// breakpoint; `--cursor-name` overrides it explicitly.
+fn ingest_cursor_name(file : String, explicit : String?) -> String {
+  match explicit {
+    Some(n) => "ingest-" + encode_cursor_component(n)
+    None => "ingest-" + encode_cursor_component(file)
+  }
+}
+
+///|
 fn split_complete_lines(
   data : Bytes,
   include_tail : Bool,
@@ -4080,6 +4125,7 @@ fn cmd_ingest(
   fifo : Bool,
   opts : IngestOptions,
   interval : String?,
+  cursor_name_opt : String?,
 ) -> Unit raise @io.IoError {
   let interval_ms = match interval {
     Some(s) =>
@@ -4096,7 +4142,24 @@ fn cmd_ingest(
     Some(_) => Some(load_dedup(dir))
     None => None
   }
-  let cursor_name = "ingest-" + path_basename(file)
+  let cursor_name = ingest_cursor_name(file, cursor_name_opt)
+  // M180: cursor names are path-encoded so same-named files in different
+  // directories no longer share one breakpoint. Migrate a legacy
+  // `ingest-<basename>` cursor once (unless --from overrides the position).
+  if opts.from_bytes is None {
+    let legacy = "ingest-" + path_basename(file)
+    if cursor_name != legacy {
+      let new_val = @backend_native.load_named_cursor(dir, cursor_name)
+      let old_val = @backend_native.load_named_cursor(dir, legacy)
+      if new_val == (0 : UInt64) && old_val != (0 : UInt64) {
+        @backend_native.save_named_cursor(dir, cursor_name, old_val)
+        ignore(@backend_native.remove_named_cursor(dir, legacy))
+        println(
+          "cursor migrated: CURSOR." + legacy + " -> CURSOR." + cursor_name,
+        )
+      }
+    }
+  }
   let mut pos : Int64 = match opts.from_bytes {
     Some(b) => b
     None =>
@@ -5331,8 +5394,15 @@ fn cmd_http(
   backlog_alert : String?,
   opts : IngestOptions,
 ) -> Unit raise @io.IoError {
-  if opts.format != "lines" && opts.format != "kv" {
-    raise @io.IoError::Invalid("invalid format: " + opts.format + " (lines|kv)")
+  // M180: json/template push is the SDK-shaped payload (JSON Lines / parsed
+  // template), reusing the exact ingest_lines pipeline of file ingest.
+  if opts.format != "lines" &&
+    opts.format != "kv" &&
+    opts.format != "json" &&
+    opts.format != "template" {
+    raise @io.IoError::Invalid(
+      "invalid format: " + opts.format + " (lines|kv|json|template)",
+    )
   }
   let port_n = match port {
     Some(s) =>
@@ -11573,6 +11643,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut min_level : String? = (None : String?)
       let mut level_field : String? = (None : String?)
       let mut sample_rate : String? = (None : String?)
+      let mut cursor_name_opt : String? = (None : String?)
       let mut include_str : String? = (None : String?)
       let mut exclude_str : String? = (None : String?)
       let mut i = 4
@@ -11624,6 +11695,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--sample-rate" && i + 1 < args.length() {
           sample_rate = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--cursor-name" && i + 1 < args.length() {
+          cursor_name_opt = Some(args[i + 1])
           i = i + 1
         } else if a == "--include" && i + 1 < args.length() {
           include_str = Some(args[i + 1])
@@ -11722,7 +11796,15 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         skip_quota: false,
         sync: desired_sync(),
       }
-      cmd_ingest(args[2], args[3], follow, fifo, opts, interval)
+      cmd_ingest(
+        args[2],
+        args[3],
+        follow,
+        fifo,
+        opts,
+        interval,
+        cursor_name_opt,
+      )
     }
   } else if cmd == "http" {
     if args.length() < 3 {
