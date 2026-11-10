@@ -218,6 +218,17 @@
 ///                                    seasonal deviations; no rules needed;
 ///                                    KV/JSON values, --since/--until for
 ///                                    historical triage
+///   audit <dir> [--actor <name>] [--action <cmd>] [--decision allow|deny]
+///               [--since ms] [--until ms] [--limit N] [--json] [--all]
+///               [--verify] [--rotate --keep N]
+///                                    query the operation audit trail (6.3):
+///                                    filter by actor/action/decision and
+///                                    event-time window, newest first;
+///                                    --json prints raw JSONL, --all includes
+///                                    rotated files, --verify checks line
+///                                    integrity, --rotate archives AUDIT
+
+///|
 ///   alert <dir> <match> --threshold N [--window minute|hour|day]
 ///                   [--notify-file <path>] [--webhook <url>] [--json]
 ///                                    threshold alerting per UTC window
@@ -9726,7 +9737,9 @@ let audit_cmds : Array[String] = [
   "cursor-list", "stats", "partitions", "export", "export-jsonl", "archive", "backup",
   "drill", "purge", "delete", "prune", "prune-bytes", "prune-before", "prune-expired",
   "prune-superseded", "merge", "compact", "compact-expired", "compress", "tier",
-  "ttl-expire", "restore", "recover", "maintain", "rbac",
+  "ttl-expire", "restore", "recover", "maintain", "rbac", "partition-policy", "ha-failover",
+  "ha-rebalance", "ha-status", "quota", "audit", "ttl-expire", "restore", "recover",
+  "maintain", "rbac",
 ]
 
 ///|
@@ -10299,6 +10312,322 @@ fn http_bearer_token(authorization : Bytes) -> Bytes {
 /// Show the directory's per-tenant quota policy (6.2) and each limited
 /// role's current write-window usage. Rules are edited directly in
 /// `<dir>/QUOTA`.
+
+///|
+/// Parse one AUDIT JSONL line into `(ts, actor, action, decision, target)`.
+/// Malformed or incomplete lines return None (the verifier counts them).
+fn audit_parse(line : String) -> (Int64, String, String, String, String)? {
+  let fields = @core.json_object_fields(@utf8.encode(line)) catch {
+    _ => return None
+  }
+  let mut ts : Int64? = None
+  let mut actor : String? = None
+  let mut action : String? = None
+  let mut decision : String? = None
+  let mut target : String? = None
+  for pair in fields {
+    if pair.0 == b"ts" {
+      let v = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch { _ => -1 }
+      if v >= (0 : Int64) {
+        ts = Some(v)
+      }
+    } else if pair.0 == b"actor" {
+      actor = Some(@utf8.decode_lossy(pair.1))
+    } else if pair.0 == b"action" {
+      action = Some(@utf8.decode_lossy(pair.1))
+    } else if pair.0 == b"decision" {
+      decision = Some(@utf8.decode_lossy(pair.1))
+    } else if pair.0 == b"target" {
+      target = Some(@utf8.decode_lossy(pair.1))
+    }
+  }
+  match (ts, actor, action, decision, target) {
+    (Some(t), Some(a), Some(c), Some(d), Some(g)) => Some((t, a, c, d, g))
+    _ => None
+  }
+}
+
+///|
+/// Split a file into non-empty lines (no newline retained).
+fn audit_file_lines(path : String) -> Array[String] {
+  let data = @backend_native.read_file(path)
+  let out : Array[String] = []
+  let n = data.length()
+  let mut start = 0
+  let mut i = 0
+  while i <= n {
+    if i == n || data.at(i).to_int() == 10 {
+      if i > start {
+        out.push(@utf8.decode_lossy(@core.slice(data, start, i)))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Read AUDIT plus (with `all`) its rotated `AUDIT.N` siblings in oldest-first
+/// order: the highest suffix is the oldest file, the live `AUDIT` is newest.
+/// Returns the lines and the number of files read.
+fn audit_read_lines(dir : String, all : Bool) -> (Array[String], Int32) {
+  ignore(audit_path(dir))
+  let out : Array[String] = []
+  let mut files = 0
+  if all {
+    let names = @backend_native.list_dir(dir) catch { _ => [] }
+    let rotated : Array[(Int32, String)] = []
+    for n in names {
+      if n.has_prefix("AUDIT.") {
+        let s = @string.parse_int(n[6:n.length()].to_owned()) catch { _ => -1 }
+        if s > 0 {
+          rotated.push((s, n))
+        }
+      }
+    }
+    rotated.sort_by(fn(a, b) { b.0.compare(a.0) })
+    for item in rotated {
+      for line in audit_file_lines(dir + "/" + item.1) {
+        out.push(line)
+      }
+      files = files + 1
+    }
+  }
+  for line in audit_file_lines(dir + "/AUDIT") {
+    out.push(line)
+  }
+  if @backend_native.file_exists(dir + "/AUDIT") {
+    files = files + 1
+  }
+  (out, files)
+}
+
+///|
+/// Audit trail query (6.3): filter AUDIT events by actor/action/decision and
+/// event-time window, newest first. `--json` prints the original JSONL lines
+/// (machine-readable), text mode renders ts/actor/action/decision/target.
+/// `--all` includes rotated `AUDIT.N`; `--verify` reports valid/invalid lines
+/// and the covered time range; `--rotate --keep N` moves the live file to
+/// AUDIT.1 and prunes older rotations (the rotation itself is audited).
+fn cmd_audit(
+  dir : String,
+  actor_f : String?,
+  action_f : String?,
+  decision_f : String?,
+  since : String?,
+  until : String?,
+  limit : String?,
+  json : Bool,
+  all : Bool,
+  verify : Bool,
+  rotate : Bool,
+  keep : String?,
+) -> Unit raise @io.IoError {
+  ignore(audit_path(dir))
+  if rotate {
+    let keep_n = match keep {
+      Some(s) =>
+        @string.parse_int(s) catch {
+          _ => raise @io.IoError::Invalid("invalid keep: " + s)
+        }
+      None => 5
+    }
+    if keep_n < 1 {
+      raise @io.IoError::Invalid("keep must be >= 1")
+    }
+    run_locked(dir, true, () => {
+      let base = dir + "/AUDIT"
+      let names = @backend_native.list_dir(dir) catch { _ => [] }
+      for n in names {
+        if n.has_prefix("AUDIT.") {
+          let s = @string.parse_int(n[6:n.length()].to_owned()) catch {
+            _ => -1
+          }
+          if s >= keep_n {
+            ignore(@backend_native.remove_file(dir + "/" + n))
+          }
+        }
+      }
+      let mut i = keep_n - 1
+      while i >= 1 {
+        let from = base + "." + i.to_string()
+        let to = base + "." + (i + 1).to_string()
+        if @backend_native.file_exists(from) {
+          ignore(@backend_native.rename_file(from, to))
+        }
+        i = i - 1
+      }
+      if @backend_native.file_exists(base) {
+        ignore(@backend_native.rename_file(base, base + ".1"))
+      }
+      @backend_native.write_file(base, b"")
+      println("rotated: AUDIT -> AUDIT.1 (keep " + keep_n.to_string() + ")")
+      // The dispatch-level allow event for `audit --rotate` landed in the
+      // archived file; record completion in the fresh live trail so the new
+      // AUDIT is never empty after a rotation.
+      audit_log(
+        dir,
+        audit_actor(dir),
+        "audit",
+        "allow",
+        "rotate-complete keep=" + keep_n.to_string(),
+      )
+    })
+    return
+  }
+  let limit_n = match limit {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid limit: " + s)
+      }
+    None => 200
+  }
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  let (raw_lines, files) = audit_read_lines(dir, all)
+  let matched : Array[(String, Int64, String, String, String, String)] = []
+  let mut total = 0
+  let mut valid = 0
+  let mut invalid = 0
+  let mut earliest : Int64 = -1
+  let mut latest : Int64 = -1
+  for line in raw_lines {
+    total = total + 1
+    match audit_parse(line) {
+      Some((ts, actor, action, decision, target)) => {
+        valid = valid + 1
+        if earliest < 0 || ts < earliest {
+          earliest = ts
+        }
+        if ts > latest {
+          latest = ts
+        }
+        if !verify {
+          let ok_actor = match actor_f {
+            Some(a) => actor == a
+            None => true
+          }
+          let ok_action = match action_f {
+            Some(a) => action == a
+            None => true
+          }
+          let ok_decision = match decision_f {
+            Some(d) => decision == d
+            None => true
+          }
+          let mut ok_time = true
+          match since_ts {
+            Some(t) => if ts < t { ok_time = false }
+            None => ()
+          }
+          match until_ts {
+            Some(t) => if ts > t { ok_time = false }
+            None => ()
+          }
+          if ok_actor && ok_action && ok_decision && ok_time {
+            matched.push((line, ts, actor, action, decision, target))
+          }
+        }
+      }
+      None => invalid = invalid + 1
+    }
+  }
+  if verify {
+    if json {
+      println(
+        "{\"files\":" +
+        files.to_string() +
+        ",\"events\":" +
+        total.to_string() +
+        ",\"valid\":" +
+        valid.to_string() +
+        ",\"invalid\":" +
+        invalid.to_string() +
+        ",\"earliest_ms\":" +
+        earliest.to_string() +
+        ",\"latest_ms\":" +
+        latest.to_string() +
+        "}",
+      )
+    } else {
+      println(
+        "audit verify: files=" +
+        files.to_string() +
+        " events=" +
+        total.to_string() +
+        " valid=" +
+        valid.to_string() +
+        " invalid=" +
+        invalid.to_string() +
+        " range=" +
+        (if earliest >= 0 {
+          @core.format_utc(earliest, "minute") +
+          ".." +
+          @core.format_utc(latest, "minute")
+        } else {
+          "empty"
+        }),
+      )
+    }
+    return
+  }
+  let start = if limit_n >= 0 && matched.length() > limit_n {
+    matched.length() - limit_n
+  } else {
+    0
+  }
+  let mut i = matched.length() - 1
+  while i >= start {
+    let item = matched[i]
+    if json {
+      println(item.0)
+    } else {
+      println(
+        @core.format_utc(item.1, "minute") +
+        " " +
+        item.1.to_string() +
+        " actor=" +
+        item.2 +
+        " action=" +
+        item.3 +
+        " decision=" +
+        item.4 +
+        " target=" +
+        item.5,
+      )
+    }
+    i = i - 1
+  }
+  println(
+    "(" +
+    total.to_string() +
+    " events, " +
+    (matched.length() - start).to_string() +
+    " shown" +
+    (if invalid > 0 { ", invalid=" + invalid.to_string() } else { "" }) +
+    (if all { ", all rotations" } else { "" }) +
+    ")",
+  )
+}
+
+///|
 fn cmd_quota(dir : String, recalc : Bool) -> Unit {
   if recalc {
     quota_recalc_storage(dir)
@@ -11855,6 +12184,69 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         json,
       )
     }
+  } else if cmd == "audit" {
+    let mut actor_f : String? = (None : String?)
+    let mut action_f : String? = (None : String?)
+    let mut decision_f : String? = (None : String?)
+    let mut since : String? = (None : String?)
+    let mut until : String? = (None : String?)
+    let mut limit : String? = (None : String?)
+    let mut keep : String? = (None : String?)
+    let mut json = false
+    let mut all = false
+    let mut verify = false
+    let mut rotate = false
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--actor" && i + 1 < args.length() {
+        actor_f = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--action" && i + 1 < args.length() {
+        action_f = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--decision" && i + 1 < args.length() {
+        decision_f = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--since" && i + 1 < args.length() {
+        since = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--until" && i + 1 < args.length() {
+        until = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--limit" && i + 1 < args.length() {
+        limit = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--keep" && i + 1 < args.length() {
+        keep = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--json" {
+        json = true
+      } else if a == "--all" {
+        all = true
+      } else if a == "--verify" {
+        verify = true
+      } else if a == "--rotate" {
+        rotate = true
+      } else {
+        raise @io.IoError::Invalid("unknown audit option: " + a)
+      }
+      i = i + 1
+    }
+    cmd_audit(
+      args[2],
+      actor_f,
+      action_f,
+      decision_f,
+      since,
+      until,
+      limit,
+      json,
+      all,
+      verify,
+      rotate,
+      keep,
+    )
   } else if cmd == "alert" {
     if args.length() < 4 {
       println(USAGE)
