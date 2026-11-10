@@ -118,6 +118,7 @@ pub(all) struct HttpRequest {
   path : Bytes
   content_length : Int32
   authorization : Bytes
+  batch_id : Bytes
 }
 
 pub(all) struct QuotaRule {
