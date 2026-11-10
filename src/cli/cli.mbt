@@ -244,6 +244,15 @@
 ///   backup <dir> <dst>               copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
 ///   restore <src> <dst>              materialize a backup into dst
+///   drill <dir> [--keep]             one-key recovery drill (6.5): backup ->
+///                                    restore -> verify -> reconcile records/
+///                                    config/index -> report, then clean up
+///   selfmon <dir> [--json]           independent health sweep (6.4): disk
+///                                    watermark, writer backlog (crash
+///                                    residue), collection latency (unknown
+///                                    while the writer lock is busy), query
+///                                    failure rate; thresholds in
+///                                    SELFMON/thresholds
 ///   cursor <dir> <start|-> <limit>   poll a consumer cursor batch
 ///   cursor-lag <dir>                 report each cursor's consumption lag
 ///   version                          print the moonlog version
@@ -258,7 +267,16 @@
 ///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
 ///   export-jsonl <dir> <file> [base64]
-///                                    write all records as JSON Lines
+///                                    write records as JSON Lines with
+///                                    filters --prefix/--match/--from/--until
+///                                    --level/--service/--host/--trace-id;
+///                                    a cross-scope prefix is denied
+///   purge <dir> <prefix> [--into <file>] [--json]
+///                                    compliance erase (6.6): retention copy
+///                                    -> batch tombstones -> physical compact
+///                                    -> verify 0 remaining; scoped roles may
+///                                    only erase their own prefix, and an
+///                                    empty prefix needs --all (unscoped only)
 ///   import <dir> <file>              replay records from a portable file
 ///   compact <dir>                    rewrite the directory with live keys
 ///   compact-expired <dir> <ttl>      rewrite with live keys, dropping expired ones
