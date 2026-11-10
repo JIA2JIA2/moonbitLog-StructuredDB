@@ -532,13 +532,10 @@ fn[T] run_locked(
 fn[T] run_read_snapshot(
   dir : String,
   action : (CliLog) -> T raise @io.IoError,
+  lock_timeout~ : Int32 = lock_timeout_ms(),
 ) -> T raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  let lock = @backend_native.DirLock::acquire_timeout(
-    dir,
-    false,
-    lock_timeout_ms(),
-  )
+  let lock = @backend_native.DirLock::acquire_timeout(dir, false, lock_timeout)
   let log = open_log(dir)
   lock.release()
   let result = action(log)
@@ -13325,22 +13322,29 @@ fn selfmon_newest_segment_age_ms(dir : String) -> Int64 {
 /// Age (ms) of the newest event timestamp in the directory — collection
 /// latency. A fresh segment mtime proves the writer is alive, but stale event
 /// timestamps mean the source stopped feeding. -1 when there is no data yet.
-fn selfmon_event_lag_ms(dir : String) -> Int64 {
+fn selfmon_event_lag_ms(dir : String) -> Int64? {
+  // None = measurement skipped because the writer lock was busy (a long
+  // exclusive operation like backup/maintain holds it) — surfaced as
+  // "unknown", never silently ok. Some(-1) = no data yet.
   if !@backend_native.file_exists(dir + "/MANIFEST") {
-    return -1
+    return Some(-1)
   }
-  run_read_snapshot(dir, log => {
-    let mut lag : Int64 = -1
-    if log.segments.length() > 0 {
-      let seg = log.segments[log.segments.length() - 1]
-      if seg.record_count > 0 && seg.max_ts > (0 : Int64) {
-        let age = now_ms() - seg.max_ts
-        lag = if age >= 0 { age } else { 0 }
+  run_read_snapshot(
+    dir,
+    log => {
+      let mut lag : Int64 = -1
+      if log.segments.length() > 0 {
+        let seg = log.segments[log.segments.length() - 1]
+        if seg.record_count > 0 && seg.max_ts > (0 : Int64) {
+          let age = now_ms() - seg.max_ts
+          lag = if age >= 0 { age } else { 0 }
+        }
       }
-    }
-    lag
-  }) catch {
-    _ => -1
+      Some(lag)
+    },
+    lock_timeout=250,
+  ) catch {
+    _ => None
   }
 }
 
@@ -13443,10 +13447,22 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
   // --- collection latency (6.4): newest event age is independent of the
   // segment mtime, so a source that stops feeding is detected while the
   // writer is still alive. ---
-  let event_lag = selfmon_event_lag_ms(dir)
-  let mut ingest_status = "ok"
-  if event_lag >= 0 && event_lag >= event_lag_warn {
-    ingest_status = "warn"
+  let event_lag_opt = selfmon_event_lag_ms(dir)
+  let event_lag = match event_lag_opt {
+    Some(v) => v
+    None => -1
+  }
+  let event_lag_degraded = match event_lag_opt {
+    None => true
+    Some(_) => false
+  }
+  let mut ingest_status = if event_lag >= 0 && event_lag >= event_lag_warn {
+    "warn"
+  } else {
+    "ok"
+  }
+  if event_lag_degraded {
+    ingest_status = "unknown"
   }
 
   // --- command failure rate (6.4) ---
@@ -13528,7 +13544,9 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       event_lag.to_string() +
       ",\"status\":\"" +
       ingest_status +
-      "\"},\"stale\":{\"last_data_age_ms\":" +
+      "\",\"degraded\":" +
+      (if event_lag_degraded { "true" } else { "false" }) +
+      "},\"stale\":{\"last_data_age_ms\":" +
       seg_age.to_string() +
       "},\"failures\":{\"window_failures\":" +
       fails.to_string() +
@@ -13581,6 +13599,7 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       event_lag.to_string() +
       " threshold_ms=" +
       event_lag_warn.to_string() +
+      (if event_lag_degraded { " lock_busy=true" } else { "" }) +
       " [" +
       ingest_status +
       "]",
