@@ -210,12 +210,14 @@
 ///                                    totals, dimension breakdown;
 ///                                    --since/--until drills into a
 ///                                    historical incident window
-///   anomalies <dir> [--baseline sec] [--recent sec] [--sigma N]
-///            [--min-count N] [--top N] [--json]
+///   anomalies <dir> [--baseline sec] [--recent sec] [--since ms] [--until ms]
+///            [--service <svc>] [--sigma N] [--min-count N] [--top N] [--json]
 ///                                    automatic anomaly detection (5.6) —
 ///                                    volume spikes, NEW error patterns vs
 ///                                    the baseline period, hour-of-day
-///                                    seasonal deviations; no rules needed
+///                                    seasonal deviations; no rules needed;
+///                                    KV/JSON values, --since/--until for
+///                                    historical triage
 ///   alert <dir> <match> --threshold N [--window minute|hour|day]
 ///                   [--notify-file <path>] [--webhook <url>] [--json]
 ///                                    threshold alerting per UTC window
@@ -7476,17 +7478,51 @@ fn cmd_dashboard(
 }
 
 ///|
-/// Automatic anomaly detection (5.6): one scan over the baseline period
-/// [now-baseline, now-recent) and the recent period [now-recent, now],
-/// reporting — with zero configured rules — three shapes:
-/// 1. VOLUME_SPIKE: a recent minute bucket whose count exceeds the baseline
+/// Message-shaped text for NEW_PATTERN templates: prefer a message-ish field
+/// (JSON flattened or KV), so volatile siblings (trace_id, latency, level)
+/// do not split one error shape into many templates; fall back to the raw
+/// value when no such field exists (plain-line logs keep their old shape).
+fn anomaly_error_text(
+  rec : @core.Record,
+  fields : Array[(Bytes, Bytes)],
+) -> Bytes {
+  // JSON values carry whole message fields (a KV `msg=...` would stop at the
+  // first space, collapsing distinct errors to one word), so only JSON is
+  // reduced to its message; KV/plain lines keep the previous whole-value
+  // template semantics.
+  if rec.value.length() > 0 && rec.value.at(0).to_int() == 123 {
+    let names : Array[Bytes] = [
+      b"message", b"msg", b"body", b"error", b"exception", b"reason", b"detail",
+    ]
+    match ctx_field_from_pairs(fields, names) {
+      Some(m) => m
+      None => rec.value
+    }
+  } else {
+    rec.value
+  }
+}
+
+///|
+/// Ops anomaly detection (5.6, optimized): zero-rule detection over a
+/// baseline period and a recent period —
+/// 1. VOLUME_SPIKE: recent minute buckets whose count exceeds the baseline
 ///    minute-bucket distribution (mean/std, z > --sigma);
-/// 2. NEW_PATTERN: an error template (`normalize_log_template`) present in
-///    the recent window but absent from the baseline (count >= --min-count);
-/// 3. SEASONAL_DEVIATION: an hour-of-day whose recent count deviates from
-///    the baseline hour-of-day average (Poisson approximation, z > --sigma).
-/// Errors are records with severity rank >= 3, or a literal "error"
-/// substring when no level field exists (same as dashboard).
+/// 2. NEW_PATTERN: error templates present in the recent period but absent
+///    from the baseline (count >= --min-count), with a sample;
+/// 3. SEASONAL_DEVIATION: an hour-of-day whose recent count deviates from the
+///    baseline hour-of-day daily mean (Poisson approximation, z > --sigma).
+/// Values accept KV text and JSON objects (2.1 flattening); errors are
+/// severity rank >= 3 from a recognized level field (case-insensitive), or —
+/// only when no level field exists — a literal "error" substring, so JSON
+/// INFO messages mentioning "error" no longer become false patterns.
+/// `--since/--until` select the recent window in absolute event time (the
+/// baseline is the same-length period immediately before it) for
+/// retrospective triage; without them the window is [now-recent, now].
+/// `--service` scopes all three detectors (key or schema service field,
+/// case-insensitive). Uses the 4.6 query slot/timeout/scan budget, a snapshot
+/// read and segment min_ts/max_ts pushdown, so a long pass cannot stall
+/// ingestion.
 fn cmd_anomalies(
   dir : String,
   baseline_sec : String,
@@ -7494,6 +7530,9 @@ fn cmd_anomalies(
   sigma : String,
   min_count : String,
   top : String,
+  service : String?,
+  since : String?,
+  until : String?,
   json : Bool,
 ) -> Unit raise @io.IoError {
   let base_ms = (@string.parse_int64(baseline_sec) catch {
@@ -7516,11 +7555,67 @@ fn cmd_anomalies(
   let top_n = @string.parse_int(top) catch {
     _ => raise @io.IoError::Invalid("invalid top: " + top)
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let now = now_ms()
-    let recent_start = now - rec_ms
-    let base_start = now - rec_ms - base_ms
+  if min_cnt <= 0 {
+    raise @io.IoError::Invalid("min-count must be positive")
+  }
+  if top_n <= 0 {
+    raise @io.IoError::Invalid("top must be positive")
+  }
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  let now = now_ms()
+  let recent_end = match until_ts {
+    Some(u) => u
+    None => now
+  }
+  let recent_start = match since_ts {
+    Some(s) => s
+    None => recent_end - rec_ms
+  }
+  if recent_start < (0 : Int64) || recent_end <= recent_start {
+    raise @io.IoError::Invalid("recent window is empty (check --since/--until)")
+  }
+  let base_end = recent_start
+  let base_start = recent_start - base_ms
+  let service_b : Bytes? = match service {
+    Some(sv) => Some(@utf8.encode(sv))
+    None => None
+  }
+  let level_names : Array[Bytes] = [
+    b"level", b"severity", b"severity_text", b"lvl", b"loglevel", b"log.level",
+  ]
+  let service_names : Array[Bytes] = [
+    b"service", b"service.name", b"svc", b"app",
+  ]
+  // 4.6 production guards: slot/guard + snapshot read, outside the writer lock.
+  // Ensure the directory first: slot lookup on a missing path masquerades as
+  // "too many concurrent queries" on a fresh inspection target.
+  ignore(@backend_native.ensure_dir(dir))
+  acquire_query_slot(dir)
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: query_timeout_ms(),
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  run_read_snapshot(dir, log => {
     // Accumulators per period.
     let base_min : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
     let rec_min : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
@@ -7529,34 +7624,78 @@ fn cmd_anomalies(
     let base_hod : FixedArray[Int64] = FixedArray::make(24, 0)
     let rec_hod : FixedArray[Int64] = FixedArray::make(24, 0)
     let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
-    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      let in_recent = rec.timestamp >= recent_start && rec.timestamp <= now
-      let in_base = rec.timestamp >= base_start && rec.timestamp < recent_start
-      if in_recent || in_base {
-        let label = @core.format_utc(rec.timestamp, "minute")
+    let mut base_total = 0
+    let mut rec_total = 0
+    let mut base_errors = 0
+    let mut rec_errors = 0
+    let mut aborted : String? = None
+    for seg in log.segments {
+      if aborted is Some(_) {
+        break
+      }
+      if seg.record_count > 0 {
+        // Pushdown: skip segments disjoint from [base_start, recent_end].
+        if seg.max_ts < base_start {
+          continue
+        }
+        if seg.min_ts > recent_end {
+          continue
+        }
+      }
+      qg.check(seg.size)
+      let mut seen = 0
+      seg.for_each(seg.base_offset, seg.next_offset, rec => {
+        seen = seen + 1
+        if seen % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => aborted = Some(m)
+            None => ()
+          }
+        }
+        if aborted is Some(_) {
+          return
+        }
+        let in_recent = rec.timestamp >= recent_start &&
+          rec.timestamp <= recent_end
+        let in_base = rec.timestamp >= base_start &&
+          rec.timestamp < recent_start
+        if !in_recent && !in_base {
+          return
+        }
+        let fields = ctx_value_fields(rec.value)
+        match service_b {
+          Some(sb) => {
+            let svc = match ctx_field_from_pairs(fields, service_names) {
+              Some(s) => s
+              None => rec.key
+            }
+            if !ctx_name_eq(svc, sb) && !ctx_name_eq(rec.key, sb) {
+              return
+            }
+          }
+          None => ()
+        }
+        let level_v = ctx_field_from_pairs(fields, level_names)
+        let is_err = match level_v {
+          Some(l) => @core.level_rank(follow_lower_ascii(l)) >= 3
+          None => match_needle(rec.value, b"error", true)
+        }
         let hod = if rec.timestamp >= 0 {
           (rec.timestamp / (3600000 : Int64) % 24).to_int()
         } else {
           0
         }
-        let pairs = @core.parse_kv_pairs(rec.value)
-        let mut lv : Bytes? = None
-        for pair in pairs {
-          if pair.0 == b"level" {
-            lv = Some(pair.1)
-          }
-        }
-        let is_err = match lv {
-          Some(l) => @core.level_rank(l) >= 3
-          None => match_needle(rec.value, b"error", true)
-        }
         if in_recent {
-          bump_string(rec_min, label)
+          rec_total = rec_total + 1
+          bump_string(rec_min, @core.format_utc(rec.timestamp, "minute"))
           if hod >= 0 && hod < 24 {
             rec_hod[hod] = rec_hod[hod] + 1
           }
           if is_err {
-            let tpl = @core.normalize_log_template(rec.value)
+            rec_errors = rec_errors + 1
+            let tpl = @core.normalize_log_template(
+              anomaly_error_text(rec, fields),
+            )
             bump_bytes(rec_tpl, tpl)
             match samples.get(tpl) {
               None => samples.set(tpl, rec.value)
@@ -7564,17 +7703,25 @@ fn cmd_anomalies(
             }
           }
         } else {
-          bump_string(base_min, label)
+          base_total = base_total + 1
+          bump_string(base_min, @core.format_utc(rec.timestamp, "minute"))
           if hod >= 0 && hod < 24 {
             base_hod[hod] = base_hod[hod] + 1
           }
           if is_err {
-            bump_bytes(base_tpl, @core.normalize_log_template(rec.value))
+            base_errors = base_errors + 1
+            bump_bytes(
+              base_tpl,
+              @core.normalize_log_template(anomaly_error_text(rec, fields)),
+            )
           }
         }
-      }
-      true
-    })
+      })
+    }
+    match aborted {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
     // Detection 1: volume spikes in recent minute buckets.
     let mut base_sum : Double = 0.0
     let mut base_n : Double = 0.0
@@ -7619,16 +7766,10 @@ fn cmd_anomalies(
         None => ()
       }
     }
+    // Stable chronological order (a burst should read top-to-bottom).
     spikes
     .mut_view()
-    .sort_by(fn(a, b) {
-      let d = b.2.compare(a.2)
-      if d != 0 {
-        d
-      } else {
-        b.1.compare(a.1)
-      }
-    })
+    .sort_by(fn(a, b) { if a.0 < b.0 { -1 } else if a.0 > b.0 { 1 } else { 0 } })
     // Detection 2: new error patterns (in recent, absent from baseline).
     let news : Array[(Bytes, Int32)] = []
     for k in rec_tpl.keys() {
@@ -7643,7 +7784,20 @@ fn cmd_anomalies(
         None => ()
       }
     }
-    news.mut_view().sort_by(fn(a, b) { b.1.compare(a.1) })
+    news
+    .mut_view()
+    .sort_by(fn(a, b) {
+      let d = b.1.compare(a.1)
+      if d != 0 {
+        d
+      } else if a.0 < b.0 {
+        -1
+      } else if a.0 > b.0 {
+        1
+      } else {
+        0
+      }
+    })
     // Detection 3: seasonal (hour-of-day) deviations.
     let base_days = if base_ms / (86400000 : Int64) > 0 {
       base_ms / (86400000 : Int64)
@@ -7661,25 +7815,40 @@ fn cmd_anomalies(
       }
       h = h + 1
     }
-    seasonal
-    .mut_view()
-    .sort_by(fn(a, b) {
-      let d = b.2.compare(a.2)
-      if d != 0 {
-        d
-      } else {
-        b.1.compare(a.1)
-      }
-    })
+    seasonal.mut_view().sort_by(fn(a, b) { a.0.compare(b.0) })
     let clip = fn(n : Int32) -> Int32 { if n > top_n { top_n } else { n } }
     if json {
-      let mut s = "{\"baseline_sec\":" +
+      let mut s = "{\"dir\":\"" +
+        json_escape_str(dir) +
+        "\",\"generated_at\":" +
+        now.to_string() +
+        ",\"baseline_sec\":" +
         baseline_sec.to_string() +
         ",\"recent_sec\":" +
         recent_sec.to_string() +
         ",\"sigma\":" +
         sigma +
-        ",\"volume_spikes\":["
+        ",\"window\":{\"baseline_start\":" +
+        base_start.to_string() +
+        ",\"baseline_end\":" +
+        base_end.to_string() +
+        ",\"recent_start\":" +
+        recent_start.to_string() +
+        ",\"recent_end\":" +
+        recent_end.to_string() +
+        "},\"counts\":{\"baseline_records\":" +
+        base_total.to_string() +
+        ",\"recent_records\":" +
+        rec_total.to_string() +
+        ",\"baseline_errors\":" +
+        base_errors.to_string() +
+        ",\"recent_errors\":" +
+        rec_errors.to_string() +
+        ",\"baseline_minute_buckets\":" +
+        base_min.length().to_string() +
+        ",\"baseline_days\":" +
+        base_days.to_string() +
+        "},\"volume_spikes\":["
       let mut first = true
       let sn = clip(spikes.length())
       for i2 in 0..<sn {
@@ -7718,7 +7887,7 @@ fn cmd_anomalies(
               },
             ),
           ) +
-          "}"
+          "\"}"
       }
       s = s + "],\"seasonal_deviations\":["
       first = true
@@ -7750,6 +7919,30 @@ fn cmd_anomalies(
         "s, sigma " +
         sigma +
         ") ===",
+      )
+      println(
+        "window: baseline [" +
+        @core.format_utc(base_start, "minute") +
+        ", " +
+        @core.format_utc(base_end, "minute") +
+        ") recent [" +
+        @core.format_utc(recent_start, "minute") +
+        ", " +
+        @core.format_utc(recent_end, "minute") +
+        "]",
+      )
+      println(
+        "counts: baseline " +
+        base_total.to_string() +
+        " records / " +
+        base_errors.to_string() +
+        " errors / " +
+        base_min.length().to_string() +
+        " minute buckets; recent " +
+        rec_total.to_string() +
+        " records / " +
+        rec_errors.to_string() +
+        " errors",
       )
       println("volume spikes: " + spikes.length().to_string())
       let sn = clip(spikes.length())
@@ -7797,8 +7990,10 @@ fn cmd_anomalies(
       if spikes.length() == 0 && news.length() == 0 && seasonal.length() == 0 {
         println("no anomalies detected")
       }
+      println(
+        "(drill-down: --since/--until <ms> on anomalies/dashboard/query to re-run or inspect this window)",
+      )
     }
-    close_log(log)
   })
 }
 
@@ -11158,6 +11353,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut sigma = "3"
       let mut min_count = "2"
       let mut top = "10"
+      let mut service : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
       let mut json = false
       let mut i = 3
       while i < args.length() {
@@ -11177,8 +11375,19 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--top" && i + 1 < args.length() {
           top = args[i + 1]
           i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
         } else if a == "--json" {
           json = true
+        } else {
+          raise @io.IoError::Invalid("unknown anomalies option: " + a)
         }
         i = i + 1
       }
@@ -11189,6 +11398,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         sigma,
         min_count,
         top,
+        service,
+        since,
+        until,
         json,
       )
     }
