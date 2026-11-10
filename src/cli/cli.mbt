@@ -403,6 +403,19 @@ fn desired_sync() -> @log.SyncPolicy {
 }
 
 ///|
+/// Batch-entry sync policy (1.2 "批量提交"): batch-style entries (put-batch,
+/// file/FIFO ingest, HTTP drain) persist once per batch instead of once per
+/// record — the same semantics the HTTP drain has always had. An explicit
+/// `MOONLOG_SYNC=never` still disables fsync entirely; single-record commands
+/// keep the `Always` default.
+fn batch_entry_sync() -> @log.SyncPolicy {
+  match desired_sync() {
+    @log.SyncPolicy::Never => @log.SyncPolicy::Never
+    _ => @log.SyncPolicy::Batch
+  }
+}
+
+///|
 /// Smallest committed cursor position across the default and all named
 /// cursors, or `None` when no cursor exists (nothing to protect).
 fn min_cursor_guard(dir : String) -> UInt64? {
@@ -880,7 +893,7 @@ fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
       Some(msg) => raise @io.IoError::Invalid(msg)
       None => ()
     }
-    let log = open_log(dir)
+    let log = open_log_sync(dir, load_partition_policy(dir), batch_entry_sync())
     let offsets = log.append_batch(recs)
     quota_record_write(dir, rule, incoming)
     for off in offsets {
@@ -11794,7 +11807,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           None => load_partition_policy(args[2])
         },
         skip_quota: false,
-        sync: desired_sync(),
+        sync: batch_entry_sync(),
       }
       cmd_ingest(
         args[2],

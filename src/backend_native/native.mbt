@@ -33,6 +33,9 @@ extern "C" fn moonlog_size(fd : Int32) -> Int64 = "moonlog_size"
 extern "C" fn moonlog_fsync(fd : Int32) -> Int32 = "moonlog_fsync"
 
 ///|
+extern "C" fn moonlog_fdatasync(fd : Int32) -> Int32 = "moonlog_fdatasync"
+
+///|
 extern "C" fn moonlog_close(fd : Int32) -> Int32 = "moonlog_close"
 
 ///|
@@ -187,6 +190,10 @@ pub(all) struct NativeFileLog {
   mut pending_len : Int32
   mut closed : Bool
   mut raw : Bytes?
+  // M181: after the first full fsync (which persists the file's directory
+  // entry), appends only extend the file — later flushes can use fdatasync
+  // and skip the inode metadata writeback per batch.
+  mut data_synced : Bool
 }
 
 ///|
@@ -206,6 +213,7 @@ pub fn NativeFileLog::open(path : String) -> NativeFileLog raise @io.IoError {
     pending: FixedArray::make(0, b'\x00'),
     pending_len: 0,
     closed: false,
+    data_synced: false,
     raw: None,
   }
 }
@@ -229,6 +237,7 @@ pub fn NativeFileLog::open_readonly(
     pending: FixedArray::make(0, b'\x00'),
     pending_len: 0,
     closed: false,
+    data_synced: false,
     raw: None,
   }
 }
@@ -262,6 +271,7 @@ pub fn NativeFileLog::open_compressed(
     pending: FixedArray::make(0, b'\x00'),
     pending_len: 0,
     closed: false,
+    data_synced: false,
     raw: Some(raw),
   }
 }
@@ -430,10 +440,18 @@ pub impl @io.LogWriter for NativeFileLog with fn flush(self) {
     None => ()
   }
   self.write_pending()
-  let r = moonlog_fsync(self.fd)
+  // M181: the first sync of a segment file must be a full fsync (it persists
+  // the file's directory entry); appends only extend the file, so later
+  // flushes use fdatasync and skip the inode metadata writeback per batch.
+  let r = if self.data_synced {
+    moonlog_fdatasync(self.fd)
+  } else {
+    moonlog_fsync(self.fd)
+  }
   if r < 0 {
     raise @io.IoError::Syscall(r)
   }
+  self.data_synced = true
 }
 
 ///|

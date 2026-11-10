@@ -127,6 +127,11 @@ int32_t moonlog_fsync(int32_t fd) {
 }
 
 MOONBIT_FFI_EXPORT
+int32_t moonlog_fdatasync(int32_t fd) {
+  return (int32_t)fdatasync(fd);
+}
+
+MOONBIT_FFI_EXPORT
 int32_t moonlog_close(int32_t fd) {
   return (int32_t)close(fd);
 }
