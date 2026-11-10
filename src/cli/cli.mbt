@@ -12886,15 +12886,55 @@ fn selfmon_report_error(args : Array[String], msg : String) -> Unit {
 
 ///|
 /// Self-monitoring threshold override (`MOONLOG_SELFMON_<NAME>`, 6.4).
-fn selfmon_threshold(name : String, default : Int64) -> Int64 {
+
+///|
+/// Load `<dir>/SELFMON/thresholds` (`NAME=value` per line) so cron jobs can
+/// pin thresholds without environment plumbing; malformed lines are ignored.
+fn selfmon_load_thresholds(dir : String) -> @hashmap.HashMap[String, Int64] {
+  let map : @hashmap.HashMap[String, Int64] = @hashmap.HashMap::HashMap([])
+  let data = @backend_native.read_file(dir + "/SELFMON/thresholds")
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        for pair in @core.parse_kv_pairs(line) {
+          let name = bytes_to_string(pair.0)
+          let v = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+            _ => -1
+          }
+          if v >= (0 : Int64) {
+            map.set(name, v)
+          }
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  map
+}
+
+///|
+/// Effective self-monitoring threshold: `MOONLOG_SELFMON_<NAME>` overrides the
+/// directory file, which overrides the built-in default.
+fn selfmon_threshold_cfg(
+  cfg : @hashmap.HashMap[String, Int64],
+  name : String,
+  default : Int64,
+) -> Int64 {
   match @env.get_env_var("MOONLOG_SELFMON_" + name) {
     Some(v) => @string.parse_int64(v) catch { _ => default }
-    None => default
+    None =>
+      match cfg.get(name) {
+        Some(v) => v
+        None => default
+      }
   }
 }
 
 ///|
-/// Parse one JSON object line into its top-level fields; None on garbage.
 fn selfmon_json_fields(line : Bytes) -> Array[(Bytes, Bytes)]? {
   Some(@core.json_object_fields(line)) catch {
     _ => None
@@ -12943,21 +12983,48 @@ fn selfmon_is_segment_name(name : String) -> Bool {
 ///|
 /// Count JSONL events with `ts >= since` in `path`; returns
 /// (matching, total lines).
-fn selfmon_count_events(path : String, since : Int64) -> (Int32, Int32) {
-  let data = @backend_native.read_file(path)
-  let mut matching = 0
-  let mut total = 0
+
+///|
+/// Whether `cmd` is a query/read entry point for the failure-rate gauge.
+/// Exports, deletes, configuration changes and audit queries are excluded so
+/// they cannot dilute "query failure rate".
+fn selfmon_is_query_cmd(cmd : String) -> Bool {
+  let list : Array[String] = [
+    "get", "getkey", "get-many", "getkey-live", "has-key", "scan", "scan-prefix",
+    "scan-range", "scan-time", "tail", "follow", "search", "query", "context", "aggregate",
+    "cluster", "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor-lag",
+    "cursor-list", "stats", "partitions",
+  ]
+  for c in list {
+    if c == cmd {
+      return true
+    }
+  }
+  false
+}
+
+///|
+/// Window stats for audited command failures (write failures and selfmon's
+/// own failures are excluded), plus the most frequent failing command — the
+/// failure-rate numerator and the "what is breaking" pointer.
+fn selfmon_error_stats(dir : String, since : Int64) -> (Int32, String, Int32) {
+  let data = @backend_native.read_file(dir + "/SELFMON_ERRORS")
+  let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+  let mut fails = 0
   let mut start = 0
   let mut i = 0
   while i <= data.length() {
     if i == data.length() || data.at(i).to_int() == 10 {
       let line = @core.slice(data, start, i)
       if line.length() > 0 {
-        total = total + 1
         match selfmon_json_fields(line) {
           Some(fields) =>
             if selfmon_field_int64(fields, b"ts") >= since {
-              matching = matching + 1
+              let cmd = selfmon_field_str(fields, b"cmd")
+              if selfmon_is_query_cmd(cmd) {
+                fails = fails + 1
+                bump_string(counts, cmd)
+              }
             }
           None => ()
         }
@@ -12966,40 +13033,41 @@ fn selfmon_count_events(path : String, since : Int64) -> (Int32, Int32) {
     }
     i = i + 1
   }
-  (matching, total)
+  let mut top_cmd = ""
+  let mut top_count = 0
+  for k in counts.keys() {
+    match counts.get(k) {
+      Some(c) =>
+        if c > top_count {
+          top_cmd = k
+          top_count = c
+        }
+      None => ()
+    }
+  }
+  (fails, top_cmd, top_count)
 }
 
 ///|
-/// Window count of allowed (executed) audit events — the denominator for
-/// the failure-rate gauge; 0 when auditing is not in force.
+/// Window count of allowed audit events across the live trail and its
+/// rotations (M172) — the failure-rate denominator. Zero when auditing is not
+/// in force.
 fn selfmon_audit_allows(dir : String, since : Int64) -> Int32 {
-  let data = @backend_native.read_file(audit_path(dir))
+  let (lines, _) = audit_read_lines(dir, true)
   let mut allowed = 0
-  let mut start = 0
-  let mut i = 0
-  while i <= data.length() {
-    if i == data.length() || data.at(i).to_int() == 10 {
-      let line = @core.slice(data, start, i)
-      if line.length() > 0 {
-        match selfmon_json_fields(line) {
-          Some(fields) =>
-            if selfmon_field_str(fields, b"decision") == "allow" &&
-              selfmon_field_int64(fields, b"ts") >= since {
-              allowed = allowed + 1
-            }
-          None => ()
+  for line in lines {
+    match audit_parse(line) {
+      Some((ts, _, action, decision, _)) =>
+        if decision == "allow" && ts >= since && selfmon_is_query_cmd(action) {
+          allowed = allowed + 1
         }
-      }
-      start = i + 1
+      None => ()
     }
-    i = i + 1
   }
   allowed
 }
 
 ///|
-/// Age in ms of the newest segment file, or -1 when the directory holds no
-/// segment yet.
 fn selfmon_newest_segment_age_ms(dir : String) -> Int64 {
   let names = @backend_native.list_dir(dir) catch { _ => [] }
   let mut newest : String? = None
@@ -13032,6 +13100,31 @@ fn selfmon_newest_segment_age_ms(dir : String) -> Int64 {
 /// Latest writer snapshot under `<dir>/SELFMON` (max ts across writers):
 /// (writer, ts, pending, head_lag_ms, backlog_alerts); all -1/"" when no
 /// writer has ever reported.
+
+///|
+/// Age (ms) of the newest event timestamp in the directory — collection
+/// latency. A fresh segment mtime proves the writer is alive, but stale event
+/// timestamps mean the source stopped feeding. -1 when there is no data yet.
+fn selfmon_event_lag_ms(dir : String) -> Int64 {
+  if !@backend_native.file_exists(dir + "/MANIFEST") {
+    return -1
+  }
+  run_read_snapshot(dir, log => {
+    let mut lag : Int64 = -1
+    if log.segments.length() > 0 {
+      let seg = log.segments[log.segments.length() - 1]
+      if seg.record_count > 0 && seg.max_ts > (0 : Int64) {
+        let age = now_ms() - seg.max_ts
+        lag = if age >= 0 { age } else { 0 }
+      }
+    }
+    lag
+  }) catch {
+    _ => -1
+  }
+}
+
+///|
 fn selfmon_latest_snapshot(
   dir : String,
 ) -> (String, Int64, Int64, Int64, Int64) {
@@ -13074,14 +13167,17 @@ fn selfmon_latest_snapshot(
 /// result structured. Deep on-disk verification stays with `fsck`.
 fn cmd_selfmon(dir : String, json : Bool) -> Unit {
   let now = now_ms()
-  let disk_warn = selfmon_threshold("DISK_WARN_PCT", 80)
-  let disk_crit = selfmon_threshold("DISK_CRIT_PCT", 90)
-  let backlog_warn = selfmon_threshold("BACKLOG_WARN", 1000)
-  let lag_warn = selfmon_threshold("LAG_WARN_MS", 5000)
-  let stale_warn = selfmon_threshold("STALE_MS", 300000)
-  let fails_warn = selfmon_threshold("FAILS_WARN", 10)
-  let window = selfmon_threshold("WINDOW_MS", 300000)
-  let active_window = selfmon_threshold("ACTIVE_WINDOW_MS", 60000)
+  let cfg = selfmon_load_thresholds(dir)
+  let disk_warn = selfmon_threshold_cfg(cfg, "DISK_WARN_PCT", 80)
+  let disk_crit = selfmon_threshold_cfg(cfg, "DISK_CRIT_PCT", 90)
+  let backlog_warn = selfmon_threshold_cfg(cfg, "BACKLOG_WARN", 1000)
+  let lag_warn = selfmon_threshold_cfg(cfg, "LAG_WARN_MS", 5000)
+  let stale_warn = selfmon_threshold_cfg(cfg, "STALE_MS", 300000)
+  let fails_warn = selfmon_threshold_cfg(cfg, "FAILS_WARN", 10)
+  let window = selfmon_threshold_cfg(cfg, "WINDOW_MS", 300000)
+  let active_window = selfmon_threshold_cfg(cfg, "ACTIVE_WINDOW_MS", 60000)
+  let event_lag_warn = selfmon_threshold_cfg(cfg, "EVENT_LAG_MS", 300000)
+  let fail_rate_warn = selfmon_threshold_cfg(cfg, "FAIL_RATE_WARN_PCT", 50)
   let since = now - window
 
   // --- disk watermark (6.4) ---
@@ -13103,9 +13199,15 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
   let (writer, snap_ts, pending, head_lag, alerts) = selfmon_latest_snapshot(
     dir,
   )
-  let writer_active = snap_ts >= 0 && now - snap_ts <= active_window
+  let snapshot_present = snap_ts >= 0
+  let snapshot_age = if snapshot_present { now - snap_ts } else { -1 }
+  let writer_active = snapshot_present && snapshot_age <= active_window
+  let writer_stale = snapshot_present && !writer_active
+  // A graceful shutdown writes pending=0, so a stale snapshot with pending>0
+  // means a crash left accepted-but-unwritten data behind — alert even after
+  // the writer is no longer active.
   let mut backlog_status = "ok"
-  if writer_active && (pending >= backlog_warn || head_lag >= lag_warn) {
+  if snapshot_present && (pending >= backlog_warn || head_lag >= lag_warn) {
     backlog_status = "warn"
   }
 
@@ -13118,15 +13220,35 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
     stale_status = "warn"
   }
 
+  // --- collection latency (6.4): newest event age is independent of the
+  // segment mtime, so a source that stops feeding is detected while the
+  // writer is still alive. ---
+  let event_lag = selfmon_event_lag_ms(dir)
+  let mut ingest_status = "ok"
+  if event_lag >= 0 && event_lag >= event_lag_warn {
+    ingest_status = "warn"
+  }
+
   // --- command failure rate (6.4) ---
-  let (fails, _total) = selfmon_count_events(dir + "/SELFMON_ERRORS", since)
+  let (fails, top_error_cmd, top_error_count) = selfmon_error_stats(dir, since)
   let attempts = if audit_enabled(dir) {
     selfmon_audit_allows(dir, since)
   } else {
     0
   }
+  let fail_rate : Int64 = if attempts > 0 {
+    let r = fails.to_int64() * (100 : Int64) / attempts.to_int64()
+    if r > (100 : Int64) {
+      (100 : Int64)
+    } else {
+      r
+    }
+  } else {
+    (0 : Int64)
+  }
   let mut failures_status = "ok"
-  if fails.to_int64() >= fails_warn {
+  if fails.to_int64() >= fails_warn ||
+    (attempts > 0 && fail_rate >= fail_rate_warn) {
     failures_status = "warn"
   }
 
@@ -13150,6 +13272,7 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
   } else if disk_status == "warn" ||
     backlog_status == "warn" ||
     stale_status == "warn" ||
+    ingest_status == "warn" ||
     failures_status == "warn" ||
     segments_status == "warn" {
     status = "warn"
@@ -13177,12 +13300,26 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       head_lag.to_string() +
       ",\"backlog_alerts\":" +
       alerts.to_string() +
-      "},\"stale\":{\"last_data_age_ms\":" +
+      ",\"snapshot_age_ms\":" +
+      snapshot_age.to_string() +
+      ",\"writer_stale\":" +
+      (if writer_stale { "true" } else { "false" }) +
+      "},\"ingest\":{\"event_lag_ms\":" +
+      event_lag.to_string() +
+      ",\"status\":\"" +
+      ingest_status +
+      "\"},\"stale\":{\"last_data_age_ms\":" +
       seg_age.to_string() +
       "},\"failures\":{\"window_failures\":" +
       fails.to_string() +
       ",\"window_attempts\":" +
       attempts.to_string() +
+      ",\"fail_rate_pct\":" +
+      fail_rate.to_string() +
+      ",\"top_error_cmd\":\"" +
+      json_escape_str(top_error_cmd) +
+      "\",\"top_error_count\":" +
+      top_error_count.to_string() +
       "},\"segments\":{\"manifest\":" +
       (if manifest_present { "true" } else { "false" }) +
       ",\"count\":" +
@@ -13211,8 +13348,21 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       head_lag.to_string() +
       " alerts=" +
       alerts.to_string() +
+      " snapshot_age_ms=" +
+      snapshot_age.to_string() +
+      " writer_stale=" +
+      (if writer_stale { "true" } else { "false" }) +
       " [" +
       backlog_status +
+      "]",
+    )
+    println(
+      "ingest: event_lag_ms=" +
+      event_lag.to_string() +
+      " threshold_ms=" +
+      event_lag_warn.to_string() +
+      " [" +
+      ingest_status +
       "]",
     )
     println(
@@ -13231,6 +13381,13 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       fails.to_string() +
       " attempts=" +
       attempts.to_string() +
+      " fail_rate_pct=" +
+      fail_rate.to_string() +
+      (if top_error_cmd != "" {
+        " top=" + top_error_cmd + "x" + top_error_count.to_string()
+      } else {
+        ""
+      }) +
       " [" +
       failures_status +
       "]",
