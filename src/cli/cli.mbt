@@ -4887,7 +4887,9 @@ fn cmd_ingest_fifo(
     total.to_string() +
     " written / " +
     sampled.to_string() +
-    " sampled out / " +
+    " sampled out (keep " +
+    actual_sample_rate_pct(total.to_int64(), sampled.to_int64()).to_string() +
+    "%) / " +
     duplicates.to_string() +
     " duplicates, " +
     path +
@@ -5091,6 +5093,46 @@ fn selfmon_report_http(dir : String, q : HttpQueue) -> Unit {
 ///|
 /// Write one batch from the queue head, compact the backing array periodically,
 /// and raise a warning when the backlog exceeds the alert threshold.
+
+///|
+/// Actual keep-rate of source sampling (1.5 "采样率实际生效"): written lines
+/// over total inbound lines, in percent. 0 when nothing arrived yet.
+pub fn actual_sample_rate_pct(written : Int64, sampled : Int64) -> Int64 {
+  let total = written + sampled
+  if total <= (0 : Int64) {
+    (0 : Int64)
+  } else {
+    written * (100 : Int64) / total
+  }
+}
+
+///|
+/// JSON object describing the sampling configuration in force plus the
+/// observed keep rate, so "the configured rate actually applies" is verifiable
+/// from /stats instead of being hand-computed from counters.
+fn sampling_stats_json(
+  cfg : @core.SamplingConfig?,
+  written : Int64,
+  sampled : Int64,
+) -> String {
+  match cfg {
+    Some(c) =>
+      "{\"min_level\":" +
+      c.min_level.to_string() +
+      ",\"sample_rate\":" +
+      c.sample_rate.to_string() +
+      ",\"include\":" +
+      (if c.include_text.length() > 0 { "true" } else { "false" }) +
+      ",\"exclude\":" +
+      (if c.exclude_text.length() > 0 { "true" } else { "false" }) +
+      ",\"keep_rate_pct\":" +
+      actual_sample_rate_pct(written, sampled).to_string() +
+      "}"
+    None => "null"
+  }
+}
+
+///|
 fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   if q.pending <= 0 {
     return
@@ -5246,6 +5288,8 @@ fn handle_http_connection(
         q.written.to_string() +
         ",\"sampled_out\":" +
         q.sampled.to_string() +
+        ",\"sampling\":" +
+        sampling_stats_json(q.opts.sampling, q.written, q.sampled) +
         ",\"duplicates\":" +
         q.duplicates.to_string() +
         ",\"backlog_alerts\":" +
@@ -5578,7 +5622,9 @@ fn cmd_http(
     q.written.to_string() +
     " written / " +
     q.sampled.to_string() +
-    " sampled out / " +
+    " sampled out (keep " +
+    actual_sample_rate_pct(q.written, q.sampled).to_string() +
+    "%) / " +
     q.duplicates.to_string() +
     " duplicates, peak " +
     q.peak_pending.to_string() +
