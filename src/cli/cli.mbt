@@ -742,6 +742,7 @@ fn cmd_put(
   run_locked(dir, true, () => {
     let rule = active_quota_rule(dir)
     let kb = @utf8.encode(key)
+    require_scope(dir, "put", kb)
     let vb0 = @utf8.encode(value)
     let vb = match uid {
       Some(u) => dedup_attach_uid(vb0, u)
@@ -801,6 +802,7 @@ fn cmd_put_if(
   run_locked(dir, true, () => {
     let rule = active_quota_rule(dir)
     let kb = @utf8.encode(key)
+    require_scope(dir, "put-if", kb)
     let vb = @utf8.encode(value)
     let incoming : Int64 = (kb.length() + vb.length()).to_int64()
     match quota_write_error(dir, rule, incoming) {
@@ -840,6 +842,7 @@ fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
     let mut i = 3
     while i < n {
       let kb = @utf8.encode(args[i])
+      require_scope(dir, "put-batch", kb)
       let vb = @utf8.encode(args[i + 1])
       incoming = incoming + (kb.length() + vb.length()).to_int64()
       recs.push((kb, vb, now_ms()))
@@ -863,8 +866,10 @@ fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
 ///|
 fn cmd_delete(dir : String, key : String) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
+    let kb = @utf8.encode(key)
+    require_scope(dir, "delete", kb)
     let log = open_log(dir)
-    let off = log.delete(@utf8.encode(key), now_ms())
+    let off = log.delete(kb, now_ms())
     println("offset " + off.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
@@ -877,7 +882,10 @@ fn cmd_get(dir : String, offset : String) -> Unit raise @io.IoError {
     let log = open_log(dir)
     let off = parse_offset(offset)
     match log.get(off) {
-      Some(rec) => print_record(rec)
+      Some(rec) => {
+        require_scope(dir, "get", rec.key)
+        print_record(rec)
+      }
       None => println("not found")
     }
     close_log(log)
@@ -901,8 +909,12 @@ fn cmd_scan(
       None => log.next_offset()
     }
     // Streamed: large ranges never materialise in memory.
+    let scope = active_scope(dir)
     let mut count = 0
     log.for_each_while(lo, hi, rec => {
+      if !scope_allows_key(scope, rec.key) {
+        return true
+      }
       print_record(rec)
       count = count + 1
       true
@@ -918,11 +930,16 @@ fn cmd_scan(
 fn cmd_scan_prefix(dir : String, prefix : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let scope = active_scope(dir)
     let recs = log.scan_prefix(@utf8.encode(prefix))
+    let mut count = 0
     for rec in recs {
-      print_record(rec)
+      if scope_allows_key(scope, rec.key) {
+        print_record(rec)
+        count = count + 1
+      }
     }
-    println("(" + recs.length().to_string() + " records)")
+    println("(" + count.to_string() + " records)")
     close_log(log)
   })
 }
@@ -941,11 +958,16 @@ fn cmd_scan_range(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let scope = active_scope(dir)
     let recs = log.scan_key_range(@utf8.encode(lo), hi_bytes)
+    let mut count = 0
     for rec in recs {
-      print_record(rec)
+      if scope_allows_key(scope, rec.key) {
+        print_record(rec)
+        count = count + 1
+      }
     }
-    println("(" + recs.length().to_string() + " records)")
+    println("(" + count.to_string() + " records)")
     close_log(log)
   })
 }
@@ -965,8 +987,12 @@ fn cmd_scan_time(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let scope = active_scope(dir)
     let mut count = 0
     log.for_each_time_range(lo_ts, hi_ts, rec => {
+      if !scope_allows_key(scope, rec.key) {
+        return true
+      }
       print_record(rec)
       count = count + 1
       true
@@ -985,8 +1011,12 @@ fn cmd_tail(dir : String, n : String) -> Unit raise @io.IoError {
     let total = log.next_offset()
     let un = count_req.to_uint64()
     let from = if total > un { total - un } else { (0 : UInt64) }
+    let scope = active_scope(dir)
     let mut count = 0
     log.for_each_while(from, total, rec => {
+      if !scope_allows_key(scope, rec.key) {
+        return true
+      }
       print_record(rec)
       count = count + 1
       true
@@ -2115,8 +2145,10 @@ fn cmd_cursor_drop(dir : String, name : String) -> Unit raise @io.IoError {
 /// segments that cannot contain it.
 fn cmd_has_key(dir : String, key : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
+    let kb = @utf8.encode(key)
+    require_scope(dir, "has-key", kb)
     let log = open_log(dir)
-    match log.get_latest_bloom(@utf8.encode(key)) {
+    match log.get_latest_bloom(kb) {
       Some(_) => println("present")
       None => println("absent")
     }
@@ -2127,9 +2159,11 @@ fn cmd_has_key(dir : String, key : String) -> Unit raise @io.IoError {
 ///|
 fn cmd_getkey(dir : String, key : String) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
+    let kb = @utf8.encode(key)
+    require_scope(dir, "getkey", kb)
     let log = open_log(dir)
     let index = log.build_key_index()
-    match log.get_latest(index, @utf8.encode(key)) {
+    match log.get_latest(index, kb) {
       Some(rec) => print_record(rec)
       None => println("not found")
     }
@@ -2161,6 +2195,9 @@ fn keys_from_file(file : String) -> Array[Bytes] {
 /// Latest live value for each of several keys, in the given order.
 fn cmd_get_many(dir : String, keys : Array[Bytes]) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
+    for k in keys {
+      require_scope(dir, "get-many", k)
+    }
     let log = open_log(dir)
     let recs = log.get_many(keys)
     let mut i = 0
@@ -2186,9 +2223,11 @@ fn cmd_getkey_live(
     _ => raise @io.IoError::Invalid("invalid ttl: " + ttl)
   }
   run_locked(dir, false, () => {
+    let kb = @utf8.encode(key)
+    require_scope(dir, "getkey-live", kb)
     let log = open_log(dir)
     let index = log.build_key_index()
-    match log.get_latest_at(index, @utf8.encode(key), now_ms(), ttl_ms) {
+    match log.get_latest_at(index, kb, now_ms(), ttl_ms) {
       Some(rec) => print_record(rec)
       None => println("not found")
     }
@@ -2692,9 +2731,13 @@ fn cmd_export_jsonl(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let scope = active_scope(dir)
     let buf = @buffer.Buffer::Buffer()
     let mut count = 0
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if !scope_allows_key(scope, rec.key) {
+        return true
+      }
       if has_prefix && !bytes_has_prefix_cli(rec.key, pb) {
         return true
       }
@@ -3434,6 +3477,7 @@ fn cmd_follow(
   service : String?,
   flush : Bool,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let mut from : UInt64 = (0 : UInt64)
   if start == "tail" {
     let lock = @backend_native.DirLock::acquire_timeout(
@@ -3555,6 +3599,9 @@ fn cmd_follow(
               }
             }
           }
+        }
+        if keep && !scope_allows_key(scope, rec.key) {
+          keep = false
         }
         if keep {
           if json {
@@ -4114,6 +4161,7 @@ fn ingest_lines(
   let mut written = 0
   let mut sampled_out = 0
   let mut duplicates = 0
+  let scope = active_scope(dir)
   let mut i = 0
   // One lock hold and one metadata write per window of up to 16 batches:
   // each metadata flush is an atomic MANIFEST/sidecar update with several
@@ -4169,6 +4217,14 @@ fn ingest_lines(
             schema_transform(raw_k, raw_v, fields, ts_base + j.to_int64())
           } else {
             (raw_k, raw_v, None)
+          }
+          if !scope_allows_key(scope, k) {
+            record_scope_denied(dir, "ingest", k)
+            raise @io.IoError::Invalid(
+              "permission denied: key '" +
+              bytes_to_string(k) +
+              "' is outside the role's data scope",
+            )
           }
           // 2.4: mask sensitive content and append enrichment metadata before
           // the value reaches the log, so nothing sensitive lands on disk and
@@ -4812,6 +4868,19 @@ fn handle_http_connection(
         )
         return
       }
+      match auth {
+        Some(r) =>
+          match r.scope {
+            Some(_) => {
+              http_respond(
+                conn, 403, "{\"error\":\"stats require an unscoped role\"}",
+              )
+              return
+            }
+            None => ()
+          }
+        None => ()
+      }
     }
     run_locked(dir, false, () => {
       let log = open_log(dir)
@@ -4885,6 +4954,41 @@ fn handle_http_connection(
     if lines.length() > 10000 {
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
+    }
+    // 6.1 index isolation: reject the whole request when any line falls
+    // outside the token role's data scope (the 202 contract stays intact).
+    match auth {
+      Some(r) =>
+        match r.scope {
+          Some(prefix) => {
+            let mut denied : Bytes? = None
+            for line in lines {
+              let (k, _, _) = parse_ingest_line(line, q.opts)
+              if !scope_allows_key(Some(prefix), k) {
+                denied = Some(k)
+                break
+              }
+            }
+            match denied {
+              Some(k) => {
+                audit_log(
+                  dir,
+                  bytes_to_string(r.name),
+                  "http",
+                  "deny",
+                  "scope:" + bytes_to_string(k),
+                )
+                http_respond(
+                  conn, 403, "{\"error\":\"key outside role scope\"}",
+                )
+                return
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
+      None => ()
     }
     // Source-side sampling runs before the queue, so the capacity below counts
     // only lines that will actually be written.
@@ -5166,6 +5270,7 @@ fn cmd_search(
   require_time : Bool,
   timeout : String?,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   if inverted && wildcard {
     raise @io.IoError::Invalid(
       "--wildcard and --inverted are mutually exclusive",
@@ -5339,7 +5444,7 @@ fn cmd_search(
                 Some(t) => if r.timestamp > t { in_time = false }
                 None => ()
               }
-              if in_time {
+              if in_time && scope_allows_key(scope, r.key) {
                 print_record(r)
                 hits = hits + 1
               }
@@ -5389,6 +5494,9 @@ fn cmd_search(
       }
       if abort_msg is Some(_) {
         return false
+      }
+      if !scope_allows_key(scope, rec.key) {
+        return true
       }
       let hit = if wildcard {
         if field == "key" {
@@ -5650,6 +5758,7 @@ fn cmd_query(
   timeout : String?,
   explain : Bool,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let level_b : Bytes? = match level {
     Some(s) => Some(@utf8.encode(s))
     None => None
@@ -6022,7 +6131,7 @@ fn cmd_query(
                   )
                 }
               }
-              if hit {
+              if hit && scope_allows_key(scope, r.key) {
                 if json {
                   print_json_record(r)
                 } else {
@@ -6092,6 +6201,9 @@ fn cmd_query(
           }
         }
         if stop || abort_msg is Some(_) {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let mut hit = true
@@ -6218,6 +6330,7 @@ fn cmd_context(
   thread_id : String?,
   sort_by_time : Bool,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let target = parse_offset(offset)
   let b = match before {
     Some(s) =>
@@ -6237,6 +6350,12 @@ fn cmd_context(
     let log = open_log(dir)
     if target >= log.next_offset() {
       raise @io.IoError::Invalid("offset out of range: " + offset)
+    }
+    // 6.1: the anchor itself must be inside the role's data scope; otherwise
+    // context would leak a cross-project record (and its neighbours).
+    match log.get(target) {
+      Some(anchor) => require_scope(dir, "context", anchor.key)
+      None => ()
     }
     // Correlation predicates (4.4): explicit values, or `auto` extracted from
     // the anchor record (KV or JSON, with field-name normalization).
@@ -6302,6 +6421,9 @@ fn cmd_context(
     let mut out_after = 0
     let window : Array[@core.Record] = []
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if !scope_allows_key(scope, rec.key) {
+        return true
+      }
       if rec.offset == target {
         for r in ring {
           window.push(r)
@@ -6483,6 +6605,7 @@ fn cmd_aggregate(
   since : String?,
   until : String?,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let top_n = match top {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -6587,6 +6710,9 @@ fn cmd_aggregate(
           }
         }
         if abort_msg is Some(_) {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let mut in_time = true
@@ -6882,6 +7008,7 @@ fn cmd_dashboard(
   top : String,
   json : Bool,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   if bucket != "minute" && bucket != "hour" && bucket != "day" {
     raise @io.IoError::Invalid(
       "invalid bucket: " + bucket + " (minute|hour|day)",
@@ -7015,6 +7142,9 @@ fn cmd_dashboard(
           return
         }
         if rec.timestamp < from_ts || rec.timestamp > to_ts {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let fields = ctx_value_fields(rec.value)
@@ -7535,6 +7665,7 @@ fn cmd_anomalies(
   until : String?,
   json : Bool,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let base_ms = (@string.parse_int64(baseline_sec) catch {
       _ => raise @io.IoError::Invalid("invalid baseline: " + baseline_sec)
     }) *
@@ -7653,6 +7784,9 @@ fn cmd_anomalies(
           }
         }
         if aborted is Some(_) {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let in_recent = rec.timestamp >= recent_start &&
@@ -8073,6 +8207,7 @@ fn cmd_cluster(
   since : String?,
   until : String?,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let top_n = match top {
     Some(s) =>
       @string.parse_int(s) catch {
@@ -8155,6 +8290,9 @@ fn cmd_cluster(
           }
         }
         if abort_msg is Some(_) {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let mut in_time = true
@@ -8319,6 +8457,7 @@ fn cmd_trend(
   since : String?,
   until : String?,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   if bucket != "minute" && bucket != "hour" && bucket != "day" {
     raise @io.IoError::Invalid(
       "invalid bucket: " + bucket + " (minute|hour|day)",
@@ -8400,6 +8539,9 @@ fn cmd_trend(
           }
         }
         if abort_msg is Some(_) {
+          return
+        }
+        if !scope_allows_key(scope, rec.key) {
           return
         }
         let mut in_time = true
@@ -9425,6 +9567,94 @@ fn cmd_baseline(
 ///|
 /// Load the RBAC rules from `<dir>/RBAC` (empty when the file is missing or
 /// unreadable).
+
+///|
+/// The data scope of the current RBAC role (6.1): None when the directory is
+/// in open local mode, the role is unscoped, or the role cannot be resolved.
+/// Dispatch has already rejected unmatched tokens, so a non-empty prefix here
+/// is authoritative.
+fn active_scope(dir : String) -> Bytes? {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return None
+  }
+  let rules = load_rbac_rules(dir)
+  let token = match @env.get_env_var("MOONLOG_TOKEN") {
+    Some(t) => @utf8.encode(t)
+    None => b""
+  }
+  match @core.rbac_find(rules, token) {
+    Some(role) => role.scope
+    None => None
+  }
+}
+
+///|
+/// Whether `key` falls inside the data scope (None = whole index).
+fn scope_allows_key(scope : Bytes?, key : Bytes) -> Bool {
+  match scope {
+    None => true
+    Some(prefix) => {
+      if key.length() < prefix.length() {
+        return false
+      }
+      let mut i = 0
+      while i < prefix.length() {
+        if key.at(i) != prefix.at(i) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+  }
+}
+
+///|
+/// Audit a data-scope violation as a deny (6.1), so cross-project attempts are
+/// attributable like command-level denials.
+fn record_scope_denied(dir : String, cmd : String, key : Bytes) -> Unit {
+  audit_log(dir, audit_actor(dir), cmd, "deny", "scope:" + bytes_to_string(key))
+}
+
+///|
+/// Reject a key outside the current role's data scope with an explicit error
+/// (6.1); the denial is audited. Used by write and single-key read paths.
+fn require_scope(
+  dir : String,
+  cmd : String,
+  key : Bytes,
+) -> Unit raise @io.IoError {
+  if !scope_allows_key(active_scope(dir), key) {
+    record_scope_denied(dir, cmd, key)
+    raise @io.IoError::Invalid(
+      "permission denied: key '" +
+      bytes_to_string(key) +
+      "' is outside the role's data scope",
+    )
+  }
+}
+
+///|
+/// Whole-index operations that a scoped role must not run even with `allow=*`
+/// (6.1 index isolation): they copy, delete, renumber or reconfigure the whole
+/// directory and would bypass the key-prefix scope.
+fn global_only_cmd(cmd : String) -> Bool {
+  let list : Array[String] = [
+    "backup", "restore", "archive", "export", "replicate", "ha-failover", "ha-rebalance",
+    "ha-watch", "drill", "recover", "compact", "compact-expired", "merge", "prune",
+    "prune-bytes", "prune-before", "prune-expired", "prune-superseded", "compress",
+    "tier", "import", "maintain", "ttl-expire", "purge", "fsck", "selfmon", "serve",
+    "rbac", "quota",
+  ]
+  for c in list {
+    if c == cmd {
+      return true
+    }
+  }
+  false
+}
+
+///|
 fn load_rbac_rules(dir : String) -> Array[@core.RbacRole] {
   let data = @backend_native.read_file(dir + "/RBAC")
   let rules : Array[@core.RbacRole] = []
@@ -10036,6 +10266,11 @@ fn cmd_rbac(
         bytes_to_string(r.name) +
         " allow=" +
         allow_text(r.allow) +
+        " scope=" +
+        (match r.scope {
+          Some(s) => bytes_to_string(s)
+          None => "*"
+        }) +
         " token=" +
         mask_token(bytes_to_string(r.token)),
       )
@@ -10058,6 +10293,10 @@ fn cmd_rbac(
             bytes_to_string(r.token) +
             " allow=" +
             allow_text(r.allow) +
+            (match r.scope {
+              Some(s) => " scope=" + bytes_to_string(s)
+              None => ""
+            }) +
             "\n",
           ),
         )
@@ -10071,7 +10310,16 @@ fn cmd_rbac(
     }
     let command = args[start]
     if rbac_check(dir, command) {
-      println("allowed: " + command)
+      if args.length() > start + 1 {
+        let key = @utf8.encode(args[start + 1])
+        if scope_allows_key(active_scope(dir), key) {
+          println("allowed: " + command + " " + args[start + 1])
+        } else {
+          println("denied: " + command + " " + args[start + 1] + " (scope)")
+        }
+      } else {
+        println("allowed: " + command)
+      }
     } else {
       println("denied: " + command)
     }
@@ -10310,12 +10558,26 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   let bootstrapping = cmd == "rbac" &&
     args.length() > 3 &&
     (args[3] == "init" || args[3] == "check")
-  if !bootstrapping && !rbac_check(args[2], cmd) {
+  // The HTTP gateway authenticates every request with a Bearer token
+  // (6.1/6.2), so launching it must not require the operator to hold a
+  // tenant token; otherwise a scoped store could not expose its push endpoint.
+  let request_authed_gateway = cmd == "http"
+  if !bootstrapping && !request_authed_gateway && !rbac_check(args[2], cmd) {
     record_denied(args[2], cmd, args)
     println(
       "permission denied: '" +
       cmd +
       "' requires MOONLOG_TOKEN with a permitted role",
+    )
+    return
+  }
+  // 6.1 index isolation: whole-index operations require an unscoped role.
+  if !bootstrapping && global_only_cmd(cmd) && active_scope(args[2]) is Some(_) {
+    record_scope_denied(args[2], cmd, b"<whole-index>")
+    println(
+      "permission denied: '" +
+      cmd +
+      "' is a whole-index operation and requires an unscoped role",
     )
     return
   }
