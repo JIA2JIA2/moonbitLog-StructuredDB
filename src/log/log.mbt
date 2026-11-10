@@ -610,7 +610,14 @@ pub fn[W, R : @io.LogReader] Log::expire_by_policy(
           rec.key,
           @core.ttl_record_level(rec.value),
         )
-        if rec.timestamp + days * (86400000 : Int64) > now {
+        // A negative age means "keep forever" (no matching rule and no
+        // default retention); treating it as an age would mark every record
+        // expired. Quota-only policies rely on this: an unscoped tenant's
+        // records must not age out just because another tenant has
+        // retain-days set.
+        if days < 0 {
+          all_expired = false
+        } else if rec.timestamp + days * (86400000 : Int64) > now {
           all_expired = false
         } else {
           expired_seen = expired_seen + 1

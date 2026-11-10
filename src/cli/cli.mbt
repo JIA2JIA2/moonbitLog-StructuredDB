@@ -1717,7 +1717,25 @@ fn cmd_ttl_expire(
   json : Bool,
 ) -> Unit raise @io.IoError {
   let ppath = dir + "/TTL"
-  if !@backend_native.file_exists(ppath) {
+  let raw = if @backend_native.file_exists(ppath) {
+    @backend_native.read_file(ppath)
+  } else {
+    b""
+  }
+  let base : @core.TtlPolicy = if raw.length() == 0 {
+    { default_days: -1, rules: [], }
+  } else {
+    match @core.parse_ttl_policy(raw) {
+      Some(p) => p
+      None => raise @io.IoError::Invalid("invalid TTL policy file: " + ppath)
+    }
+  }
+  // 6.2: per-tenant retain-days overrides join as prefix rules (strictest
+  // matching rule wins, so quotas only tighten file-based retention). Apply
+  // them even when the TTL file is absent: a QUOTA-only retention policy must
+  // not silently no-op.
+  let policy = effective_ttl_policy(dir, base)
+  if policy.default_days < 0 && policy.rules.length() == 0 {
     if json {
       println(
         "{\"policy\":false,\"dry_run\":" +
@@ -1725,18 +1743,17 @@ fn cmd_ttl_expire(
         ",\"segments_dropped\":0,\"records_expired\":0}",
       )
     } else {
-      println("no TTL policy file (" + ppath + ") — nothing to do")
+      println(
+        "no retention policy (TTL absent and no QUOTA retain-days) — nothing to do",
+      )
     }
     return
   }
-  let raw = @backend_native.read_file(ppath)
-  let policy = match @core.parse_ttl_policy(raw) {
-    Some(p) => p
-    None => raise @io.IoError::Invalid("invalid TTL policy file: " + ppath)
+  let audit_policy = if raw.length() > 0 {
+    @utf8.decode_lossy(raw)
+  } else {
+    "from QUOTA retain-days"
   }
-  // 6.2: per-tenant retain-days overrides join as prefix rules (strictest
-  // matching rule wins, so quotas only tighten file-based retention).
-  let policy = effective_ttl_policy(dir, policy)
   run_locked(dir, true, () => {
     let log = open_log(dir)
     let (dropped, expired) = log.expire_by_policy(
@@ -1751,7 +1768,8 @@ fn cmd_ttl_expire(
     @backend_native.flush_meta(dir, log)
     close_log(log)
     if !dry_run {
-      append_ttl_audit(dir, @utf8.decode_lossy(raw), dropped, expired, "cli")
+      quota_recalc_storage_quiet(dir)
+      append_ttl_audit(dir, audit_policy, dropped, expired, "cli")
     }
     if json {
       println(
@@ -1877,25 +1895,31 @@ fn run_maintenance(
     // Automatic differentiated-TTL expiry when a policy file exists (3.4):
     // every serve/maintain pass re-evaluates retention and audits the run.
     let ttl_path = dir + "/TTL"
-    if @backend_native.file_exists(ttl_path) {
-      let raw_policy = @backend_native.read_file(ttl_path)
+    let raw_policy = if @backend_native.file_exists(ttl_path) {
+      @backend_native.read_file(ttl_path)
+    } else {
+      b""
+    }
+    let base_policy : @core.TtlPolicy = if raw_policy.length() == 0 {
+      { default_days: -1, rules: [], }
+    } else {
       match @core.parse_ttl_policy(raw_policy) {
-        Some(policy) => {
-          let policy = effective_ttl_policy(dir, policy)
-          let (td, te) = log.expire_by_policy(now_ms(), policy, on_drop=seg => {
-            @backend_native.remove_segment_files(dir, seg.base_offset)
-            seg.writer.close()
-          })
-          append_ttl_audit(
-            dir,
-            @utf8.decode_lossy(raw_policy),
-            td,
-            te,
-            "maintain",
-          )
-        }
-        None => ()
+        Some(p) => p
+        None => { default_days: -1, rules: [], }
       }
+    }
+    let policy = effective_ttl_policy(dir, base_policy)
+    if policy.default_days >= 0 || policy.rules.length() > 0 {
+      let (td, te) = log.expire_by_policy(now_ms(), policy, on_drop=seg => {
+        @backend_native.remove_segment_files(dir, seg.base_offset)
+        seg.writer.close()
+      })
+      let audit_policy = if raw_policy.length() > 0 {
+        @utf8.decode_lossy(raw_policy)
+      } else {
+        "from QUOTA retain-days"
+      }
+      append_ttl_audit(dir, audit_policy, td, te, "maintain")
     }
     // Build the inverted/field-column sidecars so indexed queries load them
     // instead of rebuilding from data (3.2). Idempotent.
@@ -1904,6 +1928,7 @@ fn run_maintenance(
     }
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    quota_recalc_storage_quiet(dir)
     (merged, dropped, folded, packed)
   })
 }
@@ -2249,6 +2274,7 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
     println("compacted " + n.to_string() + " records")
     println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2270,6 +2296,7 @@ fn cmd_compact_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
     println("compacted " + n.to_string() + " records")
     println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2899,6 +2926,7 @@ fn cmd_purge(
       " (prefix scan after physical compaction)",
     )
     println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -5343,6 +5371,7 @@ fn cmd_search(
   // the same concurrency slot, timeout and scan budget as `query`. Without
   // this, a large `search` (linear or inverted) bypasses every guard.
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let timeout_val : Int64 = match timeout {
     Some(t) =>
       @string.parse_int64(t) catch {
@@ -5808,23 +5837,8 @@ fn cmd_query(
   }
   // 4.6 query guard: concurrency slot, per-segment timeout and scan budget.
   acquire_query_slot(dir)
-  // 6.2 tenant concurrency quota: additionally hold one of the tenant's own
-  // slots (QLOCK.<role>.<i>) so a single tenant cannot occupy the whole
-  // global pool. The `default` rule covers anonymous/open-local callers.
-  let quota_rules = load_quota_rules(dir)
-  if quota_rules.length() > 0 {
-    let role = match current_role(dir) {
-      Some(r) => r
-      None => b""
-    }
-    match @core.quota_for_role(quota_rules, role) {
-      Some(rule) =>
-        if rule.query_concurrent > 0 {
-          acquire_tenant_query_slot(dir, role, rule.query_concurrent)
-        }
-      None => ()
-    }
-  }
+  // 6.2 tenant concurrency quota, shared with every analysis entry point.
+  acquire_tenant_query_quota(dir)
   let timeout_val : Int64 = match timeout {
     Some(t) =>
       @string.parse_int64(t) catch {
@@ -6672,6 +6686,7 @@ fn cmd_aggregate(
   // 5.1 production guards: share the 4.6 query slot/guard and scan outside
   // the writer lock, so a slow aggregation does not stall ingestion.
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: query_timeout_ms(),
@@ -7091,6 +7106,7 @@ fn cmd_dashboard(
   // masquerade as "too many concurrent queries" on a fresh inspection target.
   ignore(@backend_native.ensure_dir(dir))
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: query_timeout_ms(),
@@ -7739,6 +7755,7 @@ fn cmd_anomalies(
   // "too many concurrent queries" on a fresh inspection target.
   ignore(@backend_native.ensure_dir(dir))
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: query_timeout_ms(),
@@ -8252,6 +8269,7 @@ fn cmd_cluster(
     None => None
   }
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: query_timeout_ms(),
@@ -8504,6 +8522,7 @@ fn cmd_trend(
     None => None
   }
   acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: query_timeout_ms(),
@@ -9950,6 +9969,132 @@ fn dir_log_bytes(dir : String) -> Int64 {
 /// bytes would exceed the rule's storage share or the persisted write
 /// window; None means admitted (nothing is persisted yet — pair with
 /// `quota_record_write` once the data is actually accepted).
+
+///|
+/// The data scope attached to `role` in the directory's RBAC file (None when
+/// RBAC is absent, the role is unscoped, or the name has no rule). Quota
+/// storage is measured over this prefix, so one tenant's data never consumes
+/// another tenant's storage budget.
+fn role_scope(dir : String, role : Bytes) -> Bytes? {
+  for r in load_rbac_rules(dir) {
+    if r.name == role {
+      return r.scope
+    }
+  }
+  None
+}
+
+///|
+/// Ledger path for a role's tenant storage: payload bytes (key+value) of
+/// records whose keys fall inside the role's data scope.
+fn quota_storage_path(dir : String, r : @core.QuotaRule) -> String {
+  dir + "/QUOTA_STATE/" + sanitize_role_name(r.role) + ".storage"
+}
+
+///|
+/// Payload bytes of records inside `scope` (None = whole directory): the
+/// tenant storage measure. Append-only versions count, so compaction and
+/// `quota --recalc` reduce it; segment headers/CRC/sidecars are excluded.
+fn tenant_storage_bytes(dir : String, scope : Bytes?) -> Int64 {
+  let log = open_log(dir) catch { _ => return 0 }
+  let mut total : Int64 = 0
+  ignore(
+    log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      if scope_allows_key(scope, rec.key) {
+        total = total + (rec.key.length() + rec.value.length()).to_int64()
+      }
+      true
+    }) catch {
+      _ => ()
+    },
+  )
+  close_log(log)
+  total
+}
+
+///|
+/// Current tenant storage usage from the persisted ledger; when the ledger is
+/// missing (first write after enabling storage-bytes) the scope is scanned
+/// once and the result is written back, so later writes stay O(1).
+fn quota_storage_used(dir : String, r : @core.QuotaRule) -> Int64 {
+  let path = quota_storage_path(dir, r)
+  let data = @backend_native.read_file(path)
+  let mut ledger : Int64 = -1
+  if data.length() > 0 {
+    for pair in @core.parse_kv_pairs(data) {
+      if pair.0 == b"bytes" {
+        let v = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+          _ => -1
+        }
+        if v >= (0 : Int64) {
+          ledger = v
+        }
+      }
+    }
+  }
+  if ledger >= 0 {
+    return ledger
+  }
+  let used = tenant_storage_bytes(dir, role_scope(dir, r.role))
+  ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+  ignore(
+    @backend_native.write_file(path, @utf8.encode("bytes=" + used.to_string())) catch {
+      _ => ()
+    },
+  )
+  used
+}
+
+///|
+
+///|
+/// Recompute storage ledgers without printing (after compaction/expiry, so a
+/// spent ledger does not keep rejecting writes until the next manual recalc).
+fn quota_recalc_storage_quiet(dir : String) -> Unit {
+  let rules = load_quota_rules(dir)
+  for r in rules {
+    if r.storage_bytes >= 0 {
+      let used = tenant_storage_bytes(dir, role_scope(dir, r.role))
+      ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+      ignore(
+        @backend_native.write_file(
+          quota_storage_path(dir, r),
+          @utf8.encode("bytes=" + used.to_string()),
+        ) catch {
+          _ => ()
+        },
+      )
+    }
+  }
+}
+
+///|
+fn quota_recalc_storage(dir : String) -> Unit {
+  let rules = load_quota_rules(dir)
+  for r in rules {
+    if r.storage_bytes >= 0 {
+      let used = tenant_storage_bytes(dir, role_scope(dir, r.role))
+      ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+      ignore(
+        @backend_native.write_file(
+          quota_storage_path(dir, r),
+          @utf8.encode("bytes=" + used.to_string()),
+        ) catch {
+          _ => ()
+        },
+      )
+      println(
+        "storage recalculated for role '" +
+        bytes_to_string(r.role) +
+        "': " +
+        used.to_string() +
+        " payload bytes",
+      )
+    }
+  }
+}
+
+///|
 fn quota_write_error(
   dir : String,
   rule : @core.QuotaRule?,
@@ -9960,8 +10105,9 @@ fn quota_write_error(
     None => return None
   }
   if r.storage_bytes >= 0 {
-    let used = dir_log_bytes(dir)
+    let used = quota_storage_used(dir, r)
     if used + incoming > r.storage_bytes {
+      audit_log(dir, bytes_to_string(r.role), "quota", "deny", "storage-bytes")
       return Some(
         "storage quota exceeded for role '" +
         bytes_to_string(r.role) +
@@ -9969,13 +10115,14 @@ fn quota_write_error(
         (used + incoming).to_string() +
         " > " +
         r.storage_bytes.to_string() +
-        " bytes on disk (prune old data or raise storage-bytes)",
+        " payload bytes in scope (compact or raise storage-bytes; `quota --recalc` refreshes the ledger)",
       )
     }
   }
   if r.write_bytes >= 0 {
     let usage = quota_window_usage(dir, r)
     if !@core.quota_write_allows(usage, r.write_bytes, incoming) {
+      audit_log(dir, bytes_to_string(r.role), "quota", "deny", "write-bytes")
       return Some(
         "write quota exceeded for role '" +
         bytes_to_string(r.role) +
@@ -10013,6 +10160,15 @@ fn quota_record_write(
     Some(r) => r
     None => return
   }
+  // Tenant storage ledger: append-only payload bytes inside the role's scope.
+  if r.storage_bytes >= 0 {
+    let used = quota_storage_used(dir, r)
+    ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+    @backend_native.write_file(
+      quota_storage_path(dir, r),
+      @utf8.encode("bytes=" + (used + incoming).to_string()),
+    )
+  }
   if r.write_bytes < 0 {
     return
   }
@@ -10027,10 +10183,6 @@ fn quota_record_write(
 }
 
 ///|
-/// The effective TTL policy for `dir` (3.4 + 6.2): the parsed TTL file plus
-/// one `prefix` rule per scoped role with a `retain-days` quota override.
-/// Expiry keeps the strictest matching rule, so tenant quotas can only
-/// tighten — never extend — file-based retention.
 fn effective_ttl_policy(
   dir : String,
   policy : @core.TtlPolicy,
@@ -10098,6 +10250,31 @@ fn acquire_tenant_query_slot(
 ///|
 /// Strip an ASCII-case-insensitive `Bearer ` prefix from an Authorization
 /// header value; values without the prefix pass through unchanged.
+
+///|
+/// Apply the tenant query-concurrency quota (6.2) after the global slot: a
+/// role's `query-concurrent` caps its own concurrent analysis commands, so one
+/// tenant cannot monopolize the shared pool. Commands without a resolved role
+/// fall back to the `default` rule.
+fn acquire_tenant_query_quota(dir : String) -> Unit raise @io.IoError {
+  let rules = load_quota_rules(dir)
+  if rules.length() == 0 {
+    return
+  }
+  let role = match current_role(dir) {
+    Some(r) => r
+    None => b""
+  }
+  match @core.quota_for_role(rules, role) {
+    Some(rule) =>
+      if rule.query_concurrent > 0 {
+        acquire_tenant_query_slot(dir, role, rule.query_concurrent)
+      }
+    None => ()
+  }
+}
+
+///|
 fn http_bearer_token(authorization : Bytes) -> Bytes {
   let prefix = b"Bearer "
   if authorization.length() < prefix.length() {
@@ -10122,7 +10299,10 @@ fn http_bearer_token(authorization : Bytes) -> Bytes {
 /// Show the directory's per-tenant quota policy (6.2) and each limited
 /// role's current write-window usage. Rules are edited directly in
 /// `<dir>/QUOTA`.
-fn cmd_quota(dir : String) -> Unit {
+fn cmd_quota(dir : String, recalc : Bool) -> Unit {
+  if recalc {
+    quota_recalc_storage(dir)
+  }
   let rules = load_quota_rules(dir)
   if rules.length() == 0 {
     println(
@@ -10167,9 +10347,18 @@ fn cmd_quota(dir : String) -> Unit {
         " used=" + quota_window_usage(dir, r).used.to_string()
       } else {
         ""
+      }) +
+      (if r.storage_bytes >= 0 {
+        " storage-used=" + quota_storage_used(dir, r).to_string()
+      } else {
+        ""
       })
     println(line)
   }
+  println(
+    "directory payload bytes (all scopes): " +
+    tenant_storage_bytes(dir, (None : Bytes?)).to_string(),
+  )
 }
 
 ///|
@@ -12253,7 +12442,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       cmd_rbac(args[2], args[3], args, 4)
     }
   } else if cmd == "quota" {
-    cmd_quota(args[2])
+    let mut recalc = false
+    let mut i = 3
+    while i < args.length() {
+      if args[i] == "--recalc" {
+        recalc = true
+      } else {
+        raise @io.IoError::Invalid("unknown quota option: " + args[i])
+      }
+      i = i + 1
+    }
+    cmd_quota(args[2], recalc)
   } else if cmd == "drill" {
     let keep = args.length() > 3 && args[3] == "--keep"
     cmd_drill(args[2], keep)
