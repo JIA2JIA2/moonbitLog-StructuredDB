@@ -1357,7 +1357,14 @@ fn is_backup_file(name : String) -> Bool {
   name == "RBAC" ||
   name == "TTL" ||
   name == "QUOTA" ||
-  name == "PARTITION"
+  name == "PARTITION" ||
+  // The operation-audit trail travels with the backup (6.6 "deletion is
+  // verifiable" relies on it surviving a disaster recovery); the live AUDIT
+  // file and its rotated AUDIT.N siblings are copied as-is, so a restored
+  // copy keeps the accountability history of the source. TTL_AUDIT (automatic
+  // maintenance records) and SELFMON runtime state stay excluded.
+  name == "AUDIT" ||
+  name.has_prefix("AUDIT.")
 }
 
 ///|
