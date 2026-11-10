@@ -201,13 +201,15 @@
 ///                                    (--since 0 for everything), pushed
 ///                                    down to segments; shares the query
 ///                                    guards and scans without the writer lock
-///   dashboard <dir> [--last sec] [--bucket minute|hour] [--service <svc>]
-///            [--quantile-field <f>] [--json]
-///                                    ops panel for daily inspection:
-///                                    volume/error-rate histogram, window
-///                                    totals, latency quantiles and top
-///                                    services (drill down with trend/query
-///                                    on suspicious windows)
+///   dashboard <dir> [--last sec] [--since ms] [--until ms]
+///            [--bucket minute|hour|day] [--by service|level|host|key]
+///            [--service <svc>] [--quantile-field <f>] [--top N] [--json]
+///                                    ops panel for daily inspection (5.5):
+///                                    volume/error histogram, per-bucket
+///                                    latency trend (p50/p95/p99), window
+///                                    totals, dimension breakdown;
+///                                    --since/--until drills into a
+///                                    historical incident window
 ///   anomalies <dir> [--baseline sec] [--recent sec] [--sigma N]
 ///            [--min-count N] [--top N] [--json]
 ///                                    automatic anomaly detection (5.6) —
@@ -6838,25 +6840,61 @@ fn cmd_aggregate(
 }
 
 ///|
-/// Ops dashboard (5.5): one scan, one panel for daily inspection — volume
-/// histogram with per-bucket error rate, window totals, optional latency
-/// quantiles (`--quantile-field`) and a top-service breakdown. Time-scoped
-/// by `--last <sec>` (default 3600), pushed down to segment min_ts/max_ts.
-/// Drill-down: shrink `--last`/`--bucket` and follow with `trend`/`query`/
-/// `context` on the suspicious window. Error = severity rank >= 3, or a
-/// literal "error" substring when the record has no level field.
+/// Sorted-in-place latency samples for an optional bucket array (empty when
+/// the bucket has no numeric samples), shared by the trend/JSON rendering.
+fn sorted_latency(vals : Array[Double]?) -> Array[Double] {
+  match vals {
+    Some(a) => {
+      a
+      .mut_view()
+      .sort_by(fn(x, y) { if x < y { -1 } else if x > y { 1 } else { 0 } })
+      a
+    }
+    None => []
+  }
+}
+
+///|
+/// Ops dashboard (5.5, optimized): one scan, one panel for daily inspection —
+/// volume histogram with per-bucket error rate, **per-bucket latency trend**
+/// (p50/p95/p99/max when `--quantile-field` is set), window totals, window
+/// latency quantiles, and a **switchable dimension breakdown** (`--by
+/// service|level|host|key`, default service). Time-scoped by `--last <sec>`
+/// (default 3600) or an absolute `--since/--until` window for historical
+/// drill-down (`--since 0` is the full history). Uses segment min_ts/max_ts
+/// pushdown, the 4.6 query slot/timeout/scan budget and a snapshot read, so a
+/// slow panel never stalls ingestion. Values are parsed from KV text or JSON
+/// objects (2.1 flattening), so SDK-appended structured logs work; error =
+/// severity rank >= 3 from a recognized level field (case-insensitive), or —
+/// only when no level field exists — a literal "error" substring (avoids the
+/// old false positive on `{"level":"INFO","msg":"no error"}`).
 fn cmd_dashboard(
   dir : String,
   last_sec : String,
   bucket : String,
   quantile_field : String?,
   service : String?,
+  since : String?,
+  until : String?,
+  by : String,
+  top : String,
   json : Bool,
 ) -> Unit raise @io.IoError {
   if bucket != "minute" && bucket != "hour" && bucket != "day" {
     raise @io.IoError::Invalid(
       "invalid bucket: " + bucket + " (minute|hour|day)",
     )
+  }
+  if by != "service" && by != "level" && by != "host" && by != "key" {
+    raise @io.IoError::Invalid(
+      "invalid dimension: " + by + " (service|level|host|key)",
+    )
+  }
+  let top_n = @string.parse_int(top) catch {
+    _ => raise @io.IoError::Invalid("invalid top: " + top)
+  }
+  if top_n <= 0 {
+    raise @io.IoError::Invalid("top must be positive")
   }
   let last_ms = (@string.parse_int64(last_sec) catch {
       _ => raise @io.IoError::Invalid("invalid last: " + last_sec)
@@ -6865,6 +6903,44 @@ fn cmd_dashboard(
   if last_ms <= 0 {
     raise @io.IoError::Invalid("last must be positive")
   }
+  let since_ts : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ts : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  match (since_ts, until_ts) {
+    (Some(f), Some(u)) =>
+      if u < f {
+        raise @io.IoError::Invalid("until must not be before since")
+      }
+    _ => ()
+  }
+  let now = now_ms()
+  let from_ts = match since_ts {
+    Some(f) => f
+    None => now - last_ms
+  }
+  let to_ts = match until_ts {
+    Some(u) => u
+    None => now
+  }
+  if to_ts < from_ts {
+    raise @io.IoError::Invalid("time window is empty (until < since)")
+  }
+  let window_sec = (to_ts - from_ts) / (1000 : Int64)
   let qfield : Bytes? = match quantile_field {
     Some(f) => Some(@utf8.encode(f))
     None => None
@@ -6873,74 +6949,147 @@ fn cmd_dashboard(
     Some(sv) => Some(@utf8.encode(sv))
     None => None
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let now = now_ms()
-    let from_ts = now - last_ms
+  let level_names : Array[Bytes] = [
+    b"level", b"severity", b"severity_text", b"lvl", b"loglevel", b"log.level",
+  ]
+  let service_names : Array[Bytes] = [
+    b"service", b"service.name", b"svc", b"app",
+  ]
+  let host_names : Array[Bytes] = [b"host", b"hostname", b"host.name", b"node"]
+  // 4.6 production guards: share the query slot/guard and scan outside the
+  // writer lock (snapshot read), so a slow panel cannot stall ingestion.
+  // Create the directory first: slot lookup on a missing path would loop and
+  // masquerade as "too many concurrent queries" on a fresh inspection target.
+  ignore(@backend_native.ensure_dir(dir))
+  acquire_query_slot(dir)
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: query_timeout_ms(),
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  run_read_snapshot(dir, log => {
     let bucket_total : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([],
     )
     let bucket_err : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([],
+    )
+    let bucket_lat : @hashmap.HashMap[String, Array[Double]] = @hashmap.HashMap::HashMap([],
+    )
+    let dim_total : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    let dim_err : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
+    let dim_lat : @hashmap.HashMap[Bytes, Array[Double]] = @hashmap.HashMap::HashMap([],
     )
     let svc_counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([],
     )
     let qvals : Array[Double] = []
     let mut total = 0
     let mut errors = 0
+    let mut aborted : String? = None
     for seg in log.segments {
+      if aborted is Some(_) {
+        break
+      }
       if seg.record_count > 0 {
         // Pushdown: skip segments disjoint from the inspection window.
         if seg.max_ts < from_ts {
           continue
         }
-        if seg.min_ts > now {
+        if seg.min_ts > to_ts {
           continue
         }
       }
+      qg.check(seg.size)
+      let mut seen = 0
       seg.for_each(seg.base_offset, seg.next_offset, rec => {
-        if rec.timestamp < from_ts || rec.timestamp > now {
+        seen = seen + 1
+        if seen % 512 == 0 {
+          match qg.check_soft(0) {
+            Some(m) => aborted = Some(m)
+            None => ()
+          }
+        }
+        if aborted is Some(_) {
           return
         }
+        if rec.timestamp < from_ts || rec.timestamp > to_ts {
+          return
+        }
+        let fields = ctx_value_fields(rec.value)
+        let svc = match ctx_field_from_pairs(fields, service_names) {
+          Some(s) => s
+          None => rec.key
+        }
         match service_b {
-          Some(sb) => if rec.key != sb { return }
+          Some(sb) =>
+            if !ctx_name_eq(svc, sb) && !ctx_name_eq(rec.key, sb) {
+              return
+            }
           None => ()
         }
         total = total + 1
         let label = @core.format_utc(rec.timestamp, bucket)
         bump_string(bucket_total, label)
-        let pairs = @core.parse_kv_pairs(rec.value)
-        let mut lv : Bytes? = None
-        for pair in pairs {
-          if pair.0 == b"level" {
-            lv = Some(pair.1)
-          }
-        }
-        let is_err = match lv {
-          Some(l) => @core.level_rank(l) >= 3
+        let level_v = ctx_field_from_pairs(fields, level_names)
+        let is_err = match level_v {
+          Some(l) => @core.level_rank(follow_lower_ascii(l)) >= 3
           None => match_needle(rec.value, b"error", true)
         }
         if is_err {
           errors = errors + 1
           bump_string(bucket_err, label)
         }
-        bump_bytes(svc_counts, rec.key)
+        bump_bytes(svc_counts, svc)
+        let dim : Bytes = if by == "level" {
+          match level_v {
+            Some(l) => follow_lower_ascii(l)
+            None => b"<none>"
+          }
+        } else if by == "host" {
+          match ctx_field_from_pairs(fields, host_names) {
+            Some(h) => h
+            None => b"<missing>"
+          }
+        } else if by == "key" {
+          rec.key
+        } else {
+          svc
+        }
+        bump_bytes(dim_total, dim)
+        if is_err {
+          bump_bytes(dim_err, dim)
+        }
         match qfield {
           Some(qf) =>
-            for pair in pairs {
-              if pair.0 == qf {
-                let d_opt = Some(
-                  @string.parse_double(@utf8.decode_lossy(pair.1)),
-                ) catch {
+            match ctx_field_from_pairs(fields, [qf]) {
+              Some(raw) => {
+                let d_opt = Some(@string.parse_double(@utf8.decode_lossy(raw))) catch {
                   _ => None
                 }
                 match d_opt {
-                  Some(d) => qvals.push(d)
+                  Some(d) => {
+                    qvals.push(d)
+                    match bucket_lat.get(label) {
+                      Some(arr) => arr.push(d)
+                      None => bucket_lat.set(label, [d])
+                    }
+                    match dim_lat.get(dim) {
+                      Some(arr) => arr.push(d)
+                      None => dim_lat.set(dim, [d])
+                    }
+                  }
                   None => ()
                 }
               }
+              None => ()
             }
           None => ()
         }
       })
+    }
+    match aborted {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
     }
     // Sorted bucket labels (oldest first).
     let labels : Array[String] = []
@@ -6949,10 +7098,18 @@ fn cmd_dashboard(
     }
     labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
     let mut max_total : Int32 = 0
+    let mut max_p95 : Double = 0.0
     for label in labels {
       match bucket_total.get(label) {
         Some(c) => if c > max_total { max_total = c }
         None => ()
+      }
+      let lat = sorted_latency(bucket_lat.get(label))
+      if lat.length() > 0 {
+        let p = pct_of(lat, 0.95)
+        if p > max_p95 {
+          max_p95 = p
+        }
       }
     }
     let err_rate : Double = if total > 0 {
@@ -6960,13 +7117,34 @@ fn cmd_dashboard(
     } else {
       0.0
     }
+    // Dimension breakdown (default service, same shape as the old top list).
+    let dim_items : Array[(Bytes, Int32)] = []
+    for k in dim_total.keys() {
+      match dim_total.get(k) {
+        Some(c) => dim_items.push((k, c))
+        None => ()
+      }
+    }
+    let dim_top = top_counts(dim_items, top_n)
+    let mut max_dim : Int32 = 0
+    for item in dim_top {
+      if item.1 > max_dim {
+        max_dim = item.1
+      }
+    }
     if json {
       let mut s = "{\"dir\":\"" +
         json_escape_str(dir) +
-        "\",\"last_sec\":" +
-        last_sec.to_string() +
+        "\",\"since\":" +
+        from_ts.to_string() +
+        ",\"until\":" +
+        to_ts.to_string() +
+        ",\"last_sec\":" +
+        window_sec.to_string() +
         ",\"bucket\":\"" +
         bucket +
+        "\",\"by\":\"" +
+        by +
         "\",\"windows\":["
       let mut first = true
       for label in labels {
@@ -6983,6 +7161,8 @@ fn cmd_dashboard(
         } else {
           0.0
         }
+        let lat = sorted_latency(bucket_lat.get(label))
+        let ln = lat.length()
         if !first {
           s = s + ","
         }
@@ -6996,7 +7176,17 @@ fn cmd_dashboard(
           e.to_string() +
           ",\"err_pct\":" +
           rate.to_string() +
-          "}"
+          ",\"latency\":{\"n\":" +
+          ln.to_string() +
+          ",\"p50\":" +
+          (if ln > 0 { pct_of(lat, 0.5).to_string() } else { "0" }) +
+          ",\"p95\":" +
+          (if ln > 0 { pct_of(lat, 0.95).to_string() } else { "0" }) +
+          ",\"p99\":" +
+          (if ln > 0 { pct_of(lat, 0.99).to_string() } else { "0" }) +
+          ",\"max\":" +
+          (if ln > 0 { lat[ln - 1].to_string() } else { "0" }) +
+          "}}"
       }
       s = s +
         "],\"summary\":{\"total\":" +
@@ -7040,16 +7230,62 @@ fn cmd_dashboard(
         }
         None => ()
       }
-      s = s + "}"
+      s = s + ",\"dimensions\":["
+      let mut first_dim = true
+      for item in dim_top {
+        let dt = item.1
+        let de = match dim_err.get(item.0) {
+          Some(c) => c
+          None => 0
+        }
+        let drate = if dt > 0 {
+          de.to_double() * 100.0 / dt.to_double()
+        } else {
+          0.0
+        }
+        let dlat = sorted_latency(dim_lat.get(item.0))
+        let dn = dlat.length()
+        if !first_dim {
+          s = s + ","
+        }
+        first_dim = false
+        s = s +
+          "{\"name\":\"" +
+          json_escape_str(bytes_to_string(item.0)) +
+          "\",\"total\":" +
+          dt.to_string() +
+          ",\"errors\":" +
+          de.to_string() +
+          ",\"err_pct\":" +
+          drate.to_string() +
+          ",\"latency\":{\"n\":" +
+          dn.to_string() +
+          ",\"p50\":" +
+          (if dn > 0 { pct_of(dlat, 0.5).to_string() } else { "0" }) +
+          ",\"p95\":" +
+          (if dn > 0 { pct_of(dlat, 0.95).to_string() } else { "0" }) +
+          ",\"p99\":" +
+          (if dn > 0 { pct_of(dlat, 0.99).to_string() } else { "0" }) +
+          ",\"max\":" +
+          (if dn > 0 { dlat[dn - 1].to_string() } else { "0" }) +
+          "}}"
+      }
+      s = s + "]}"
       println(s)
     } else {
       println(
         "=== dashboard: " +
         dir +
-        " (last " +
-        last_sec.to_string() +
+        " (since " +
+        from_ts.to_string() +
+        " until " +
+        to_ts.to_string() +
+        " / " +
+        window_sec.to_string() +
         "s, bucket " +
         bucket +
+        ", by " +
+        by +
         ") ===",
       )
       println("volume & errors:")
@@ -7105,6 +7341,43 @@ fn cmd_dashboard(
       )
       match qfield {
         Some(qf) => {
+          println("latency trend (" + bytes_to_string(qf) + ", p95 bars):")
+          for label in labels {
+            let lat = sorted_latency(bucket_lat.get(label))
+            let n = lat.length()
+            if n > 0 {
+              let p95 = pct_of(lat, 0.95)
+              let bars = if max_p95 > 0.0 {
+                (p95 * 40.0 / max_p95).to_int()
+              } else {
+                0
+              }
+              let bar = {
+                let sb = StringBuilder()
+                let mut k = 0
+                while k < bars {
+                  sb.write_char('#')
+                  k = k + 1
+                }
+                sb.to_string()
+              }
+              println(
+                label +
+                "  n=" +
+                n.to_string() +
+                " p50=" +
+                pct_of(lat, 0.5).to_string() +
+                " p95=" +
+                p95.to_string() +
+                " p99=" +
+                pct_of(lat, 0.99).to_string() +
+                " max=" +
+                lat[n - 1].to_string() +
+                "  |" +
+                bar,
+              )
+            }
+          }
           qvals
           .mut_view()
           .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
@@ -7138,29 +7411,67 @@ fn cmd_dashboard(
         }
         None => ()
       }
-      let svc_items : Array[(Bytes, Int32)] = []
-      for k in svc_counts.keys() {
-        match svc_counts.get(k) {
-          Some(c) => svc_items.push((k, c))
-          None => ()
-        }
-      }
-      let svc_top = top_counts(svc_items, 5)
-      let mut svc_line = "top services: "
-      let mut first_sv = true
-      for item in svc_top {
-        if !first_sv {
-          svc_line = svc_line + " "
-        }
-        first_sv = false
-        svc_line = svc_line + bytes_to_string(item.0) + "=" + item.1.to_string()
-      }
-      println(svc_line)
       println(
-        "(drill-down: trend --bucket minute / query --since --until / context)",
+        "dimension " +
+        by +
+        " (top " +
+        dim_top.length().to_string() +
+        " of " +
+        dim_total.length().to_string() +
+        "):",
+      )
+      for item in dim_top {
+        let dt = item.1
+        let de = match dim_err.get(item.0) {
+          Some(c) => c
+          None => 0
+        }
+        let drate = if dt > 0 {
+          de.to_double() * 100.0 / dt.to_double()
+        } else {
+          0.0
+        }
+        let dlat = sorted_latency(dim_lat.get(item.0))
+        let dn = dlat.length()
+        let p95 = if dn > 0 { pct_of(dlat, 0.95) } else { 0.0 }
+        let bars = if max_dim > 0 {
+          (dt.to_double() * 40.0 / max_dim.to_double()).to_int()
+        } else {
+          0
+        }
+        let bar = {
+          let sb = StringBuilder()
+          let mut k = 0
+          while k < bars {
+            sb.write_char('#')
+            k = k + 1
+          }
+          sb.to_string()
+        }
+        let lat_part = match qfield {
+          Some(_) =>
+            " p95=" + p95.to_string() + (if dn > 0 { "" } else { " (n=0)" })
+          None => ""
+        }
+        println(
+          "  " +
+          bytes_to_string(item.0) +
+          "  total=" +
+          dt.to_string() +
+          " err=" +
+          de.to_string() +
+          " (" +
+          drate.to_string() +
+          "%)" +
+          lat_part +
+          "  |" +
+          bar,
+        )
+      }
+      println(
+        "(drill-down: --since/--until <ms> --bucket minute, then trend/query/context)",
       )
     }
-    close_log(log)
   })
 }
 
@@ -10786,6 +11097,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut bucket = "minute"
       let mut quantile_field : String? = (None : String?)
       let mut service : String? = (None : String?)
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
+      let mut by = "service"
+      let mut top = "5"
       let mut json = false
       let mut i = 3
       while i < args.length() {
@@ -10802,12 +11117,37 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--service" && i + 1 < args.length() {
           service = Some(args[i + 1])
           i = i + 1
+        } else if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--by" && i + 1 < args.length() {
+          by = args[i + 1]
+          i = i + 1
+        } else if a == "--top" && i + 1 < args.length() {
+          top = args[i + 1]
+          i = i + 1
         } else if a == "--json" {
           json = true
+        } else {
+          raise @io.IoError::Invalid("unknown dashboard option: " + a)
         }
         i = i + 1
       }
-      cmd_dashboard(args[2], last_sec, bucket, quantile_field, service, json)
+      cmd_dashboard(
+        args[2],
+        last_sec,
+        bucket,
+        quantile_field,
+        service,
+        since,
+        until,
+        by,
+        top,
+        json,
+      )
     }
   } else if cmd == "anomalies" {
     if args.length() < 3 {
