@@ -5017,7 +5017,45 @@ fn http_queue_enqueue(
   if q.pending > q.peak_pending {
     q.peak_pending = q.pending
   }
+  // M182: check the backlog alert right after the enqueue — the fast drain
+  // (M145) can consume an entire queue within one round, so a
+  // drain-boundary-only check never observes the backlog and small queues
+  // never alerted even when full.
+  http_backlog_check(q)
   true
+}
+
+///|
+/// Backlog alert state machine (1.3): one WARN/RESOLVED pair per episode.
+/// Called both after an enqueue and after a drain batch — the fast drain
+/// (M145: a full queue is consumed within one round) means a
+/// drain-boundary-only check never observes the backlog, so small queues
+/// never alerted even when full.
+fn http_backlog_check(q : HttpQueue) -> Unit {
+  if !q.backlog_active && q.pending > q.alert_threshold {
+    q.backlog_active = true
+    q.backlog_since = now_ms()
+    q.alerts = q.alerts + 1
+    println(
+      "WARN backlog " +
+      q.pending.to_string() +
+      " lines (threshold " +
+      q.alert_threshold.to_string() +
+      "), peak " +
+      q.peak_pending.to_string(),
+    )
+  } else if q.backlog_active && q.pending <= q.alert_threshold {
+    q.backlog_active = false
+    println(
+      "RESOLVED backlog drained to " +
+      q.pending.to_string() +
+      " lines after " +
+      (now_ms() - q.backlog_since).to_string() +
+      " ms (peak " +
+      q.peak_pending.to_string() +
+      ")",
+    )
+  }
 }
 
 ///|
@@ -5089,32 +5127,9 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
     q.lines = rest
     q.head = 0
   }
-  // Alert on crossing the threshold, resolve when the backlog drains: one
-  // WARN/RESOLVED pair per backlog episode instead of one WARN per batch.
-  if !q.backlog_active && q.pending > q.alert_threshold {
-    q.backlog_active = true
-    q.backlog_since = now_ms()
-    q.alerts = q.alerts + 1
-    println(
-      "WARN backlog " +
-      q.pending.to_string() +
-      " lines (threshold " +
-      q.alert_threshold.to_string() +
-      "), peak " +
-      q.peak_pending.to_string(),
-    )
-  } else if q.backlog_active && q.pending <= q.alert_threshold {
-    q.backlog_active = false
-    println(
-      "RESOLVED backlog drained to " +
-      q.pending.to_string() +
-      " lines after " +
-      (now_ms() - q.backlog_since).to_string() +
-      " ms (peak " +
-      q.peak_pending.to_string() +
-      ")",
-    )
-  }
+  // M182: the same alert check also runs after the enqueue, because one
+  // drain round can consume the whole queue (see http_backlog_check).
+  http_backlog_check(q)
   // 6.4: report the writer snapshot at most once a second so the
   // independent selfmon command sees backlog without adding per-batch
   // fsync cost.
@@ -5450,7 +5465,18 @@ fn cmd_http(
       @string.parse_int(s) catch {
         _ => raise @io.IoError::Invalid("invalid backlog alert: " + s)
       }
-    None => 5000
+    None => {
+      // M182: scale the default alert with the queue capacity. The old
+      // absolute 5000 made small queues (--queue 50) never alert even when
+      // full — the "积压告警" guarantee was unreachable for them. Explicit
+      // --backlog-alert stays an absolute value.
+      let half = queue_cap_n / 2
+      if half < 1 {
+        1
+      } else {
+        half
+      }
+    }
   }
   if queue_cap_n <= 0 ||
     batch_n <= 0 ||
