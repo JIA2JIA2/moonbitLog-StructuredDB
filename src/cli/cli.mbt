@@ -2904,17 +2904,23 @@ fn cmd_purge(
   prefix : String,
   into : String?,
   json : Bool,
+  all : Bool,
 ) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let scope = active_scope(dir)
     let pb = @utf8.encode(prefix)
     // 6.6 + 6.1: a scoped tenant may erase only its own prefix; an unscoped
-    // role may still run an explicit prefix (an empty prefix stays unscoped
-    // only, so no accidental whole-index erase).
+    // role may run an explicit prefix, and an empty prefix (whole index)
+    // only with the explicit --all confirmation — never by accident.
     if prefix.length() == 0 {
       if scope is Some(_) {
         raise @io.IoError::Invalid(
           "permission denied: a scoped role must give a non-empty purge prefix",
+        )
+      }
+      if !all {
+        raise @io.IoError::Invalid(
+          "empty prefix would erase the whole index; pass --all to confirm, or give a prefix",
         )
       }
     } else if !scope_allows_key(scope, pb) {
@@ -3007,7 +3013,8 @@ fn cmd_purge(
         status +
         "\",\"prefix\":\"" +
         json_escape_str(prefix) +
-        "\"" +
+        "\",\"all\":" +
+        (if all { "true" } else { "false" }) +
         into_json +
         ",\"exported\":" +
         exported.to_string() +
@@ -3023,7 +3030,10 @@ fn cmd_purge(
       )
     } else {
       println("PURGE status=" + status)
-      println("prefix: " + prefix)
+      println(
+        "prefix: " +
+        (if prefix.length() == 0 { "(whole index)" } else { prefix }),
+      )
       match into {
         Some(file) =>
           println(
@@ -13042,6 +13052,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     } else {
       let mut into : String? = (None : String?)
       let mut json = false
+      let mut all = false
       let mut i = 4
       while i < args.length() {
         if args[i] == "--into" && i + 1 < args.length() {
@@ -13049,12 +13060,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if args[i] == "--json" {
           json = true
+        } else if args[i] == "--all" {
+          all = true
         } else {
           raise @io.IoError::Invalid("unknown purge option: " + args[i])
         }
         i = i + 1
       }
-      cmd_purge(args[2], args[3], into, json)
+      cmd_purge(args[2], args[3], into, json, all)
     }
   } else if cmd == "import" {
     if args.length() < 4 {
