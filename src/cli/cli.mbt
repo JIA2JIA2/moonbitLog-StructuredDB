@@ -871,23 +871,50 @@ fn cmd_put_if(
 
 ///|
 /// Append several key/value pairs passed as `<k1> <v1> <k2> <v2> ...`.
-fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
+fn cmd_put_batch(
+  dir : String,
+  args : Array[String],
+  batch_id : String?,
+) -> Unit raise @io.IoError {
   let n = args.length()
-  if (n - 3) % 2 != 0 {
-    raise @io.IoError::Invalid("put-batch needs key/value pairs")
-  }
   run_locked(dir, true, () => {
+    // 1.4 批次号: a confirmed batch id is replayed as a no-op; an unconfirmed
+    // one is recorded only after the batch is admitted, so a quota/scope
+    // failure lets the client retry the whole batch safely.
+    let ids = load_batch_ids(dir)
+    match batch_id {
+      Some(bid) => {
+        if !valid_batch_id(bid) {
+          raise @io.IoError::Invalid(
+            "invalid batch id: non-empty, <= 256 bytes, no newline/tab",
+          )
+        }
+        if ids.get(bid) is Some(_) {
+          println(
+            "skipped batch " + bid + " (duplicate-batch, nothing written)",
+          )
+          return
+        }
+      }
+      None => ()
+    }
     let rule = active_quota_rule(dir)
     let recs : Array[(Bytes, Bytes, Int64)] = []
     let mut incoming : Int64 = 0
     let mut i = 3
     while i < n {
-      let kb = @utf8.encode(args[i])
-      require_scope(dir, "put-batch", kb)
-      let vb = @utf8.encode(args[i + 1])
-      incoming = incoming + (kb.length() + vb.length()).to_int64()
-      recs.push((kb, vb, now_ms()))
-      i = i + 2
+      if args[i] == "--batch-id" && i + 1 < n {
+        i = i + 2
+      } else if i + 1 >= n {
+        raise @io.IoError::Invalid("put-batch needs key/value pairs")
+      } else {
+        let kb = @utf8.encode(args[i])
+        require_scope(dir, "put-batch", kb)
+        let vb = @utf8.encode(args[i + 1])
+        incoming = incoming + (kb.length() + vb.length()).to_int64()
+        recs.push((kb, vb, now_ms()))
+        i = i + 2
+      }
     }
     match quota_write_error(dir, rule, incoming) {
       Some(msg) => raise @io.IoError::Invalid(msg)
@@ -896,6 +923,10 @@ fn cmd_put_batch(dir : String, args : Array[String]) -> Unit raise @io.IoError {
     let log = open_log_sync(dir, load_partition_policy(dir), batch_entry_sync())
     let offsets = log.append_batch(recs)
     quota_record_write(dir, rule, incoming)
+    match batch_id {
+      Some(bid) => record_batch_id(dir, ids, bid)
+      None => ()
+    }
     for off in offsets {
       println("offset " + off.to_string())
     }
@@ -4321,6 +4352,58 @@ fn schema_transform(
 const DEDUP_FILE : String = "DEDUP"
 
 ///|
+/// Confirmed batch ids (1.4 批次号): one id per line in `<dir>/BATCHES`,
+/// appended with O_APPEND when a push/put-batch carrying that id is admitted.
+/// A replayed batch id is skipped wholesale so client retries never duplicate
+/// data; the id is recorded only after admission, so a 429 lets the client
+/// retry safely.
+const BATCHES_FILE : String = "BATCHES"
+
+///|
+/// Validate a caller-supplied batch id: non-empty, bounded, single-line.
+fn valid_batch_id(id : String) -> Bool {
+  id.length() > 0 &&
+  id.length() <= 256 &&
+  !@core.bytes_contains(@utf8.encode(id), b"\n") &&
+  !@core.bytes_contains(@utf8.encode(id), b"\t")
+}
+
+///|
+/// Load the persisted set of confirmed batch ids into a lookup map.
+fn load_batch_ids(dir : String) -> @hashmap.HashMap[String, Int32] {
+  let map : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
+  let data = @backend_native.read_file(dir + "/" + BATCHES_FILE)
+  let mut start = 0
+  let mut i = 0
+  while i <= data.length() {
+    if i == data.length() || data.at(i).to_int() == 10 {
+      let line = @core.slice(data, start, i)
+      if line.length() > 0 {
+        map.set(@utf8.decode_lossy(line), 1)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  map
+}
+
+///|
+/// Record a confirmed batch id: O_APPEND one line and remember it in the
+/// in-memory set, so later replays of the same batch are skipped wholesale.
+fn record_batch_id(
+  dir : String,
+  ids : @hashmap.HashMap[String, Int32],
+  id : String,
+) -> Unit raise @io.IoError {
+  if ids.get(id) is Some(_) {
+    return
+  }
+  @backend_native.append_file(dir + "/" + BATCHES_FILE, @utf8.encode(id + "\n"))
+  ids.set(id, 1)
+}
+
+///|
 /// Whether `uid` can be stored one-per-line in the sidecar.
 fn dedup_uid_ok(uid : Bytes) -> Bool {
   if uid.length() == 0 {
@@ -4952,6 +5035,9 @@ fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
 /// client retries, nothing is dropped silently). Sustained backlog beyond
 /// `alert_threshold` raises a warning and increments `alerts`.
 struct HttpQueue {
+  // Confirmed batch ids (1.4): loaded once at startup from <dir>/BATCHES and
+  // grown in memory as new batch ids are admitted.
+  batch_ids : @hashmap.HashMap[String, Int32]
   mut lines : Array[Bytes]
   mut head : Int32
   mut pending : Int32
@@ -5347,6 +5433,20 @@ fn handle_http_connection(
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
     }
+    // 1.4 批次号: a confirmed batch id is replayed as a no-op, so client
+    // retries never duplicate data. Unconfirmed ids are only recorded once the
+    // request is admitted (202), so a 429 lets the client retry safely.
+    let batch_id_req = @utf8.decode_lossy(request.batch_id)
+    if batch_id_req.length() > 0 && q.batch_ids.get(batch_id_req) is Some(_) {
+      http_respond(
+        conn,
+        200,
+        "{\"status\":\"duplicate-batch\",\"skipped\":" +
+        lines.length().to_string() +
+        "}",
+      )
+      return
+    }
     // 6.1 index isolation: reject the whole request when any line falls
     // outside the token role's data scope (the 202 contract stays intact).
     match auth {
@@ -5408,6 +5508,9 @@ fn handle_http_connection(
       }
       if http_queue_enqueue(q, kept, incoming) {
         quota_record_write(dir, rule, incoming)
+        if batch_id_req.length() > 0 {
+          record_batch_id(dir, q.batch_ids, batch_id_req)
+        }
         q.accepted = q.accepted + kept.length().to_int64()
         q.sampled = q.sampled + sampled_out.to_int64()
         http_respond(
@@ -5561,6 +5664,7 @@ fn cmd_http(
     None => None
   }
   let q : HttpQueue = {
+    batch_ids: load_batch_ids(dir),
     lines: [],
     head: 0,
     pending: 0,
@@ -11537,7 +11641,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 5 {
       println(USAGE)
     } else {
-      cmd_put_batch(args[2], args)
+      let mut batch_id : String? = (None : String?)
+      let mut i = 3
+      while i < args.length() {
+        if args[i] == "--batch-id" && i + 1 < args.length() {
+          batch_id = Some(args[i + 1])
+          i = i + 2
+        } else {
+          i = i + 1
+        }
+      }
+      cmd_put_batch(args[2], args, batch_id)
     }
   } else if cmd == "delete" {
     if args.length() < 4 {

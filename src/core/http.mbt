@@ -7,6 +7,10 @@ pub(all) struct HttpRequest {
   path : Bytes
   content_length : Int32
   authorization : Bytes
+  // 1.4 batch id: raw `X-Batch-Id:` header value (empty when absent) — a
+  // confirmed batch id is replayed as a no-op so client retries never
+  // duplicate data.
+  batch_id : Bytes
 }
 
 ///|
@@ -26,6 +30,7 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
   }
   let mut content_length = 0
   let mut authorization : Bytes = b""
+  let mut batch_id : Bytes = b""
   let mut pos = first_end + 1
   while pos < head.length() {
     let end = find_byte_http(head, 10, pos)
@@ -56,10 +61,22 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
         v = v + 1
       }
       authorization = slice(line, v, line.length())
+    } else if has_ci_prefix_http(line, b"x-batch-id:") {
+      let mut v = 11
+      while v < line.length() && line.at(v).to_int() == 32 {
+        v = v + 1
+      }
+      batch_id = slice(line, v, line.length())
     }
     pos = end + 1
   }
-  Some({ verb: parts[0], path: parts[1], content_length, authorization, })
+  Some({
+    verb: parts[0],
+    path: parts[1],
+    content_length,
+    authorization,
+    batch_id,
+  })
 }
 
 ///|

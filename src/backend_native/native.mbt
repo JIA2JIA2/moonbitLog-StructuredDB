@@ -1382,7 +1382,8 @@ fn is_backup_file(name : String) -> Bool {
   // copy keeps the accountability history of the source. TTL_AUDIT (automatic
   // maintenance records) and SELFMON runtime state stay excluded.
   name == "AUDIT" ||
-  name.has_prefix("AUDIT.")
+  name.has_prefix("AUDIT.") ||
+  name == "BATCHES"
 }
 
 ///|
