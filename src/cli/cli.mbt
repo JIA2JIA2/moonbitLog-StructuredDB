@@ -2954,7 +2954,41 @@ fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
     @backend_native.flush_meta(src, log)
     close_log(log)
     let n = @backend_native.backup_log_dir(src, dst)
-    println("backed up " + n.to_string() + " segments to " + dst)
+    let names = @backend_native.list_dir(dst) catch { _ => [] }
+    let mut files = 0
+    let mut bytes : Int64 = 0
+    for name in names {
+      if name == "SELFMON" {
+        continue
+      }
+      let s = @backend_native.file_size(dst + "/" + name)
+      if s >= 0 {
+        files = files + 1
+        bytes = bytes + s
+      }
+    }
+    let (idx_files, idx_bytes) = drill_sidecar_stats(dst)
+    println(
+      "backed up " +
+      n.to_string() +
+      " segments to " +
+      dst +
+      " (files=" +
+      files.to_string() +
+      " bytes=" +
+      bytes.to_string() +
+      " index_files=" +
+      idx_files.to_string() +
+      " index_bytes=" +
+      idx_bytes.to_string() +
+      " selfmon_thresholds=" +
+      (if @backend_native.file_exists(dst + "/SELFMON/thresholds") {
+        "present"
+      } else {
+        "absent"
+      }) +
+      ")",
+    )
   })
 }
 
@@ -2979,7 +3013,15 @@ fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
 fn remove_tree(path : String) -> Unit {
   let names = @backend_native.list_dir(path) catch { _ => [] }
   for name in names {
-    ignore(@backend_native.remove_file(path + "/" + name))
+    let child = path + "/" + name
+    // Recurse into directories (e.g. SELFMON/thresholds); a plain file or an
+    // empty directory reports no children, so remove_file handles it.
+    let children = @backend_native.list_dir(child) catch { _ => [] }
+    if children.length() > 0 {
+      remove_tree(child)
+    } else {
+      ignore(@backend_native.remove_file(child))
+    }
   }
   ignore(@backend_native.remove_file(path))
 }
@@ -2990,8 +3032,32 @@ fn remove_tree(path : String) -> Unit {
 /// "ok" when every present policy matches byte for byte, and "mismatch"
 /// otherwise — a diverging policy would silently change retention or
 /// access behavior on the restored copy.
+
+///|
+/// Count and byte size of index sidecars (`.log.inv`/`.log.index`/`.log.keys`)
+/// for the recovery drill (6.5): the restored copy must carry the same index
+/// footprint as the source, otherwise "index backup" was silently lossy.
+fn drill_sidecar_stats(dir : String) -> (Int32, Int64) {
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let mut files = 0
+  let mut bytes : Int64 = 0
+  for name in names {
+    if name.has_suffix(".log.inv") ||
+      name.has_suffix(".log.index") ||
+      name.has_suffix(".log.keys") {
+      files = files + 1
+      let s = @backend_native.file_size(dir + "/" + name)
+      if s > 0 {
+        bytes = bytes + s
+      }
+    }
+  }
+  (files, bytes)
+}
+
+///|
 fn drill_config_check(dir : String, rst : String) -> String {
-  let files = ["RBAC", "TTL", "QUOTA", "PARTITION"]
+  let files = ["RBAC", "TTL", "QUOTA", "PARTITION", "SELFMON/thresholds"]
   let mut result = "absent"
   for f in files {
     let src_has = @backend_native.file_exists(dir + "/" + f)
@@ -3039,6 +3105,11 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
   let mut match_ok = false
   let mut config_status = "absent"
   let mut spot_ok = false
+  let mut index_ok = false
+  let mut src_index_files = 0
+  let mut src_index_bytes : Int64 = 0
+  let mut rst_index_files = 0
+  let mut rst_index_bytes : Int64 = 0
 
   // 1. Backup: flush data and metadata, then copy the durable set under the
   // exclusive lock.
@@ -3048,7 +3119,14 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
     @backend_native.flush_meta(dir, log)
     close_log(log)
     ignore(@backend_native.backup_log_dir(dir, bak))
-    backup_files = (@backend_native.list_dir(bak) catch { _ => [] }).length()
+    let mut bf = 0
+    let bnames = @backend_native.list_dir(bak) catch { _ => [] }
+    for name in bnames {
+      if name != "SELFMON" && @backend_native.file_size(bak + "/" + name) >= 0 {
+        bf = bf + 1
+      }
+    }
+    backup_files = bf
   })
 
   // 2. Restore into the scratch directory (empty by construction).
@@ -3087,13 +3165,17 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
       _ => false
     }
     spot_ok = spot
+    let data_ok = verify_ok && next_ok && verify_records == src_records && spot
     config_status = drill_config_check(dir, rst)
-    match_ok = verify_ok &&
-      next_ok &&
-      verify_records == src_records &&
-      spot &&
-      config_status != "mismatch"
-    verify_status = if match_ok { "ok" } else { "fail" }
+    let (s_if, s_ib) = drill_sidecar_stats(dir)
+    let (r_if, r_ib) = drill_sidecar_stats(rst)
+    src_index_files = s_if
+    src_index_bytes = s_ib
+    rst_index_files = r_if
+    rst_index_bytes = r_ib
+    index_ok = s_if == r_if && s_ib == r_ib
+    match_ok = data_ok && config_status != "mismatch" && index_ok
+    verify_status = if data_ok { "ok" } else { "fail" }
     close_log(src_log)
     close_log(rst_log)
   })
@@ -3113,6 +3195,18 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
     (if spot_ok { "ok" } else { "fail" }),
   )
   println("config: " + config_status)
+  println(
+    "index: files=" +
+    src_index_files.to_string() +
+    " bytes=" +
+    src_index_bytes.to_string() +
+    " restored_files=" +
+    rst_index_files.to_string() +
+    " restored_bytes=" +
+    rst_index_bytes.to_string() +
+    " status=" +
+    (if index_ok { "ok" } else { "mismatch" }),
+  )
   if !keep {
     remove_tree(bak)
     remove_tree(rst)

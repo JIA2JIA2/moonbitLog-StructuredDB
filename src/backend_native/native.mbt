@@ -1356,7 +1356,8 @@ fn is_backup_file(name : String) -> Bool {
   name.has_suffix(".log.inv") ||
   name == "RBAC" ||
   name == "TTL" ||
-  name == "QUOTA"
+  name == "QUOTA" ||
+  name == "PARTITION"
 }
 
 ///|
@@ -1649,6 +1650,15 @@ pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
       }
     }
   }
+  // SELFMON/thresholds is configuration (like RBAC/TTL/QUOTA), while the
+  // sibling http.json is runtime state; carry only the thresholds file.
+  if file_exists(src + "/SELFMON/thresholds") {
+    ignore(ensure_dir(dst + "/SELFMON"))
+    write_file(
+      dst + "/SELFMON/thresholds",
+      read_file(src + "/SELFMON/thresholds"),
+    )
+  }
   fsync_dir(dst)
   copied
 }
@@ -1682,6 +1692,15 @@ pub fn restore_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
     if is_backup_file(name) {
       write_file(dst + "/" + name, read_file(src + "/" + name))
     }
+  }
+  // SELFMON/thresholds is configuration (like RBAC/TTL/QUOTA), while the
+  // sibling http.json is runtime state; carry only the thresholds file.
+  if file_exists(src + "/SELFMON/thresholds") {
+    ignore(ensure_dir(dst + "/SELFMON"))
+    write_file(
+      dst + "/SELFMON/thresholds",
+      read_file(src + "/SELFMON/thresholds"),
+    )
   }
   fsync_dir(dst)
   count_segment_files(dst)
