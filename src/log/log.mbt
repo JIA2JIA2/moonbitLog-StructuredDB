@@ -170,6 +170,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
   value : Bytes,
   timestamp : Int64,
   kind~ : @core.RecordKind = @core.RecordKind::Put,
+  do_sync~ : Bool = true,
 ) -> UInt64 raise @io.IoError {
   let my_bucket = if self.partition_ms > 0 {
     time_bucket(timestamp, self.partition_ms)
@@ -199,7 +200,7 @@ pub fn[W : @io.LogWriter, R] Log::append(
   }
   let active = self.segments[self.segments.length() - 1]
   let offset = active.append(key, value, timestamp, kind~)
-  if self.sync is SyncPolicy::Always {
+  if do_sync && self.sync is SyncPolicy::Always {
     active.writer.flush()
     active.mark_fsync_clean()
   }
@@ -575,6 +576,30 @@ pub fn[W : @io.LogWriter, R] Log::delete(
   timestamp : Int64,
 ) -> UInt64 raise @io.IoError {
   self.append(key, b"", timestamp, kind=@core.RecordKind::Delete)
+}
+
+///|
+/// Append tombstones for many keys with a single fsync at the end — the
+/// compliance-purge path erases thousands of keys and must not pay one fsync
+/// per tombstone (10k keys: ~17s -> sub-second).
+pub fn[W : @io.LogWriter, R] Log::delete_many(
+  self : Log[W, R],
+  keys : Array[Bytes],
+  timestamp : Int64,
+) -> Int32 raise @io.IoError {
+  for key in keys {
+    ignore(
+      self.append(
+        key,
+        b"",
+        timestamp,
+        kind=@core.RecordKind::Delete,
+        do_sync=false,
+      ),
+    )
+  }
+  self.flush()
+  keys.length()
 }
 
 ///|

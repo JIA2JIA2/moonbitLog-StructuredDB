@@ -51,7 +51,7 @@ pub(all) struct Log[W, R] {
   mut index_builds : Int32
   mut cursor_guard : UInt64?
 }
-pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind) -> UInt64 raise @io.IoError
+pub fn[W : @io.LogWriter, R] Log::append(Self[W, R], Bytes, Bytes, Int64, kind? : @core.RecordKind, do_sync? : Bool) -> UInt64 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::append_batch(Self[W, R], Array[(Bytes, Bytes, Int64)]) -> Array[UInt64] raise @io.IoError
 pub fn[W : @io.LogWriter + @io.LogTruncate, R : @io.LogReader] Log::append_batch_atomic(Self[W, R], Array[(Bytes, Bytes, Int64)], (@segment.Segment[W, R]) -> Unit) -> Array[UInt64] raise @io.IoError
 pub fn[W : @io.LogWriter, R : @io.LogReader] Log::append_idempotent(Self[W, R], Bytes, Bytes, Int64) -> (Bool, UInt64) raise @io.IoError
@@ -62,6 +62,7 @@ pub fn[W : @io.LogWriter, R : @io.LogReader] Log::compare_and_swap(Self[W, R], B
 pub fn[W, R] Log::count(Self[W, R]) -> Int32
 pub fn[W, R : @io.LogReader] Log::count_superseded(Self[W, R], KeyIndex) -> Int32 raise @io.IoError
 pub fn[W : @io.LogWriter, R] Log::delete(Self[W, R], Bytes, Int64) -> UInt64 raise @io.IoError
+pub fn[W : @io.LogWriter, R] Log::delete_many(Self[W, R], Array[Bytes], Int64) -> Int32 raise @io.IoError
 pub fn[W, R] Log::drop_before(Self[W, R], UInt64, (@segment.Segment[W, R]) -> Unit) -> Int32
 pub fn[W, R : @io.LogReader] Log::expire_by_policy(Self[W, R], Int64, @core.TtlPolicy, apply? : Bool, on_drop~ : (@segment.Segment[W, R]) -> Unit) -> (Int32, Int32) raise @io.IoError
 pub fn[W, R : @io.LogReader] Log::export_bytes(Self[W, R]) -> Bytes raise @io.IoError

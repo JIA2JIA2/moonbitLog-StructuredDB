@@ -2734,6 +2734,10 @@ fn cmd_export_jsonl(
   match_text : String?,
   from_ts : String?,
   until_ts : String?,
+  level : String?,
+  service : String?,
+  host : String?,
+  trace : String?,
 ) -> Unit raise @io.IoError {
   if mode != "text" && mode != "base64" {
     raise @io.IoError::Invalid("invalid mode: " + mode + " (text|base64)")
@@ -2749,6 +2753,26 @@ fn cmd_export_jsonl(
     None => b""
   }
   let has_match = match_text is Some(_)
+  let level_b : Bytes? = match level {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let service_b : Bytes? = match service {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let host_b : Bytes? = match host {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let trace_b : Bytes? = match trace {
+    Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let has_schema = level is Some(_) ||
+    service is Some(_) ||
+    host is Some(_) ||
+    trace is Some(_)
   let from = match from_ts {
     Some(s) =>
       Some(
@@ -2770,6 +2794,16 @@ fn cmd_export_jsonl(
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let scope = active_scope(dir)
+    // An explicitly requested prefix outside the role's scope is a denial,
+    // not an empty export (6.1: 越权访问被明确拒绝).
+    if has_prefix && !scope_allows_key(scope, pb) {
+      record_scope_denied(dir, "export-jsonl", pb)
+      raise @io.IoError::Invalid(
+        "permission denied: prefix '" +
+        bytes_to_string(pb) +
+        "' is outside the role's data scope",
+      )
+    }
     let buf = @buffer.Buffer::Buffer()
     let mut count = 0
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
@@ -2778,6 +2812,21 @@ fn cmd_export_jsonl(
       }
       if has_prefix && !bytes_has_prefix_cli(rec.key, pb) {
         return true
+      }
+      if has_schema {
+        let fields = ctx_value_fields(rec.value)
+        if !@core.schema_matches(
+            fields,
+            rec.key,
+            rec.value,
+            level_b,
+            service_b,
+            host_b,
+            trace_b,
+            (None : Bytes?),
+          ) {
+          return true
+        }
       }
       if has_match &&
         !@core.bytes_contains(rec.key, mb) &&
@@ -2839,18 +2888,40 @@ fn cmd_purge(
   dir : String,
   prefix : String,
   into : String?,
+  json : Bool,
 ) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
-    let log = open_log(dir)
+    let scope = active_scope(dir)
     let pb = @utf8.encode(prefix)
+    // 6.6 + 6.1: a scoped tenant may erase only its own prefix; an unscoped
+    // role may still run an explicit prefix (an empty prefix stays unscoped
+    // only, so no accidental whole-index erase).
+    if prefix.length() == 0 {
+      if scope is Some(_) {
+        raise @io.IoError::Invalid(
+          "permission denied: a scoped role must give a non-empty purge prefix",
+        )
+      }
+    } else if !scope_allows_key(scope, pb) {
+      record_scope_denied(dir, "purge", pb)
+      raise @io.IoError::Invalid(
+        "permission denied: prefix '" +
+        prefix +
+        "' is outside the role's data scope",
+      )
+    }
+    let log = open_log(dir)
     let now = now_ms()
     let buf = @buffer.Buffer::Buffer()
     let mut exported = 0
     let mut matched_records = 0
     let keys : Array[Bytes] = []
+    let key_set : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
     // Sweep once: retention copy and key collection over the live records.
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      if !rec.is_delete() && bytes_has_prefix_cli(rec.key, pb) {
+      if !rec.is_delete() &&
+        scope_allows_key(scope, rec.key) &&
+        bytes_has_prefix_cli(rec.key, pb) {
         matched_records = matched_records + 1
         match into {
           Some(_) => {
@@ -2875,14 +2946,12 @@ fn cmd_purge(
           }
           None => ()
         }
-        let mut seen = false
-        for k in keys {
-          if k == rec.key {
-            seen = true
+        match key_set.get(rec.key) {
+          Some(_) => ()
+          None => {
+            key_set.set(rec.key, 1)
+            keys.push(rec.key)
           }
-        }
-        if !seen {
-          keys.push(rec.key)
         }
       }
       true
@@ -2893,8 +2962,8 @@ fn cmd_purge(
     }
     // Erase: tombstone every matched key, then physically compact so the
     // records and their tombstones leave the segment files.
-    for k in keys {
-      ignore(log.delete(k, now))
+    if keys.length() > 0 {
+      ignore(log.delete_many(keys, now))
     }
     let live = log.compact(on_drop=seg => {
       @backend_native.remove_segment_files(dir, seg.base_offset)
@@ -2904,39 +2973,69 @@ fn cmd_purge(
     // Verify (6.6): after compaction nothing matching the prefix remains.
     let mut remaining = 0
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
-      if !rec.is_delete() && bytes_has_prefix_cli(rec.key, pb) {
+      if !rec.is_delete() &&
+        scope_allows_key(scope, rec.key) &&
+        bytes_has_prefix_cli(rec.key, pb) {
         remaining = remaining + 1
       }
       true
     })
     close_log(log)
     let status = if remaining == 0 { "ok" } else { "fail" }
-    println("PURGE status=" + status)
-    println("prefix: " + prefix)
-    match into {
-      Some(file) =>
-        println(
-          "exported: " +
-          exported.to_string() +
-          " records -> " +
-          file +
-          " (parseable JSONL retention copy)",
-        )
-      None => ()
+    if json {
+      let into_json = match into {
+        Some(file) => ",\"into\":\"" + json_escape_str(file) + "\""
+        None => ""
+      }
+      println(
+        "{\"status\":\"" +
+        status +
+        "\",\"prefix\":\"" +
+        json_escape_str(prefix) +
+        "\"" +
+        into_json +
+        ",\"exported\":" +
+        exported.to_string() +
+        ",\"deleted_keys\":" +
+        keys.length().to_string() +
+        ",\"deleted_records\":" +
+        matched_records.to_string() +
+        ",\"compacted_live\":" +
+        live.to_string() +
+        ",\"remaining\":" +
+        remaining.to_string() +
+        ",\"cursors_reset\":true}",
+      )
+    } else {
+      println("PURGE status=" + status)
+      println("prefix: " + prefix)
+      match into {
+        Some(file) =>
+          println(
+            "exported: " +
+            exported.to_string() +
+            " records -> " +
+            file +
+            " (parseable JSONL retention copy)",
+          )
+        None => ()
+      }
+      println(
+        "deleted: keys=" +
+        keys.length().to_string() +
+        " records=" +
+        matched_records.to_string(),
+      )
+      println("compacted: live_records=" + live.to_string())
+      println(
+        "verified: remaining=" +
+        remaining.to_string() +
+        " (prefix scan after physical compaction)",
+      )
+      println(
+        "warning: offsets renumbered; reset any cursors (cursor-commit 0)",
+      )
     }
-    println(
-      "deleted: keys=" +
-      keys.length().to_string() +
-      " records=" +
-      matched_records.to_string(),
-    )
-    println("compacted: live_records=" + live.to_string())
-    println(
-      "verified: remaining=" +
-      remaining.to_string() +
-      " (prefix scan after physical compaction)",
-    )
-    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     quota_recalc_storage_quiet(dir)
   })
 }
@@ -9767,8 +9866,8 @@ fn global_only_cmd(cmd : String) -> Bool {
     "backup", "restore", "archive", "export", "replicate", "ha-failover", "ha-rebalance",
     "ha-watch", "drill", "recover", "compact", "compact-expired", "merge", "prune",
     "prune-bytes", "prune-before", "prune-expired", "prune-superseded", "compress",
-    "tier", "import", "maintain", "ttl-expire", "purge", "fsck", "selfmon", "serve",
-    "rbac", "quota",
+    "tier", "import", "maintain", "ttl-expire", "fsck", "selfmon", "serve", "rbac",
+    "quota",
   ]
   for c in list {
     if c == cmd {
@@ -12870,6 +12969,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut match_text : String? = (None : String?)
       let mut from_ts : String? = (None : String?)
       let mut until_ts : String? = (None : String?)
+      let mut level : String? = (None : String?)
+      let mut service : String? = (None : String?)
+      let mut host : String? = (None : String?)
+      let mut trace : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -12885,8 +12988,22 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--until" && i + 1 < args.length() {
           until_ts = Some(args[i + 1])
           i = i + 1
+        } else if a == "--level" && i + 1 < args.length() {
+          level = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--host" && i + 1 < args.length() {
+          host = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--trace-id" && i + 1 < args.length() {
+          trace = Some(args[i + 1])
+          i = i + 1
         } else if a == "text" || a == "base64" {
           mode = a
+        } else {
+          raise @io.IoError::Invalid("unknown export-jsonl option: " + a)
         }
         i = i + 1
       }
@@ -12898,6 +13015,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         match_text,
         from_ts,
         until_ts,
+        level,
+        service,
+        host,
+        trace,
       )
     }
   } else if cmd == "purge" {
@@ -12905,15 +13026,20 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut into : String? = (None : String?)
+      let mut json = false
       let mut i = 4
       while i < args.length() {
         if args[i] == "--into" && i + 1 < args.length() {
           into = Some(args[i + 1])
           i = i + 1
+        } else if args[i] == "--json" {
+          json = true
+        } else {
+          raise @io.IoError::Invalid("unknown purge option: " + args[i])
         }
         i = i + 1
       }
-      cmd_purge(args[2], args[3], into)
+      cmd_purge(args[2], args[3], into, json)
     }
   } else if cmd == "import" {
     if args.length() < 4 {
