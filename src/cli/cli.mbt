@@ -63,6 +63,12 @@
 ///            [--interval ms] [--fail-threshold N] [--json] [--once]
 ///                                    promote automatically after N failed
 ///                                    probes; exits after a promotion
+///   tier-policy <dir> [--cold-dir <abs>] [--warm N] [--json]
+///                                    show or persist the directory-level
+///                                    tiering policy: maintain/serve then move
+///                                    rolled segments beyond the warm count to
+///                                    the cold-dir automatically (an explicit
+///                                    `tier` run pins the policy too)
 ///   archive <dir> <file> [--list] [--extract --into <dir>]
 ///                                    pack a log directory into a single
 ///                                    self-contained archive file (CRC32) for
@@ -376,7 +382,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.4"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|ttl-audit|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|ttl-audit|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|tier-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -615,6 +621,138 @@ fn save_schema_policy(dir : String, on : Bool) -> Unit raise @io.IoError {
     dir + "/" + SCHEMA_FILE,
     @utf8.encode(if on { "on\n" } else { "off\n" }),
   )
+}
+
+///|
+/// Directory-level tiering policy `<dir>/TIER` (3.6 third round): line 1 is
+/// the absolute cold-dir, line 2 (optional) `warm <N>`. Persisting it lets
+/// `maintain`/`serve` move rolled segments to the cold tier automatically —
+/// the tiering used to live only in a manual `tier` invocation, so operators
+/// who never ran it kept every rolled segment on hot storage. A missing or
+/// malformed file means no automatic tiering (safe fallback).
+const TIER_FILE : String = "TIER"
+
+///|
+/// (cold_dir, warm) from `<dir>/TIER`; ("", 0) when absent/malformed. An
+/// empty first line or `off` disables automatic tiering.
+fn load_tier_policy(dir : String) -> (String, Int64) {
+  let path = dir + "/" + TIER_FILE
+  if !@backend_native.file_exists(path) {
+    return ("", 0)
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  let mut cold : String = ""
+  let mut warm : Int64 = 1
+  let mut seen_cold = false
+  for line in lines {
+    let s = @utf8.decode_lossy(line).trim().to_owned()
+    if s.length() == 0 {
+      continue
+    }
+    if !seen_cold {
+      if s == "off" {
+        return ("", 0)
+      }
+      cold = s
+      seen_cold = true
+      continue
+    }
+    // `warm <N>` — byte-level prefix check ('w','a','r','m',' ').
+    if line.length() > 5 &&
+      line.at(0).to_int() == 119 &&
+      line.at(1).to_int() == 97 &&
+      line.at(2).to_int() == 114 &&
+      line.at(3).to_int() == 109 &&
+      line.at(4).to_int() == 32 {
+      let v = @string.parse_int64(
+        @utf8.decode_lossy(@core.slice(line, 5, line.length())),
+      ) catch {
+        _ => 1
+      }
+      if v >= 0 {
+        warm = v
+      }
+    }
+  }
+  if cold.length() == 0 || cold.at(0).to_int() != 47 {
+    return ("", 0)
+  }
+  (cold, warm)
+}
+
+///|
+fn save_tier_policy(
+  dir : String,
+  cold_dir : String,
+  warm : Int64,
+) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  let body = if cold_dir == "off" || cold_dir.length() == 0 {
+    "off\n"
+  } else if warm > 0 {
+    cold_dir + "\nwarm " + warm.to_string() + "\n"
+  } else {
+    cold_dir + "\n"
+  }
+  @backend_native.write_file(dir + "/" + TIER_FILE, @utf8.encode(body))
+}
+
+///|
+/// Show or persist the directory-level tiering policy (`TIER`). With no
+/// options it prints the current policy; `--cold-dir <abs>` persists it so
+/// `maintain`/`serve` tier rolled segments automatically (`off` clears);
+/// `--warm N` sets how many newest rolled segments stay hot.
+fn cmd_tier_policy(
+  dir : String,
+  cold_dir : String?,
+  warm : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  match cold_dir {
+    Some(c) => {
+      if c != "off" && (c.length() == 0 || c.at(0).to_int() != 47) {
+        raise @io.IoError::Invalid("cold-dir must be an absolute path: " + c)
+      }
+      save_tier_policy(dir, c, requested_warm(warm))
+    }
+    None => ()
+  }
+  let (cold, warm_n) = load_tier_policy(dir)
+  if json {
+    println(
+      "{\"tier\":\"" +
+      json_escape_str(cold) +
+      "\",\"warm\":" +
+      (if cold.length() == 0 { "0" } else { warm_n.to_string() }) +
+      "}",
+    )
+  } else if cold.length() == 0 {
+    println("tier: off (dir " + dir + ")")
+  } else {
+    println(
+      "tier: " + cold + " (warm " + warm_n.to_string() + ", dir " + dir + ")",
+    )
+  }
+}
+
+///|
+/// Parse an explicit `--warm <N>` (>= 0); 0 keeps the persisted value.
+fn requested_warm(s : String?) -> Int64 raise @io.IoError {
+  match s {
+    Some(v) => {
+      let n = @string.parse_int64(v) catch {
+        _ => raise @io.IoError::Invalid("invalid warm count: " + v)
+      }
+      if n < 0 {
+        raise @io.IoError::Invalid(
+          "invalid warm count: " + v + " (must be >= 0)",
+        )
+      }
+      n
+    }
+    None => 0
+  }
 }
 
 ///|
@@ -1703,9 +1841,22 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let detail = log.segment_summaries()
+    // Tier classification (3.6 third round): a segment whose data file also
+    // exists in the configured cold-dir has been moved there (the main-path
+    // file is a symlink), a compressed segment still on hot storage is warm,
+    // and the active uncompressed tail is hot. Without a TIER policy the
+    // breakdown degrades to hot/warm only.
+    let (cold_dir, _) = load_tier_policy(dir)
     let mut raw_total : Int64 = 0
     let mut disk_total : Int64 = 0
+    let mut hot_bytes : Int64 = 0
+    let mut warm_bytes : Int64 = 0
+    let mut cold_bytes : Int64 = 0
+    let mut hot_segs = 0
+    let mut warm_segs = 0
+    let mut cold_segs = 0
     let actual_disk : Array[Int64] = []
+    let tiers : Array[String] = []
     for seg in detail {
       raw_total = raw_total + seg.bytes
       // Use the real file size (following cold-tier symlinks): a compressed
@@ -1716,6 +1867,24 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
       )
       actual_disk.push(d)
       disk_total = disk_total + d
+      let in_cold = cold_dir.length() > 0 &&
+        @backend_native.file_exists(
+          cold_dir + "/" + @segment.segment_file_name(seg.base_offset),
+        )
+      let tier = if in_cold {
+        cold_segs = cold_segs + 1
+        cold_bytes = cold_bytes + d
+        "cold"
+      } else if seg.compressed {
+        warm_segs = warm_segs + 1
+        warm_bytes = warm_bytes + d
+        "warm"
+      } else {
+        hot_segs = hot_segs + 1
+        hot_bytes = hot_bytes + d
+        "hot"
+      }
+      tiers.push(tier)
     }
     if json {
       let mut s = "{\"records\":" +
@@ -1728,7 +1897,19 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
         raw_total.to_string() +
         ",\"disk_bytes\":" +
         disk_total.to_string() +
-        ",\"detail\":["
+        ",\"tiers\":{\"hot\":{\"segments\":" +
+        hot_segs.to_string() +
+        ",\"bytes\":" +
+        hot_bytes.to_string() +
+        "},\"warm\":{\"segments\":" +
+        warm_segs.to_string() +
+        ",\"bytes\":" +
+        warm_bytes.to_string() +
+        "},\"cold\":{\"segments\":" +
+        cold_segs.to_string() +
+        ",\"bytes\":" +
+        cold_bytes.to_string() +
+        "}},\"detail\":["
       let mut first = true
       let mut i = 0
       while i < detail.length() {
@@ -1747,7 +1928,10 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           ",\"disk_bytes\":" +
           actual_disk[i].to_string() +
           ",\"compressed\":" +
-          (if seg.compressed { "true" } else { "false" })
+          (if seg.compressed { "true" } else { "false" }) +
+          ",\"tier\":\"" +
+          tiers[i] +
+          "\""
         if seg.has_span {
           s = s +
             ",\"min_ts\":" +
@@ -1765,6 +1949,21 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
       println("next_offset " + log.next_offset().to_string())
       println("raw_bytes " + raw_total.to_string())
       println("disk_bytes " + disk_total.to_string())
+      println(
+        "tiers hot=" +
+        hot_segs.to_string() +
+        "seg/" +
+        hot_bytes.to_string() +
+        "B warm=" +
+        warm_segs.to_string() +
+        "seg/" +
+        warm_bytes.to_string() +
+        "B cold=" +
+        cold_segs.to_string() +
+        "seg/" +
+        cold_bytes.to_string() +
+        "B",
+      )
       let mut i = 0
       while i < detail.length() {
         let seg = detail[i]
@@ -1778,7 +1977,9 @@ fn cmd_stats(dir : String, json : Bool) -> Unit raise @io.IoError {
           " disk=" +
           actual_disk[i].to_string() +
           " compressed=" +
-          (if seg.compressed { "true" } else { "false" }),
+          (if seg.compressed { "true" } else { "false" }) +
+          " tier=" +
+          tiers[i],
         )
         i = i + 1
       }
@@ -2433,6 +2634,18 @@ fn cmd_maintain(
   println("merged " + merged.to_string())
   println("superseded dropped " + dropped.to_string())
   println("compressed " + packed.to_string())
+  // Automatic cold tiering when a TIER policy exists (3.6 third round):
+  // after the pass, rolled segments beyond the warm count move to the
+  // persisted cold-dir — tiering no longer depends on an operator running
+  // `tier` by hand. tier_log_dir runs its own open/compress/close lifecycle
+  // and must come after run_maintenance released the log.
+  let (tier_cold, tier_warm) = load_tier_policy(dir)
+  let tiered : Int32 = if tier_cold.length() > 0 {
+    @backend_native.tier_log_dir(dir, tier_cold, ROLL_SIZE, tier_warm.to_int())
+  } else {
+    0
+  }
+  println("tiered " + tiered.to_string())
   match ttl_ms {
     Some(_) => println("expired folded " + folded.to_string())
     None => ()
@@ -2488,6 +2701,17 @@ fn cmd_serve(
   let mut go = true
   while go {
     let (merged, dropped, folded, packed) = run_maintenance(dir, max, ttl_ms)
+    let (tier_cold, tier_warm) = load_tier_policy(dir)
+    if tier_cold.length() > 0 {
+      ignore(
+        @backend_native.tier_log_dir(
+          dir,
+          tier_cold,
+          ROLL_SIZE,
+          tier_warm.to_int(),
+        ),
+      )
+    }
     cycle = cycle + 1
     let mut line = "cycle " +
       cycle.to_string() +
@@ -2856,6 +3080,10 @@ fn cmd_tier(
   } else {
     run_locked(dir, true, () => {
       let moved = @backend_native.tier_log_dir(dir, cold_dir, ROLL_SIZE, warm_n)
+      // An explicit `tier` pins the cold-dir as the directory-level policy
+      // (3.6 third round): subsequent maintain/serve passes keep tiering to
+      // the same place without the operator repeating the command.
+      save_tier_policy(dir, cold_dir, warm_n.to_int64())
       if json {
         println(
           "{\"dry_run\":false,\"moved\":" +
@@ -2903,6 +3131,7 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name == "TTL" ||
       name == "QUOTA" ||
       name == "PARTITION" ||
+      name == "TIER" ||
       name == "SCHEMA" ||
       name == "AUDIT" ||
       name == "TTL_AUDIT" {
@@ -3626,7 +3855,7 @@ fn drill_sidecar_stats(dir : String) -> (Int32, Int64) {
 ///|
 fn drill_config_check(dir : String, rst : String) -> String {
   let files = [
-    "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "SELFMON/thresholds",
+    "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "TIER", "SELFMON/thresholds",
   ]
   let mut result = "absent"
   for f in files {
@@ -12326,6 +12555,31 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_schema_policy(args[2], mode, json)
+    }
+  } else if cmd == "tier-policy" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut cold_dir : String? = (None : String?)
+      let mut warm : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a == "--cold-dir" && i + 1 < args.length() {
+          cold_dir = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--warm" && i + 1 < args.length() {
+          warm = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown tier-policy argument: " + a)
+        }
+        i = i + 1
+      }
+      cmd_tier_policy(args[2], cold_dir, warm, json)
     }
   } else if cmd == "partitions" {
     if args.length() < 3 {

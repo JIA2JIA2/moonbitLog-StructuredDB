@@ -1105,7 +1105,28 @@ pub fn compress_rolled_segments(
           )
           seg.mark_compressed(raw_size, algo)
           seg.mark_fsync_clean()
+          // Persist the compressed segment meta before reopening: without
+          // this the on-disk .index still says `compressed=false` and the
+          // reopen below would fall back to a plain (now-compressed) file.
+          write_file_atomic(
+            dir,
+            segment_index_name(seg.base_offset),
+            seg.to_meta().encode(),
+          )
           packed = packed + 1
+          // The segment's fd still points at the orphaned raw inode, so the
+          // live log object must switch to the decompressing view of the new
+          // file — otherwise a verify in the same maintenance pass reads raw
+          // bytes against the compressed checksum and flags corruption
+          // (3.6 third round). Per-segment reopen, not a whole-log reopen:
+          // the latter re-reads the manifest and was observed dropping every
+          // compressed segment.
+          seg.writer.close()
+          let name = @segment.segment_file_name(seg.base_offset)
+          match load_compressed_segment(dir, name, dir + "/" + name) {
+            Some(reopened) => log.segments[i] = reopened
+            None => ()
+          }
         }
       }
     }
@@ -1376,6 +1397,7 @@ fn is_backup_file(name : String) -> Bool {
   name == "TTL" ||
   name == "QUOTA" ||
   name == "PARTITION" ||
+  name == "TIER" ||
   name == "SCHEMA" ||
   // The operation-audit trail travels with the backup (6.6 "deletion is
   // verifiable" relies on it surviving a disaster recovery); the live AUDIT
