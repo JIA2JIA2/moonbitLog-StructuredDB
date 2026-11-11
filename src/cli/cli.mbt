@@ -8309,7 +8309,31 @@ fn bump_string(counts : @hashmap.HashMap[String, Int32], key : String) -> Unit {
 }
 
 ///|
-/// Sort `(bucket, count)` pairs by count descending and keep the top `top_n`.
+/// Byte-wise lexicographic order; used to make same-count output stable.
+fn bytes_lex(a : Bytes, b : Bytes) -> Int32 {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n {
+    let x = a.at(i).to_int()
+    let y = b.at(i).to_int()
+    if x != y {
+      return if x < y { -1 } else { 1 }
+    }
+    i = i + 1
+  }
+  if a.length() < b.length() {
+    -1
+  } else if a.length() > b.length() {
+    1
+  } else {
+    0
+  }
+}
+
+///|
+/// Sort `(bucket, count)` pairs by count descending (template ascending as
+/// tiebreaker, so same-count clusters print in a deterministic order) and
+/// keep the top `top_n`.
 fn top_counts(
   items : Array[(Bytes, Int32)],
   top_n : Int32,
@@ -8320,7 +8344,7 @@ fn top_counts(
     } else if a.1 < b.1 {
       1
     } else {
-      0
+      bytes_lex(a.0, b.0)
     }
   })
   let out : Array[(Bytes, Int32)] = []
@@ -9904,20 +9928,53 @@ fn cmd_anomalies(
 
 ///|
 /// Error clustering: normalize each matching line into a template (digit
-/// runs, hex and quoted spans replaced) and count templates, so variable
-/// content collapses into message shapes. `--match` (default "error") selects
-/// lines (ASCII case-insensitive, key or value; an empty string matches
-/// everything). `--top N` prints the N most frequent templates (default 20).
+/// runs, hex, quoted spans and `key=value` bare values replaced) and count
+/// templates, so variable content collapses into message shapes — the same
+/// shape with different hosts/ids/values merges into one cluster. `--match`
+/// (default "error") selects lines (ASCII case-insensitive, key or value; an
+/// empty string matches everything). `--top N` prints the N most frequent
+/// templates (default 20); `--min-count N` hides one-off long-tail clusters.
 /// With `--stacks`, stack-frame lines are merged into the nearest preceding
-/// matching header **regardless of `--match`** (frames rarely contain the
-/// needle, so the default filter used to drop them); a non-matching header
-/// closes the chain. JSON records with a `stack`/`stacktrace`/`exception`
-/// field are clustered by their normalized stack (so the same stack with
-/// different messages/ids collapses) and count their frame lines. Bounded by
+/// non-frame line **regardless of `--match`** (frames rarely contain the
+/// needle, and `panic:`-style headers do not contain it either): a matching
+/// header becomes a counted cluster, a non-matching one stays an implicit
+/// anchor emitted as a frames-only cluster; blank lines are transparent and
+/// stray frames fall back to their own cluster. JSON records cluster by
+/// their normalized `stack`/`stacktrace`/`exception` field (same stack with
+/// different messages/ids collapses) or, without a stack field, by their
+/// message — not the opaque whole-record template. Bounded by
 /// `--since`/`--until` (default last 24h, `--since 0` for everything) with
 /// segment pushdown; shares the 4.6 slot/guard and scans outside the writer
-/// lock. `--json` emits the clusters as machine-readable JSON.
-fn cluster_json_stack(value : Bytes) -> (Bytes, Int32, Bytes)? {
+/// lock. `--json` emits `{mode, clusters, total, records}`; text output
+/// reports the records count so the noise reduction is visible.
+
+///|
+/// True when the line is empty or whitespace-only. Stack traces often carry
+/// blank separator lines; they must neither open a header nor break the
+/// frame chain.
+fn blank_line(v : Bytes) -> Bool {
+  let n = v.length()
+  let mut i = 0
+  while i < n {
+    let b = v.at(i).to_int()
+    if b != 32 && b != 9 && b != 10 && b != 13 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Cluster a JSON record: extract its `stack`/`stacktrace`/`exception` field
+/// and message in one pass. With a stack, the record clusters by its
+/// normalized stack (same stack + different messages/ids collapses) and
+/// counts its frame lines. Without a stack, the record clusters by its
+/// normalized message — the whole JSON used to normalize to the opaque
+/// `{<str>:<str>,...}` template, merging every record into one cluster.
+/// Returns `(cluster key, frame count, sample)`; `None` when the record is
+/// not JSON or carries neither stack nor message.
+fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes)? {
   if value.length() == 0 || value.at(0).to_int() != 123 {
     return None
   }
@@ -9940,10 +9997,17 @@ fn cluster_json_stack(value : Bytes) -> (Bytes, Int32, Bytes)? {
       }
     }
   }
+  let sample = match msg {
+    Some(m) => m
+    None => value
+  }
   match stack {
     Some(s) => {
       if s.length() == 0 {
-        return None
+        return match msg {
+          Some(m) => Some((@core.normalize_log_template(m), 0, m))
+          None => None
+        }
       }
       // Count frame lines; the exception-class header does not count.
       let mut frames : Int32 = 0
@@ -9958,13 +10022,18 @@ fn cluster_json_stack(value : Bytes) -> (Bytes, Int32, Bytes)? {
         }
         i = i + 1
       }
-      let sample = match msg {
-        Some(m) => m
-        None => value
-      }
       Some((@core.normalize_log_template(s), frames, sample))
     }
-    None => None
+    None =>
+      match msg {
+        Some(m) =>
+          if m.length() > 0 {
+            Some((@core.normalize_log_template(m), 0, m))
+          } else {
+            None
+          }
+        None => None
+      }
   }
 }
 
@@ -9977,6 +10046,7 @@ fn cmd_cluster(
   json : Bool,
   since : String?,
   until : String?,
+  min_count : String?,
 ) -> Unit raise @io.IoError {
   let scope = active_scope(dir)
   let top_n = match top {
@@ -9985,6 +10055,19 @@ fn cmd_cluster(
         _ => raise @io.IoError::Invalid("invalid top count: " + s)
       }
     None => 20
+  }
+  let min_n = match min_count {
+    Some(s) => {
+      let v = @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid min-count: " + s)
+      }
+      if v < 1 {
+        1
+      } else {
+        v
+      }
+    }
+    None => 1
   }
   let needle = @utf8.encode(
     match match_text {
@@ -10036,6 +10119,7 @@ fn cmd_cluster(
   let samples : @hashmap.HashMap[Bytes, Bytes] = @hashmap.HashMap::HashMap([])
   run_read_snapshot(dir, log => {
     let mut current : Bytes? = None
+    let mut last_head : Bytes? = None
     let mut abort_msg : String? = None
     for seg in log.segments {
       if abort_msg is Some(_) {
@@ -10081,11 +10165,12 @@ fn cmd_cluster(
         }
         let pass = match_needle(rec.key, needle, true) ||
           match_needle(rec.value, needle, true)
+        let jrec = cluster_json_record(rec.value)
         if stacks {
           // JSON records carry their stack inline: cluster by the normalized
           // stack (same stack + different messages/ids collapses) and count
           // the frame lines inside that record.
-          match cluster_json_stack(rec.value) {
+          match jrec {
             Some((tpl, fr, sample)) =>
               if pass {
                 bump_bytes(counts, tpl)
@@ -10104,30 +10189,51 @@ fn cmd_cluster(
                 current = None
               }
             None =>
-              // Frames merge into the nearest matched header even when the
-              // frame line itself does not contain the needle (the default
-              // "error" filter used to drop every frame); a non-matching
-              // header closes the chain.
-              if @core.is_stack_frame(rec.value) {
+              // Frames merge into the nearest preceding non-frame line even
+              // when neither the frame nor that header contains the needle
+              // (the default "error" filter used to drop every frame, and
+              // `panic:`-style headers used to strand their frames): a
+              // matching header becomes a counted error cluster, a
+              // non-matching one stays an implicit anchor (frames counted,
+              // emitted as a frames-only cluster), blank lines are
+              // transparent, and truly stray frames fall back to their own
+              // cluster.
+              if blank_line(rec.value) {
+                return
+              } else if @core.is_stack_frame(rec.value) {
                 match current {
-                  Some(k) => bump_bytes(frames, k)
+                  Some(k) => {
+                    bump_bytes(frames, k)
+                    if counts.get(k) is None && samples.get(k) is None {
+                      match last_head {
+                        Some(h) => samples.set(k, h)
+                        None => ()
+                      }
+                    }
+                  }
                   None =>
                     bump_bytes(counts, @core.normalize_log_template(rec.value))
                 }
-              } else if pass {
-                let tpl = @core.normalize_log_template(rec.value)
-                bump_bytes(counts, tpl)
-                current = Some(tpl)
-                match samples.get(tpl) {
-                  None => samples.set(tpl, rec.value)
-                  Some(_) => ()
-                }
               } else {
-                current = None
+                let tpl = @core.normalize_log_template(rec.value)
+                if pass {
+                  bump_bytes(counts, tpl)
+                }
+                current = Some(tpl)
+                last_head = Some(rec.value)
+                if pass {
+                  match samples.get(tpl) {
+                    None => samples.set(tpl, rec.value)
+                    Some(_) => ()
+                  }
+                }
               }
           }
         } else if pass {
-          bump_bytes(counts, @core.normalize_log_template(rec.value))
+          match jrec {
+            Some((tpl, _, _)) => bump_bytes(counts, tpl)
+            None => bump_bytes(counts, @core.normalize_log_template(rec.value))
+          }
         }
       })
     }
@@ -10137,10 +10243,32 @@ fn cmd_cluster(
     }
   })
   let items : Array[(Bytes, Int32)] = []
+  let mut records = 0
   for k in counts.keys() {
     match counts.get(k) {
-      Some(c) => items.push((k, c))
+      Some(c) => {
+        records = records + c
+        if c >= min_n {
+          items.push((k, c))
+        }
+      }
       None => ()
+    }
+  }
+  let mut total = counts.length()
+  if stacks {
+    // Implicit anchors: headers that matched no needle but carry merged
+    // frames (`panic:`-style headers). They contribute no records but the
+    // stack is real signal — always emit them, outside --min-count.
+    let extra : Array[(Bytes, Int32)] = []
+    for k in frames.keys() {
+      if counts.get(k) is None {
+        extra.push((k, 0))
+      }
+    }
+    total = total + extra.length()
+    for e in extra {
+      items.push(e)
     }
   }
   let shown = top_counts(items, top_n)
@@ -10180,7 +10308,12 @@ fn cmd_cluster(
       }
       s = s + "}"
     }
-    s = s + "],\"total\":" + counts.length().to_string() + "}"
+    s = s +
+      "],\"total\":" +
+      total.to_string() +
+      ",\"records\":" +
+      records.to_string() +
+      "}"
     println(s)
   } else if stacks {
     println("count  frames  template  | sample")
@@ -10203,13 +10336,25 @@ fn cmd_cluster(
         sample,
       )
     }
-    println("(" + counts.length().to_string() + " clusters)")
+    println(
+      "(" +
+      shown.length().to_string() +
+      " clusters from " +
+      records.to_string() +
+      " records)",
+    )
   } else {
     println("count  template")
     for item in shown {
       println(item.1.to_string() + "  " + bytes_to_string(item.0))
     }
-    println("(" + counts.length().to_string() + " templates)")
+    println(
+      "(" +
+      shown.length().to_string() +
+      " templates from " +
+      records.to_string() +
+      " records)",
+    )
   }
 }
 
@@ -14095,6 +14240,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut json = false
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
+      let mut min_count : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -14114,12 +14260,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--until" && i + 1 < args.length() {
           until = Some(args[i + 1])
           i = i + 1
+        } else if a == "--min-count" && i + 1 < args.length() {
+          min_count = Some(args[i + 1])
+          i = i + 1
         } else {
           raise @io.IoError::Invalid("unknown cluster option: " + a)
         }
         i = i + 1
       }
-      cmd_cluster(args[2], match_text, top, stacks, json, since, until)
+      cmd_cluster(
+        args[2],
+        match_text,
+        top,
+        stacks,
+        json,
+        since,
+        until,
+        min_count,
+      )
     }
   } else if cmd == "trend" {
     if args.length() < 3 {
