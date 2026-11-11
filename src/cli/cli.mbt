@@ -32,6 +32,10 @@
 ///                                    differentiated-TTL expiry per <dir>/TTL
 ///                                    (default/service/level rules); applied
 ///                                    runs append to TTL_AUDIT.log
+///   ttl-audit <dir> [--since ms] [--until ms] [--limit N]
+///              [--json] [--verify]   query the TTL_AUDIT trail (events,
+///                                    trigger, counts, policy); --verify
+///                                    reports line integrity
 ///   replicate <src> <dst> [--follow]
 ///                                    incrementally mirror the source log into
 ///                                    a complete replica directory (--follow
@@ -365,7 +369,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.4"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|ttl-audit|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -1950,6 +1954,215 @@ fn ttl_audit_path(dir : String) -> String {
     ignore(@backend_native.rename_file(legacy, dir + "/TTL_AUDIT"))
   }
   dir + "/TTL_AUDIT"
+}
+
+///|
+/// Read-only query over `<dir>/TTL_AUDIT` (3.4 "cleanup stays auditable" —
+/// the trail used to be write-only, inspectable only by raw `cat`). Events
+/// are the JSONL lines `append_ttl_audit` writes; `--since/--until` filter on
+/// the event `ts` (ms), `--limit` caps the output (0 = unlimited, default
+/// 20), `--json` emits a JSON array, and `--verify` reports line integrity
+/// (every line must parse as JSON carrying `ts`/`event`/`trigger`).
+fn cmd_ttl_audit(
+  dir : String,
+  since : String?,
+  until : String?,
+  limit : String?,
+  json : Bool,
+  verify : Bool,
+) -> Unit raise @io.IoError {
+  let since_ms : Int64? = match since {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid since: " + s)
+        },
+      )
+    None => None
+  }
+  let until_ms : Int64? = match until {
+    Some(s) =>
+      Some(
+        @string.parse_int64(s) catch {
+          _ => raise @io.IoError::Invalid("invalid until: " + s)
+        },
+      )
+    None => None
+  }
+  let limit_n : Int32 = match limit {
+    Some(s) =>
+      @string.parse_int(s) catch {
+        _ => raise @io.IoError::Invalid("invalid limit: " + s)
+      }
+    None => 20
+  }
+  if limit_n < 1 {
+    raise @io.IoError::Invalid("limit must be >= 1")
+  }
+  let path = ttl_audit_path(dir)
+  let mut lines : Array[Bytes] = []
+  if @backend_native.file_exists(path) {
+    let data = @backend_native.read_file(path)
+    let (rows, _) = split_complete_lines(data, true)
+    lines = rows
+  }
+  let total = lines.length()
+  let mut valid = 0
+  let mut invalid = 0
+  let mut shown = 0
+  let out = StringBuilder()
+  for line in lines {
+    let fields : Array[(Bytes, Bytes)]? = Some(@core.json_object_fields(line)) catch {
+      _ => None
+    }
+    match fields {
+      Some(pairs) => {
+        let mut ts : Int64? = None
+        let mut event = ""
+        let mut trigger = ""
+        let mut dropped = ""
+        let mut expired = ""
+        let mut policy = ""
+        let mut ok = false
+        for pair in pairs {
+          let k = @utf8.decode_lossy(pair.0)
+          let v = @utf8.decode_lossy(pair.1)
+          if k == "ts" {
+            let n = @string.parse_int64(v) catch { _ => (0 : Int64) }
+            if n > 0 {
+              ts = Some(n)
+              ok = true
+            }
+          } else if k == "event" {
+            event = v
+          } else if k == "trigger" {
+            trigger = v
+          } else if k == "segments_dropped" {
+            dropped = v
+          } else if k == "records_expired" {
+            expired = v
+          } else if k == "policy" {
+            policy = v
+          }
+        }
+        if ok {
+          valid = valid + 1
+        } else {
+          invalid = invalid + 1
+        }
+        if ok {
+          match (since_ms, until_ms) {
+            (Some(s), _) =>
+              match ts {
+                Some(t) => if t < s { continue }
+                None => ()
+              }
+            (_, Some(u)) =>
+              match ts {
+                Some(t) => if t > u { continue }
+                None => ()
+              }
+            _ => ()
+          }
+          if shown >= limit_n {
+            continue
+          }
+          shown = shown + 1
+          if verify {
+            // Verify-only mode: count integrity, print nothing per event.
+            continue
+          }
+          if json {
+            out.write_string(
+              line_text_of_event(ts, event, trigger, dropped, expired, policy),
+            )
+            out.write_string(",")
+          } else {
+            let t_s = match ts {
+              Some(t) => t.to_string()
+              None => "-"
+            }
+            println(
+              t_s +
+              "  " +
+              trigger +
+              "  dropped=" +
+              dropped +
+              "  expired=" +
+              expired +
+              "  policy=" +
+              policy,
+            )
+          }
+        }
+      }
+      None => invalid = invalid + 1
+    }
+  }
+  if json && verify {
+    println(
+      "{\"lines\":" +
+      total.to_string() +
+      ",\"valid\":" +
+      valid.to_string() +
+      ",\"invalid\":" +
+      invalid.to_string() +
+      ",\"status\":\"" +
+      (if invalid == 0 { "ok" } else { "corrupt" }) +
+      "\"}",
+    )
+  } else if json {
+    let body = out.to_string()
+    let trimmed = if body.length() > 0 && body.has_suffix(",") {
+      body.substring(start=0, end=body.length() - 1)
+    } else {
+      body
+    }
+    println("[" + trimmed + "]")
+  } else if verify {
+    println(
+      "lines " +
+      total.to_string() +
+      ", valid " +
+      valid.to_string() +
+      ", invalid " +
+      invalid.to_string() +
+      (if invalid == 0 { " — ok" } else { " — corrupt" }),
+    )
+  } else {
+    println(
+      "(" + shown.to_string() + " events, " + total.to_string() + " lines)",
+    )
+  }
+}
+
+///|
+/// One event serialized as a compact JSON object for `ttl-audit --json`.
+fn line_text_of_event(
+  ts : Int64?,
+  event : String,
+  trigger : String,
+  dropped : String,
+  expired : String,
+  policy : String,
+) -> String {
+  let t_s = match ts {
+    Some(t) => t.to_string()
+    None => "null"
+  }
+  "{\"ts\":" +
+  t_s +
+  ",\"event\":\"" +
+  json_escape_str(event) +
+  "\",\"trigger\":\"" +
+  json_escape_str(trigger) +
+  "\",\"segments_dropped\":" +
+  (if dropped.length() == 0 { "0" } else { dropped }) +
+  ",\"records_expired\":" +
+  (if expired.length() == 0 { "0" } else { expired }) +
+  ",\"policy\":\"" +
+  json_escape_str(policy) +
+  "\"}"
 }
 
 ///|
@@ -13314,6 +13527,36 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       }
       cmd_ttl_expire(args[2], dry, json)
+    }
+  } else if cmd == "ttl-audit" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut since : String? = (None : String?)
+      let mut until : String? = (None : String?)
+      let mut limit : String? = (None : String?)
+      let mut json = false
+      let mut verify = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--since" && i + 1 < args.length() {
+          since = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--until" && i + 1 < args.length() {
+          until = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--limit" && i + 1 < args.length() {
+          limit = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--json" {
+          json = true
+        } else if a == "--verify" {
+          verify = true
+        }
+        i = i + 1
+      }
+      cmd_ttl_audit(args[2], since, until, limit, json, verify)
     }
   } else if cmd == "ha-failover" {
     if args.length() < 4 {

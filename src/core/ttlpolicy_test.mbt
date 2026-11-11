@@ -106,3 +106,21 @@ test "ttl scope matching is case-insensitive for service and level" {
   // `Level=` field names are case-insensitive too.
   assert_eq(@core.ttl_record_level(b"Level=error msg=x"), Some(b"error"))
 }
+
+///|
+test "ttl_record_level covers JSON records and level aliases (3.4)" {
+  // SDK-style JSON records: before flattening, `severity_text` was invisible
+  // and per-level retention silently missed them.
+  assert_eq(
+    @core.ttl_record_level(
+      b"{\"severity_text\":\"ERROR\",\"service\":\"orders\",\"message\":\"boom\"}",
+    ),
+    Some(b"ERROR"),
+  )
+  // KV alias fields resolve through the unified schema (2.2).
+  assert_eq(@core.ttl_record_level(b"severity=warn svc=o"), Some(b"warn"))
+  assert_eq(@core.ttl_record_level(b"lvl=fatal k=v"), Some(b"fatal"))
+  // Plain values without any level slot stay None.
+  assert_true(@core.ttl_record_level(b"{\"msg\":\"no level here\"}") is None)
+  assert_true(@core.ttl_record_level(b"msg=plain") is None)
+}

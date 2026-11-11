@@ -174,11 +174,27 @@ pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
 }
 
 ///|
-/// The parsed `level` field of a record value (kv pairs), if present.
+/// The parsed `level` field of a record value, if present. Sources: kv pairs
+/// plus the flattened JSON object for SDK-style records (2.1) — before the
+/// flattening, JSON records carried no recognizable level and the per-level
+/// retention rule silently missed them (3.4 third round). The level slot is
+/// identified through the unified schema (2.2), so `severity_text` and
+/// friends resolve exactly like `level=` does; value matching stays
+/// case-insensitive in `ttl_days_of`.
 pub fn ttl_record_level(value : Bytes) -> Bytes? {
   let mut found : Bytes? = None
-  for pair in parse_kv_pairs(value) {
-    if ttl_bytes_eq_ci(pair.0, b"level") {
+  let mut walk : Array[(Bytes, Bytes)] = parse_kv_pairs(value)
+  if value.length() > 0 && value.at(0).to_int() == 123 {
+    let flat : Array[(Bytes, Bytes)]? = Some(json_object_fields(value)) catch {
+      _ => None
+    }
+    match flat {
+      Some(pairs) => walk = pairs
+      None => ()
+    }
+  }
+  for pair in walk {
+    if canonical_field(pair.0) == 1 {
       found = Some(pair.1)
     }
   }
