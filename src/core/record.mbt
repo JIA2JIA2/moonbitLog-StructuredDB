@@ -113,13 +113,19 @@ fn u32_as_int(x : UInt32) -> Int32 {
 }
 
 ///|
-/// Copy the bytes in `[start, end)` into a fresh `Bytes`.
+/// Copy the bytes in `[start, end)` into a fresh `Bytes`. One blit instead of
+/// a per-byte buffer loop: `read_at` on a compressed segment serves every
+/// record read through this function, so the loop dominated query latency on
+/// compressed data (3.3) — the same hot path applies to record decoding
+/// everywhere.
 pub fn slice(data : Bytes, start : Int32, end : Int32) -> Bytes {
-  let buf = @buffer.Buffer::Buffer()
-  for i = start; i < end; i = i + 1 {
-    buf.write_byte(data.at(i))
+  let len = end - start
+  if len <= 0 {
+    return []
   }
-  buf.to_bytes()
+  let out : FixedArray[Byte] = FixedArray::make(len, b'\x00')
+  out.blit_from_bytes(0, data, start, len)
+  Bytes::from_fixedarray(out, len~)
 }
 
 ///|

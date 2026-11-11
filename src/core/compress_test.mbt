@@ -100,3 +100,14 @@ test "lzss finds repeated log lines beyond the old 64-byte scan" {
   }
   assert_eq(dec, src)
 }
+
+///|
+test "rle decompress clamps a run that overflows raw_len (3.3)" {
+  // A run of 5 'x' encoded by rle_compress; with raw_len=2 a truncated
+  // stream must not write past the allocation — the run is clamped to the
+  // bound instead of growing the output beyond it.
+  let src = b"xxxxx"
+  let enc = @core.rle_compress(src)
+  let dec = @core.rle_decompress(enc, (2 : Int64)) catch { _ => panic() }
+  assert_eq(dec, b"xx")
+}

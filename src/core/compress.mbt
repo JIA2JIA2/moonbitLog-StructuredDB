@@ -38,39 +38,49 @@ pub fn rle_compress(data : Bytes) -> Bytes {
 
 ///|
 /// Inverse of `rle_compress`. `raw_len` bounds the expected output length and
-/// guards against a corrupt or truncated stream.
+/// guards against a corrupt or truncated stream. The output is allocated once
+/// at the known size and written by index — a growable buffer's per-byte push
+/// dominated decompression time on compressed segments (3.3). A run that
+/// would overflow the bound is clamped, so a corrupt stream cannot write past
+/// the allocation.
 pub fn rle_decompress(data : Bytes, raw_len : Int64) -> Bytes raise MetaError {
-  let out = @buffer.Buffer::Buffer()
+  if raw_len < 0 || raw_len > (0x7FFFFFFF : Int64) {
+    raise MetaError::Truncated(0)
+  }
+  let out : FixedArray[Byte] = FixedArray::make(raw_len.to_int(), b'\x00')
   let n = data.length()
   let mut i = 0
-  let mut produced : Int64 = 0
-  while i < n && produced < raw_len {
+  let mut produced : Int32 = 0
+  while i < n && produced < raw_len.to_int() {
     let b = data.at(i)
     if b == (0xFF : Byte) {
       if i + 2 >= n {
         raise MetaError::Truncated(i)
       }
-      let count = data.at(i + 1).to_int().to_int64()
+      let count = data.at(i + 1).to_int()
       let val = data.at(i + 2)
-      if count == 0 {
-        out.write_byte(val)
-        produced = produced + 1
+      let avail = raw_len.to_int() - produced
+      let run = if count == 0 {
+        1
+      } else if count < avail {
+        count
       } else {
-        let mut k : Int64 = 0
-        while k < count {
-          out.write_byte(val)
-          k = k + 1
-        }
-        produced = produced + count
+        avail
+      }
+      let mut k = 0
+      while k < run {
+        out[produced] = val
+        produced = produced + 1
+        k = k + 1
       }
       i = i + 3
     } else {
-      out.write_byte(b)
+      out[produced] = b
       produced = produced + 1
       i = i + 1
     }
   }
-  out.to_bytes()
+  Bytes::from_fixedarray(out, len=produced)
 }
 
 ///|
@@ -189,17 +199,26 @@ pub fn lz_compress(data : Bytes) -> Bytes {
 
 ///|
 /// Inverse of `lz_compress`. `raw_len` bounds the expected output length and
-/// guards against a corrupt or truncated stream.
+/// guards against a corrupt or truncated stream. The output is allocated once
+/// at the known size and written by index; back-references read that array
+/// directly. A growable-Array push loop (plus the final slice copy) dominated
+/// decompression time and doubled compressed-segment query latency (3.3), so
+/// this is the hot path's shape. A truncated stream yields the bytes produced
+/// so far, matching the old behavior.
 pub fn lz_decompress(data : Bytes, raw_len : Int64) -> Bytes raise MetaError {
-  let out : Array[Byte] = []
+  if raw_len < 0 || raw_len > (0x7FFFFFFF : Int64) {
+    raise MetaError::Truncated(0)
+  }
+  let out : FixedArray[Byte] = FixedArray::make(raw_len.to_int(), b'\x00')
   let n = data.length()
+  let limit = raw_len.to_int()
   let mut pos = 0
-  let mut produced : Int64 = 0
-  while pos < n && produced < raw_len {
+  let mut produced : Int32 = 0
+  while pos < n && produced < limit {
     let flags = data.at(pos).to_int()
     pos = pos + 1
     let mut bit = 0
-    while bit < 8 && pos < n && produced < raw_len {
+    while bit < 8 && pos < n && produced < limit {
       if (flags & (1 << bit)) != 0 {
         if pos + 2 > n {
           raise MetaError::Truncated(pos)
@@ -208,26 +227,26 @@ pub fn lz_decompress(data : Bytes, raw_len : Int64) -> Bytes raise MetaError {
         let dist = (v & 0xFFF) + 1
         let len = ((v >> 12) & 0xF) + 3
         pos = pos + 2
-        let start = out.length() - dist
+        let start = produced - dist
         if start < 0 {
           raise MetaError::Truncated(pos)
         }
         let mut k = 0
-        while k < len {
-          out.push(out[start + k])
-          k = k + 1
+        while k < len && produced < limit {
+          out[produced] = out[start + k]
           produced = produced + 1
+          k = k + 1
         }
       } else {
         if pos >= n {
           raise MetaError::Truncated(pos)
         }
-        out.push(data.at(pos))
+        out[produced] = data.at(pos)
         pos = pos + 1
         produced = produced + 1
       }
       bit = bit + 1
     }
   }
-  Bytes::from_array(out[:])
+  Bytes::from_fixedarray(out, len=produced)
 }
