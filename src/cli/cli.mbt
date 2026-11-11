@@ -9626,7 +9626,14 @@ fn anomaly_error_text(
 ///    minute-bucket distribution (mean/std, z > --sigma);
 /// 2. NEW_PATTERN: error templates present in the recent period but absent
 ///    from the baseline (count >= --min-count), with a sample;
-/// 3. SEASONAL_DEVIATION: an hour-of-day whose recent count deviates from the
+/// 3. PATTERN_SPIKE: an error template that already existed in the baseline
+///    whose recent count exceeds the duration-normalized baseline
+///    expectation by `--spike-factor` (default 3x, and by at least
+///    --min-count absolute growth) — total-volume z-scores miss composition
+///    shifts (one pattern 4x while another drops) and the diff detector only
+///    sees templates absent from the baseline, so a 4x surge on a known
+///    error used to go completely unreported;
+/// 4. SEASONAL_DEVIATION: an hour-of-day whose recent count deviates from the
 ///    baseline hour-of-day daily mean (Poisson approximation, z > --sigma).
 /// Values accept KV text and JSON objects (2.1 flattening); errors are
 /// severity rank >= 3 from a recognized level field (case-insensitive), or —
@@ -9635,7 +9642,7 @@ fn anomaly_error_text(
 /// `--since/--until` select the recent window in absolute event time (the
 /// baseline is the same-length period immediately before it) for
 /// retrospective triage; without them the window is [now-recent, now].
-/// `--service` scopes all three detectors (key or schema service field,
+/// `--service` scopes all detectors (key or schema service field,
 /// case-insensitive). Uses the 4.6 query slot/timeout/scan budget, a snapshot
 /// read and segment min_ts/max_ts pushdown, so a long pass cannot stall
 /// ingestion.
@@ -9647,6 +9654,7 @@ fn cmd_anomalies(
   min_count : String,
   top : String,
   service : String?,
+  spike_factor_s : String?,
   since : String?,
   until : String?,
   json : Bool,
@@ -9677,6 +9685,23 @@ fn cmd_anomalies(
   }
   if top_n <= 0 {
     raise @io.IoError::Invalid("top must be positive")
+  }
+  // Pattern-spike factor (detection 4): an existing error template whose
+  // recent count exceeds the baseline expectation by this multiple (and by
+  // at least --min-count absolute growth) reports as PATTERN_SPIKE. Default
+  // 3x — total-volume z-scores miss composition shifts (one pattern 4x
+  // while another drops), and the diff detector only sees new templates.
+  let spike_factor_v : Double = match spike_factor_s {
+    Some(v) => {
+      let d = @string.parse_double(v) catch {
+        _ => raise @io.IoError::Invalid("invalid spike-factor: " + v)
+      }
+      if d <= 1.0 {
+        raise @io.IoError::Invalid("spike-factor must be > 1.0")
+      }
+      d
+    }
+    None => 3.0
   }
   let since_ts : Int64? = match since {
     Some(s) =>
@@ -9919,6 +9944,53 @@ fn cmd_anomalies(
         0
       }
     })
+    // Detection 4: pattern spikes — an error template that already existed in
+    // the baseline whose recent count exceeds the duration-normalized
+    // baseline expectation by --spike-factor (and grows by at least
+    // --min-count). Total-volume z-scores miss composition shifts (one
+    // pattern 4x while another drops) and the diff detector only sees
+    // templates absent from the baseline, so a 4x surge on a known error
+    // used to go completely unreported.
+    let pspikes : Array[(Bytes, Int32, Int32, Double, Double)] = []
+    for k in rec_tpl.keys() {
+      match rec_tpl.get(k) {
+        Some(rc) =>
+          if rc >= min_cnt {
+            match base_tpl.get(k) {
+              Some(bc) => {
+                let expected = bc.to_double() *
+                  rec_ms.to_double() /
+                  base_ms.to_double()
+                let z = if expected > 0.0 {
+                  (rc.to_double() - expected) / sqrt_double(expected)
+                } else {
+                  0.0
+                }
+                if rc.to_double() > expected * spike_factor_v &&
+                  rc.to_double() - expected >= min_cnt.to_double() {
+                  pspikes.push((k, rc, bc, expected, z))
+                }
+              }
+              None => ()
+            }
+          }
+        None => ()
+      }
+    }
+    pspikes
+    .mut_view()
+    .sort_by(fn(a, b) {
+      let d = b.4.compare(a.4)
+      if d != 0 {
+        d
+      } else if a.0 < b.0 {
+        -1
+      } else if a.0 > b.0 {
+        1
+      } else {
+        0
+      }
+    })
     // Detection 3: seasonal (hour-of-day) deviations.
     let base_days = if base_ms / (86400000 : Int64) > 0 {
       base_ms / (86400000 : Int64)
@@ -10010,6 +10082,36 @@ fn cmd_anomalies(
           ) +
           "\"}"
       }
+      s = s + "],\"pattern_spikes\":["
+      first = true
+      let pn = clip(pspikes.length())
+      for i2 in 0..<pn {
+        if !first {
+          s = s + ","
+        }
+        first = false
+        s = s +
+          "{\"template\":\"" +
+          json_escape_str(bytes_to_string(pspikes[i2].0)) +
+          "\",\"count\":" +
+          pspikes[i2].1.to_string() +
+          ",\"baseline\":" +
+          pspikes[i2].2.to_string() +
+          ",\"expected\":" +
+          pspikes[i2].3.to_string() +
+          ",\"z\":" +
+          pspikes[i2].4.to_string() +
+          ",\"sample\":\"" +
+          json_escape_str(
+            bytes_to_string(
+              match samples.get(pspikes[i2].0) {
+                Some(sv) => sv
+                None => b""
+              },
+            ),
+          ) +
+          "\"}"
+      }
       s = s + "],\"seasonal_deviations\":["
       first = true
       let sn2 = clip(seasonal.length())
@@ -10093,6 +10195,28 @@ fn cmd_anomalies(
           sample,
         )
       }
+      println("pattern spikes: " + pspikes.length().to_string())
+      let pn = clip(pspikes.length())
+      for i2 in 0..<pn {
+        let sample = match samples.get(pspikes[i2].0) {
+          Some(sv) => bytes_to_string(sv)
+          None => ""
+        }
+        println(
+          "  " +
+          pspikes[i2].1.to_string() +
+          "x (baseline " +
+          pspikes[i2].2.to_string() +
+          ", expected " +
+          pspikes[i2].3.to_string() +
+          ", z=" +
+          pspikes[i2].4.to_string() +
+          ")  " +
+          bytes_to_string(pspikes[i2].0) +
+          "  | " +
+          sample,
+        )
+      }
       println("seasonal deviations: " + seasonal.length().to_string())
       let sn2 = clip(seasonal.length())
       for i2 in 0..<sn2 {
@@ -10108,7 +10232,10 @@ fn cmd_anomalies(
           seasonal[i2].2.to_string(),
         )
       }
-      if spikes.length() == 0 && news.length() == 0 && seasonal.length() == 0 {
+      if spikes.length() == 0 &&
+        news.length() == 0 &&
+        pspikes.length() == 0 &&
+        seasonal.length() == 0 {
         println("no anomalies detected")
       }
       println(
@@ -14871,6 +14998,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut min_count = "2"
       let mut top = "10"
       let mut service : String? = (None : String?)
+      let mut spike_factor_s : String? = (None : String?)
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
       let mut json = false
@@ -14895,6 +15023,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--service" && i + 1 < args.length() {
           service = Some(args[i + 1])
           i = i + 1
+        } else if a == "--spike-factor" && i + 1 < args.length() {
+          spike_factor_s = Some(args[i + 1])
+          i = i + 1
         } else if a == "--since" && i + 1 < args.length() {
           since = Some(args[i + 1])
           i = i + 1
@@ -14916,6 +15047,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         min_count,
         top,
         service,
+        spike_factor_s,
         since,
         until,
         json,
