@@ -4227,12 +4227,17 @@ fn drill_config_check(dir : String, rst : String) -> String {
 
 ///|
 /// One-key recovery drill (6.5): back `dir` up into a scratch directory,
-/// restore it into a second one, fast-verify the restored copy, reconcile
-/// record counts and offsets against the live directory, compare the policy
-/// files and spot-read the first and last record, and reconcile the audit
-/// trail plus the batch-id ledger against the backup — proving a real
-/// restore succeeds end to end. The live directory is only ever read (under
-/// its shared lock) and the scratch directories are removed unless `--keep`.
+/// restore it into a second one, then reconcile the restored copy against
+/// the **backup snapshot** — fast-verify, record count/offset agreement,
+/// first/last record spot reads, policy files, index sidecars, the audit
+/// trail and the batch-id ledger — proving a real restore succeeds end to
+/// end. The live directory is only touched during the backup pass under
+/// its exclusive lock; reconciliation never reads it, so a drill stays
+/// green while producers keep appending after the snapshot was taken (a
+/// live-directory baseline used to flip `DRILL status` to fail whenever a
+/// concurrent write landed between the two passes) and writes are never
+/// blocked by the reconciliation phase. Scratch directories are removed
+/// unless `--keep`.
 fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
   let bak = dir + ".drill-backup"
@@ -4279,64 +4284,65 @@ fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
   // 2. Restore into the scratch directory (empty by construction).
   restored_segs = @backend_native.restore_log_dir(bak, rst)
 
-  // 3. Verify and reconcile against the live directory (shared lock).
-  run_locked(dir, false, () => {
-    let src_log = open_log(dir)
-    src_records = src_log.count()
-    let src_next = src_log.next_offset()
-    let first_src = src_log.get((0 : UInt64))
-    let last_src = if src_next > (0 : UInt64) {
-      src_log.get(src_next - (1 : UInt64))
-    } else {
-      None
-    }
-    let rst_log = open_log(rst)
-    let report = rst_log.verify_fast()
-    verify_records = report.records
-    let verify_ok = report.first_bad_offset is None &&
-      report.first_bad_checksum is None
-    let next_ok = rst_log.next_offset() == src_next
-    let first_rst = rst_log.get((0 : UInt64))
-    let last_rst = if src_next > (0 : UInt64) {
-      rst_log.get(src_next - (1 : UInt64))
-    } else {
-      None
-    }
-    let spot = match (first_src, first_rst, last_src, last_rst) {
-      (Some(a), Some(b), Some(c), Some(d)) =>
-        a.key == b.key &&
-        a.value == b.value &&
-        c.key == d.key &&
-        c.value == d.value
-      (None, None, None, None) => true
-      _ => false
-    }
-    spot_ok = spot
-    let data_ok = verify_ok && next_ok && verify_records == src_records && spot
-    config_status = drill_config_check(dir, rst)
-    audit_status = drill_audit_check(bak, rst)
-    let (a_f, a_b) = drill_audit_stats(bak)
-    audit_files = a_f
-    audit_bytes = a_b
-    audit_chain_ok = drill_audit_chain_ok(rst)
-    batches_status = drill_batches_check(bak, rst)
-    let (s_if, s_ib) = drill_sidecar_stats(dir)
-    let (r_if, r_ib) = drill_sidecar_stats(rst)
-    src_index_files = s_if
-    src_index_bytes = s_ib
-    rst_index_files = r_if
-    rst_index_bytes = r_ib
-    index_ok = s_if == r_if && s_ib == r_ib
-    match_ok = data_ok &&
-      config_status != "mismatch" &&
-      index_ok &&
-      audit_status != "mismatch" &&
-      audit_chain_ok &&
-      batches_status != "mismatch"
-    verify_status = if data_ok { "ok" } else { "fail" }
-    close_log(src_log)
-    close_log(rst_log)
-  })
+  // 3. Verify and reconcile against the backup snapshot. Both scratch
+  // directories are drill-private, so this runs without any directory
+  // lock on the source — writes that land in the source after the backup
+  // pass (snapshot taken, producer resumes) cannot flip the result.
+  let src_log = open_log(bak)
+  src_records = src_log.count()
+  let src_next = src_log.next_offset()
+  let first_src = src_log.get((0 : UInt64))
+  let last_src = if src_next > (0 : UInt64) {
+    src_log.get(src_next - (1 : UInt64))
+  } else {
+    None
+  }
+  let rst_log = open_log(rst)
+  let report = rst_log.verify_fast()
+  verify_records = report.records
+  let verify_ok = report.first_bad_offset is None &&
+    report.first_bad_checksum is None
+  let next_ok = rst_log.next_offset() == src_next
+  let first_rst = rst_log.get((0 : UInt64))
+  let last_rst = if src_next > (0 : UInt64) {
+    rst_log.get(src_next - (1 : UInt64))
+  } else {
+    None
+  }
+  let spot = match (first_src, first_rst, last_src, last_rst) {
+    (Some(a), Some(b), Some(c), Some(d)) =>
+      a.key == b.key &&
+      a.value == b.value &&
+      c.key == d.key &&
+      c.value == d.value
+    (None, None, None, None) => true
+    _ => false
+  }
+  spot_ok = spot
+  let data_ok = verify_ok && next_ok && verify_records == src_records && spot
+  config_status = drill_config_check(bak, rst)
+  audit_status = drill_audit_check(bak, rst)
+  let (a_f, a_b) = drill_audit_stats(bak)
+  audit_files = a_f
+  audit_bytes = a_b
+  audit_chain_ok = drill_audit_chain_ok(rst)
+  batches_status = drill_batches_check(bak, rst)
+  let (s_if, s_ib) = drill_sidecar_stats(bak)
+  let (r_if, r_ib) = drill_sidecar_stats(rst)
+  src_index_files = s_if
+  src_index_bytes = s_ib
+  rst_index_files = r_if
+  rst_index_bytes = r_ib
+  index_ok = s_if == r_if && s_ib == r_ib
+  match_ok = data_ok &&
+    config_status != "mismatch" &&
+    index_ok &&
+    audit_status != "mismatch" &&
+    audit_chain_ok &&
+    batches_status != "mismatch"
+  verify_status = if data_ok { "ok" } else { "fail" }
+  close_log(src_log)
+  close_log(rst_log)
 
   let status = if match_ok { "ok" } else { "fail" }
   if json {
@@ -4362,7 +4368,7 @@ fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
       verify_status +
       "\",\"records\":" +
       verify_records.to_string() +
-      ",\"source_records\":" +
+      ",\"snapshot_records\":" +
       src_records.to_string() +
       ",\"spot_read\":" +
       (if spot_ok { "true" } else { "false" }) +
@@ -4402,7 +4408,7 @@ fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
     verify_status +
     " records=" +
     verify_records.to_string() +
-    " source_records=" +
+    " snapshot_records=" +
     src_records.to_string() +
     " spot_read=" +
     (if spot_ok { "ok" } else { "fail" }),
