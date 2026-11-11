@@ -17,14 +17,18 @@
 ///   put-batch <dir> <k> <v> ...      append several key/value records at once
 ///   delete <dir> <key>               append a tombstone for a key
 ///   get <dir> <offset>               fetch one record by offset
-///   scan <dir> [from] [to]           list records in [from, to); forced time
+///   scan <dir> [from] [to] [--timeout ms]
+///                                    list records in [from, to); forced time
 ///                                    range via --since/--until/--require-time
-///   scan-prefix <dir> <prefix>       list live keys beginning with a prefix
+///   scan-prefix <dir> <prefix> [--timeout ms]
+///                                    list live keys beginning with a prefix
 ///                                    (forced time range --since/--until)
-///   scan-range <dir> <lo> [hi]       list live keys in [lo, hi), hi optional
+///   scan-range <dir> <lo> [hi] [--timeout ms]
+///                                    list live keys in [lo, hi), hi optional
 ///                                    (forced time range --since/--until)
-///   scan-time <dir> <lo> <hi>        list records with timestamp in [lo, hi)
-///   tail <dir> <n>                   list the most recent n records
+///   scan-time <dir> <lo> <hi> [--timeout ms]
+///                                    list records with timestamp in [lo, hi)
+///   tail <dir> <n> [--timeout ms]    list the most recent n records
 ///   recover <dir>                    open + recover, then report counts
 ///   prune <dir> <keep-segments>      keep only the newest segments
 ///   prune-bytes <dir> <bytes>        drop oldest segments over a byte budget
@@ -302,7 +306,8 @@
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
 ///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
-///   export-jsonl <dir> <file> [base64]  forced time range via --from/--until
+///   export-jsonl <dir> <file> [base64] [--timeout ms]
+///                                    forced time range via --from/--until
 ///                                    and --require-time
 ///                                    write records as JSON Lines with
 ///                                    filters --prefix/--match/--from/--until
@@ -1304,9 +1309,13 @@ fn cmd_scan(
   since : String?,
   until : String?,
   require_time : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  let scope = active_scope(dir)
+  let (lo_ts, hi_ts) = scan_time_bounds("scan", since, until, require_time)
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let lo = match from {
       Some(s) => parse_offset(s)
       None => (0 : UInt64)
@@ -1315,9 +1324,6 @@ fn cmd_scan(
       Some(s) => parse_offset(s)
       None => log.next_offset()
     }
-    let (lo_ts, hi_ts) = scan_time_bounds("scan", since, until, require_time)
-    // Streamed: large ranges never materialise in memory.
-    let scope = active_scope(dir)
     let mut count = 0
     // 4.3: with time bounds over the whole offset range, walk by time so
     // segments outside the window are skipped without decoding (pushdown).
@@ -1327,6 +1333,9 @@ fn cmd_scan(
       log.for_each_time_range(lo_ts, hi_ts, rec => {
         if !scope_allows_key(scope, rec.key) {
           return true
+        }
+        if !sg.tick(rec.key.length(), rec.value.length()) {
+          return false
         }
         print_record(rec)
         count = count + 1
@@ -1340,13 +1349,16 @@ fn cmd_scan(
         if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
           return true
         }
+        if !sg.tick(rec.key.length(), rec.value.length()) {
+          return false
+        }
         print_record(rec)
         count = count + 1
         true
       })
     }
+    sg.raise_if_aborted()
     println("(" + count.to_string() + " records)")
-    close_log(log)
   })
 }
 
@@ -1361,24 +1373,32 @@ fn cmd_scan_prefix(
   since : String?,
   until : String?,
   require_time : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let (lo_ts, hi_ts) = scan_time_bounds(
-      "scan-prefix", since, until, require_time,
-    )
+  let (lo_ts, hi_ts) = scan_time_bounds(
+    "scan-prefix", since, until, require_time,
+  )
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let scope = active_scope(dir)
     let recs = log.scan_prefix(@utf8.encode(prefix))
     let mut count = 0
     for rec in recs {
-      if scope_allows_key(scope, rec.key) &&
-        scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
-        print_record(rec)
-        count = count + 1
+      if !scope_allows_key(scope, rec.key) {
+        continue
       }
+      if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
+        continue
+      }
+      if !sg.tick(rec.key.length(), rec.value.length()) {
+        break
+      }
+      print_record(rec)
+      count = count + 1
     }
+    sg.raise_if_aborted()
     println("(" + count.to_string() + " records)")
-    close_log(log)
   })
 }
 
@@ -1393,28 +1413,36 @@ fn cmd_scan_range(
   since : String?,
   until : String?,
   require_time : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   let hi_bytes = match hi {
     Some(s) => @utf8.encode(s)
     None => (b"" : Bytes)
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
-    let (lo_ts, hi_ts) = scan_time_bounds(
-      "scan-range", since, until, require_time,
-    )
+  let (lo_ts, hi_ts) = scan_time_bounds(
+    "scan-range", since, until, require_time,
+  )
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let scope = active_scope(dir)
     let recs = log.scan_key_range(@utf8.encode(lo), hi_bytes)
     let mut count = 0
     for rec in recs {
-      if scope_allows_key(scope, rec.key) &&
-        scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
-        print_record(rec)
-        count = count + 1
+      if !scope_allows_key(scope, rec.key) {
+        continue
       }
+      if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
+        continue
+      }
+      if !sg.tick(rec.key.length(), rec.value.length()) {
+        break
+      }
+      print_record(rec)
+      count = count + 1
     }
+    sg.raise_if_aborted()
     println("(" + count.to_string() + " records)")
-    close_log(log)
   })
 }
 
@@ -1424,6 +1452,7 @@ fn cmd_scan_time(
   dir : String,
   lo : String,
   hi : String,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   let lo_ts = @string.parse_int64(lo) catch {
     _ => raise @io.IoError::Invalid("invalid timestamp: " + lo)
@@ -1431,29 +1460,40 @@ fn cmd_scan_time(
   let hi_ts = @string.parse_int64(hi) catch {
     _ => raise @io.IoError::Invalid("invalid timestamp: " + hi)
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let scope = active_scope(dir)
     let mut count = 0
     log.for_each_time_range(lo_ts, hi_ts, rec => {
       if !scope_allows_key(scope, rec.key) {
         return true
       }
+      if !sg.tick(rec.key.length(), rec.value.length()) {
+        return false
+      }
       print_record(rec)
       count = count + 1
       true
     })
+    sg.raise_if_aborted()
     println("(" + count.to_string() + " records)")
-    close_log(log)
   })
 }
 
 ///|
-/// List the most recent `n` records in append order, streamed.
-fn cmd_tail(dir : String, n : String) -> Unit raise @io.IoError {
+/// List the most recent `n` records in append order, streamed. Shares the
+/// 4.6 scan protection (slot, timeout, budget, snapshot read) — a huge `n`
+/// is a full-table scan in disguise.
+fn cmd_tail(
+  dir : String,
+  n : String,
+  timeout : String?,
+) -> Unit raise @io.IoError {
   let count_req = parse_count(n)
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let total = log.next_offset()
     let un = count_req.to_uint64()
     let from = if total > un { total - un } else { (0 : UInt64) }
@@ -1463,12 +1503,15 @@ fn cmd_tail(dir : String, n : String) -> Unit raise @io.IoError {
       if !scope_allows_key(scope, rec.key) {
         return true
       }
+      if !sg.tick(rec.key.length(), rec.value.length()) {
+        return false
+      }
       print_record(rec)
       count = count + 1
       true
     })
+    sg.raise_if_aborted()
     println("(" + count.to_string() + " records)")
-    close_log(log)
   })
 }
 
@@ -3370,12 +3413,14 @@ fn cmd_archive(
 /// Export the whole directory (including tombstones) to a portable record
 /// stream file.
 fn cmd_export(dir : String, file : String) -> Unit raise @io.IoError {
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  // Backup path (6.5): a deliberate full-store copy, so the query guard's
+  // timeout and budget are intentionally not applied. The snapshot is still
+  // opened under the lock only (4.6 lock scope): the copy itself never
+  // blocks ingestion.
+  run_read_snapshot(dir, log => {
     let data = log.export_bytes()
     @backend_native.write_file(file, data)
     println("exported " + log.count().to_string() + " records")
-    close_log(log)
   })
 }
 
@@ -3513,6 +3558,7 @@ fn cmd_export_jsonl(
   service : String?,
   host : String?,
   trace : String?,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   if mode != "text" && mode != "base64" {
     raise @io.IoError::Invalid("invalid mode: " + mode + " (text|base64)")
@@ -3554,8 +3600,9 @@ fn cmd_export_jsonl(
   let (lo_ts, hi_ts) = scan_time_bounds(
     "export-jsonl", from_ts, until_ts, require_time,
   )
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  let qg = scan_query_guard(dir, timeout)
+  let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
+  run_read_snapshot(dir, log => {
     let scope = active_scope(dir)
     // An explicitly requested prefix outside the role's scope is a denial,
     // not an empty export (6.1: 越权访问被明确拒绝).
@@ -3599,6 +3646,9 @@ fn cmd_export_jsonl(
       if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
         return true
       }
+      if !sg.tick(rec.key.length(), rec.value.length()) {
+        return false
+      }
       buf.write_bytes(b"{\"offset\":")
       buf.write_bytes(@utf8.encode(rec.offset.to_string()))
       buf.write_bytes(b",\"timestamp\":")
@@ -3613,9 +3663,9 @@ fn cmd_export_jsonl(
       count = count + 1
       true
     })
+    sg.raise_if_aborted()
     @backend_native.write_file(file, buf.to_bytes())
     println("exported " + count.to_string() + " records")
-    close_log(log)
   })
 }
 
@@ -7136,6 +7186,70 @@ fn QueryGuard::check(
   seg_size : Int64,
 ) -> Unit raise @io.IoError {
   match self.check_soft(seg_size) {
+    Some(m) => raise @io.IoError::Invalid(m)
+    None => ()
+  }
+}
+
+///|
+/// Shared 4.6 entry for the streamed scan-family commands: concurrency slot,
+/// tenant quota (6.2), timeout parsing and the QueryGuard itself. Scans
+/// cannot account segments up front the way search does (the time pushdown
+/// inside `for_each_time_range` skips segments invisibly to the caller), so
+/// the budget is fed from decoded record bytes via `ScanGuard::tick`.
+fn scan_query_guard(
+  dir : String,
+  timeout : String?,
+) -> QueryGuard raise @io.IoError {
+  acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
+  let timeout_val : Int64 = match timeout {
+    Some(t) =>
+      @string.parse_int64(t) catch {
+        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
+      }
+    None => query_timeout_ms()
+  }
+  {
+    t0: now_ms(),
+    timeout: timeout_val,
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+}
+
+///|
+/// Callback guard for streamed scans (4.6): record-granularity timeout
+/// sampling plus a decoded-bytes scan budget, usable inside the non-raising
+/// `for_each_while`/`for_each_time_range` callbacks (check_soft pattern).
+/// `tick` returns false when the scan must stop; the caller raises
+/// `abort` after the loop.
+struct ScanGuard {
+  qg : QueryGuard
+  mut seen : Int32
+  mut win_bytes : Int64
+  mut abort : String?
+}
+
+///|
+fn ScanGuard::tick(self : ScanGuard, key_len : Int32, val_len : Int32) -> Bool {
+  self.seen = self.seen + 1
+  self.win_bytes = self.win_bytes + key_len.to_int64() + val_len.to_int64()
+  if self.seen % 512 == 0 {
+    match self.qg.check_soft(self.win_bytes) {
+      Some(m) => self.abort = Some(m)
+      None => ()
+    }
+    self.win_bytes = 0
+  }
+  !(self.abort is Some(_))
+}
+
+///|
+/// Raise the recorded violation of a streamed scan (after the loop).
+fn ScanGuard::raise_if_aborted(self : ScanGuard) -> Unit raise @io.IoError {
+  match self.abort {
     Some(m) => raise @io.IoError::Invalid(m)
     None => ()
   }
@@ -12801,6 +12915,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let mut since : String? = (None : String?)
     let mut until : String? = (None : String?)
     let mut require_time = false
+    let mut timeout : String? = (None : String?)
     let mut i = 3
     while i < args.length() {
       let a = args[i]
@@ -12812,6 +12927,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       } else if a == "--require-time" {
         require_time = true
+      } else if a == "--timeout" && i + 1 < args.length() {
+        timeout = Some(args[i + 1])
+        i = i + 1
       } else if a.length() > 0 && a[:1] == "-" {
         raise @io.IoError::Invalid("unknown scan option: " + a)
       } else {
@@ -12824,12 +12942,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
     let from = if pos_args.length() > 0 { Some(pos_args[0]) } else { None }
     let to = if pos_args.length() > 1 { Some(pos_args[1]) } else { None }
-    cmd_scan(args[2], from, to, since, until, require_time)
+    cmd_scan(args[2], from, to, since, until, require_time, timeout)
   } else if cmd == "scan-prefix" {
     let pos_args : Array[String] = []
     let mut since : String? = (None : String?)
     let mut until : String? = (None : String?)
     let mut require_time = false
+    let mut timeout : String? = (None : String?)
     let mut i = 3
     while i < args.length() {
       let a = args[i]
@@ -12841,6 +12960,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       } else if a == "--require-time" {
         require_time = true
+      } else if a == "--timeout" && i + 1 < args.length() {
+        timeout = Some(args[i + 1])
+        i = i + 1
       } else if a.length() > 0 && a[:1] == "-" {
         raise @io.IoError::Invalid("unknown scan-prefix option: " + a)
       } else {
@@ -12851,13 +12973,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if pos_args.length() != 1 {
       println(USAGE)
     } else {
-      cmd_scan_prefix(args[2], pos_args[0], since, until, require_time)
+      cmd_scan_prefix(args[2], pos_args[0], since, until, require_time, timeout)
     }
   } else if cmd == "scan-range" {
     let pos_args : Array[String] = []
     let mut since : String? = (None : String?)
     let mut until : String? = (None : String?)
     let mut require_time = false
+    let mut timeout : String? = (None : String?)
     let mut i = 3
     while i < args.length() {
       let a = args[i]
@@ -12869,6 +12992,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       } else if a == "--require-time" {
         require_time = true
+      } else if a == "--timeout" && i + 1 < args.length() {
+        timeout = Some(args[i + 1])
+        i = i + 1
       } else if a.length() > 0 && a[:1] == "-" {
         raise @io.IoError::Invalid("unknown scan-range option: " + a)
       } else {
@@ -12880,19 +13006,51 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let hi = if pos_args.length() > 1 { Some(pos_args[1]) } else { None }
-      cmd_scan_range(args[2], pos_args[0], hi, since, until, require_time)
+      cmd_scan_range(
+        args[2],
+        pos_args[0],
+        hi,
+        since,
+        until,
+        require_time,
+        timeout,
+      )
     }
   } else if cmd == "scan-time" {
     if args.length() < 5 {
       println(USAGE)
     } else {
-      cmd_scan_time(args[2], args[3], args[4])
+      let mut timeout : String? = (None : String?)
+      let mut i = 5
+      while i < args.length() {
+        let a = args[i]
+        if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown scan-time option: " + a)
+        }
+        i = i + 1
+      }
+      cmd_scan_time(args[2], args[3], args[4], timeout)
     }
   } else if cmd == "tail" {
     if args.length() < 4 {
       println(USAGE)
     } else {
-      cmd_tail(args[2], args[3])
+      let mut timeout : String? = (None : String?)
+      let mut i = 4
+      while i < args.length() {
+        let a = args[i]
+        if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown tail option: " + a)
+        }
+        i = i + 1
+      }
+      cmd_tail(args[2], args[3], timeout)
     }
   } else if cmd == "recover" {
     cmd_recover(args[2])
@@ -14657,6 +14815,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut service : String? = (None : String?)
       let mut host : String? = (None : String?)
       let mut trace : String? = (None : String?)
+      let mut timeout : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -14686,6 +14845,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--require-time" {
           require_time = true
+        } else if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
         } else if a == "text" || a == "base64" {
           mode = a
         } else {
@@ -14706,6 +14868,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         service,
         host,
         trace,
+        timeout,
       )
     }
   } else if cmd == "purge" {
