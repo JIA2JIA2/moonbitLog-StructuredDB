@@ -12247,6 +12247,16 @@ fn global_only_cmd(cmd : String) -> Bool {
     "prune-bytes", "prune-before", "prune-expired", "prune-superseded", "compress",
     "tier", "import", "maintain", "ttl-expire", "fsck", "selfmon", "serve", "rbac",
     "quota",
+    // Directory-level configuration commands (6.1 third pass): they rewrite
+    // PARTITION/SCHEMA/TIER, which governs every tenant's write path — a
+    // scoped role must not reconfigure the whole directory.
+     "partition-policy", "schema-policy", "tier-policy",
+    // Whole-store audit trail queries: the JSONL files mix every role's
+    // events, so a scoped role would read cross-tenant operation history.
+     "audit", "ttl-audit",
+    // Bulk benchmark writes land under the bench: prefix, outside any role
+    // scope, and its verify expects exactly `count` records in the directory.
+     "bench-write",
   ]
   for c in list {
     if c == cmd {
@@ -12310,8 +12320,10 @@ let audit_cmds : Array[String] = [
   "drill", "purge", "delete", "prune", "prune-bytes", "prune-before", "prune-expired",
   "prune-superseded", "merge", "compact", "compact-expired", "compress", "tier",
   "ttl-expire", "restore", "recover", "maintain", "rbac", "partition-policy", "schema-policy",
-  "ha-failover", "ha-rebalance", "ha-status", "quota", "audit", "ttl-expire", "restore",
-  "recover", "maintain", "rbac",
+  "ha-failover", "ha-rebalance", "ha-status", "quota", "audit",
+  // 6.1/6.3 third pass: configuration commands and HA state changes added
+  // after M172 were leaving no trail.
+   "tier-policy", "ttl-audit", "ha-watch",
 ]
 
 ///|
@@ -13654,22 +13666,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   let request_authed_gateway = cmd == "http"
   if !bootstrapping && !request_authed_gateway && !rbac_check(args[2], cmd) {
     record_denied(args[2], cmd, args)
-    println(
+    eprintln(
       "permission denied: '" +
       cmd +
       "' requires MOONLOG_TOKEN with a permitted role",
     )
-    return
+    // 4.3 error channel: denials must be observable to shell pipelines
+    // (M197 left these two RBAC exits at stdout/exit 0; 6.1 third pass).
+    @backend_native.exit_process(1)
   }
   // 6.1 index isolation: whole-index operations require an unscoped role.
   if !bootstrapping && global_only_cmd(cmd) && active_scope(args[2]) is Some(_) {
     record_scope_denied(args[2], cmd, b"<whole-index>")
-    println(
+    eprintln(
       "permission denied: '" +
       cmd +
       "' is a whole-index operation and requires an unscoped role",
     )
-    return
+    @backend_native.exit_process(1)
   }
   // 6.3 operation audit: queries, exports, destructive maintenance and
   // configuration changes leave an attributable allow event (actor + ts +
