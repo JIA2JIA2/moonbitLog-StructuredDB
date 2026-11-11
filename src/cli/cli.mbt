@@ -94,7 +94,9 @@
 ///                                    end-to-end latency is bounded by the
 ///                                    poll interval (default 200ms), and the
 ///                                    closing summary reports filtered count
-///                                    and max live lag
+///                                    and max live lag (with --json the
+///                                    summary goes to stderr, keeping stdout
+///                                    a clean JSONL stream)
 ///   ingest <dir> <file> [--follow] [--once] [--fifo] [--format lines|kv]
 ///                     [--key <name>] [--key-field <name>] [--ts-field <name>]
 ///                     [--cursor-name <name>]
@@ -4656,6 +4658,9 @@ fn cmd_follow(
   let mut max_lag : Int64 = -1
   let mut go = true
   while go && !@backend_native.shutdown_requested() {
+    // Snapshot round (4.6): hold the directory lock only while the segment
+    // snapshot is opened — decoding, filtering and printing run lock-free, so
+    // a burst of new records cannot stall ingestion while it is being tailed.
     let lock = @backend_native.DirLock::acquire_timeout(
       dir,
       false,
@@ -4663,6 +4668,7 @@ fn cmd_follow(
     )
     let log = open_log(dir)
     let next = log.next_offset()
+    lock.release()
     let had_new = next > from
     if had_new {
       let recs = log.scan_range(from, next)
@@ -4760,7 +4766,6 @@ fn cmd_follow(
       }
     }
     close_log(log)
-    lock.release()
     if once {
       go = false
     } else if had_new {
@@ -4773,8 +4778,7 @@ fn cmd_follow(
     }
   }
   let lag_text = if max_lag >= 0 { max_lag.to_string() + "ms" } else { "n/a" }
-  println(
-    "(" +
+  let summary = "(" +
     fetched.to_string() +
     " records, cursor " +
     from.to_string() +
@@ -4782,8 +4786,14 @@ fn cmd_follow(
     filtered.to_string() +
     " filtered, max lag " +
     lag_text +
-    ")",
-  )
+    ")"
+  if json {
+    // 4.3 output purity: the closing summary is a status line, not a record —
+    // in --json mode it must not corrupt the JSONL stream on stdout.
+    eprintln(summary)
+  } else {
+    println(summary)
+  }
   if flush {
     @backend_native.flush_stdout()
   }
@@ -13037,6 +13047,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         i = i + 1
       } else if a == "--flush" {
         flush = true
+      } else if a.length() >= 2 && a[0].to_int() == 45 && a[1].to_int() == 45 {
+        raise @io.IoError::Invalid("unknown follow option: " + a)
       } else {
         start = a
       }
