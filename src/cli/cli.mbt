@@ -6710,7 +6710,11 @@ fn cmd_search(
         }
         let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
         for tok in toks {
-          for idx in seg.inv_term_postings(tok) {
+          // Prefix postings: the exact-token posting misses records holding
+          // the query only as a prefix of a longer token (`payment` vs
+          // `payments`), which made `--inverted` disagree with the linear
+          // substring search (4.1 third round).
+          for idx in seg.inv_term_prefix_postings(tok) {
             let off = seg.base_offset + idx.to_uint64()
             if off >= lo && off < hi {
               seen.set(off, true)
@@ -6731,41 +6735,90 @@ fn cmd_search(
             0
           }
         })
-        let mut seen_cands = 0
-        for off in cands {
-          seen_cands = seen_cands + 1
-          if seen_cands % 512 == 0 {
-            match qg.check_soft(0) {
-              Some(m) => abort_msg = Some(m)
+        // Substring refinement over the candidates (same semantics as the
+        // linear path): prefix postings can over-select, so every record is
+        // confirmed against the original needle. With zero candidates the
+        // index has nothing to offer (no such token at all) — fall back to a
+        // linear scan, because the substring may still exist.
+        if cands.length() == 0 {
+          log.for_each_while(lo, hi, rec => {
+            if !scope_allows_key(scope, rec.key) {
+              return true
+            }
+            let hit = if field == "key" {
+              match_needle(rec.key, needle, ignore_case)
+            } else if field == "value" {
+              match_needle(rec.value, needle, ignore_case)
+            } else {
+              match_needle(rec.key, needle, ignore_case) ||
+              match_needle(rec.value, needle, ignore_case)
+            }
+            let mut in_time = true
+            match since_ts {
+              Some(t) => if rec.timestamp < t { in_time = false }
               None => ()
             }
-          }
-          if abort_msg is Some(_) {
-            break
-          }
-          if max_hits >= 0 && hits >= max_hits {
-            truncated = true
-            stop = true
-            break
-          }
-          let rec = log.get(off) catch { _ => None }
-          match rec {
-            Some(r) => {
-              let mut in_time = true
-              match since_ts {
-                Some(t) => if r.timestamp < t { in_time = false }
-                None => ()
+            match until_ts {
+              Some(t) => if rec.timestamp > t { in_time = false }
+              None => ()
+            }
+            if hit && in_time {
+              if max_hits >= 0 && hits >= max_hits {
+                truncated = true
+                stop = true
+                return false
               }
-              match until_ts {
-                Some(t) => if r.timestamp > t { in_time = false }
+              print_record(rec)
+              hits = hits + 1
+            }
+            true
+          })
+          println(matches_summary(hits, truncated, max_hits) + " (inverted)")
+        } else {
+          let mut seen_cands = 0
+          for off in cands {
+            seen_cands = seen_cands + 1
+            if seen_cands % 512 == 0 {
+              match qg.check_soft(0) {
+                Some(m) => abort_msg = Some(m)
                 None => ()
-              }
-              if in_time && scope_allows_key(scope, r.key) {
-                print_record(r)
-                hits = hits + 1
               }
             }
-            None => ()
+            if abort_msg is Some(_) {
+              break
+            }
+            if max_hits >= 0 && hits >= max_hits {
+              truncated = true
+              stop = true
+              break
+            }
+            let rec = log.get(off) catch { _ => None }
+            match rec {
+              Some(r) => {
+                let mut in_time = true
+                match since_ts {
+                  Some(t) => if r.timestamp < t { in_time = false }
+                  None => ()
+                }
+                match until_ts {
+                  Some(t) => if r.timestamp > t { in_time = false }
+                  None => ()
+                }
+                let hit = if field == "key" {
+                  match_needle(r.key, needle, ignore_case)
+                } else if field == "value" {
+                  match_needle(r.value, needle, ignore_case)
+                } else {
+                  match_needle(r.key, needle, ignore_case) ||
+                  match_needle(r.value, needle, ignore_case)
+                }
+                if hit && in_time && scope_allows_key(scope, r.key) {
+                  print_record(r)
+                  hits = hits + 1
+                }
+              }
+              None => ()
+            }
           }
         }
       }

@@ -67,6 +67,46 @@ test "build and lookups match record content" {
 }
 
 ///|
+test "prefix postings cover token variants (4.1 third round)" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  // Record 0 holds `payment` inside a longer token (`payment-declined`
+  // splits into payment/declined); record 1 holds the plural form
+  // (`payments`); record 2 has neither.
+  ignore(
+    seg.append(b"log", b"msg=payment-declined now", (1 : Int64)) catch {
+      _ => panic()
+    },
+  )
+  ignore(
+    seg.append(b"log", b"msg=payments queue", (2 : Int64)) catch {
+      _ => panic()
+    },
+  )
+  ignore(
+    seg.append(b"log", b"msg=unrelated words", (3 : Int64)) catch {
+      _ => panic()
+    },
+  )
+  seg.build_inv_index()
+  // Exact postings only see record 0 (`payment` as a full token); the
+  // plural form lives in a different token.
+  assert_eq(seg.inv_term_postings(b"payment"), [0])
+  // Prefix postings union every token that extends the query — the
+  // inverted path now agrees with the linear substring search.
+  assert_eq(seg.inv_term_prefix_postings(b"payment"), [0, 1])
+  assert_eq(seg.inv_term_prefix_postings(b"pay"), [0, 1])
+  // Exact equality is included (the query token itself matches).
+  assert_eq(seg.inv_term_prefix_postings(b"payments"), [1])
+  // No token extends `declineds` — empty result.
+  assert_eq(seg.inv_term_prefix_postings(b"declineds").length(), 0)
+}
+
+///|
 test "inv sidecar roundtrip preserves both tables" {
   let store = @backend_mem.MemLog::new()
   let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(

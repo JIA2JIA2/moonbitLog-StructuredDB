@@ -8,6 +8,9 @@
 pub(all) struct InvIndex {
   terms : @hashmap.HashMap[Bytes, Array[Int32]]
   fields : @hashmap.HashMap[Bytes, Array[Int32]]
+  // Lazily sorted term keys for prefix lookups (3.6→4.1 third round): built
+  // on first use, not persisted — the sidecar layout is unchanged.
+  mut sorted_terms : Array[Bytes]
 }
 
 ///|
@@ -205,7 +208,7 @@ pub fn[W, R : @io.LogReader] Segment::build_inv_index(
     kb.write_bytes(rec.key)
     inv_add(fields, kb.to_bytes(), idx)
   })
-  self.inv_index = Some({ terms, fields, })
+  self.inv_index = Some({ terms, fields, sorted_terms: [], })
 }
 
 ///|
@@ -254,6 +257,91 @@ pub fn[W, R] Segment::inv_field_postings(
         Some(arr) => arr
         None => []
       }
+    }
+    None => []
+  }
+}
+
+///|
+/// Union of the posting lists of every token that starts with `term`
+/// (ascending, deduplicated). Powers `--inverted` substring semantics: the
+/// exact-token posting alone misses records whose value contains the query
+/// only as a prefix of a longer token (`payment` vs `payments`), which made
+/// the inverted path disagree with the linear substring search. The sorted
+/// key cache is built once per index instance.
+pub fn[W, R] Segment::inv_term_prefix_postings(
+  self : Segment[W, R],
+  term : Bytes,
+) -> Array[Int32] {
+  match self.inv_index {
+    Some(ix) => {
+      if ix.sorted_terms.length() == 0 && ix.terms.length() > 0 {
+        let keys : Array[Bytes] = []
+        ix.terms.each(fn(k, _) { keys.push(k) })
+        keys
+        .mut_view()
+        .sort_by(fn(a, b) {
+          let d = a.lexical_compare(b)
+          if d < 0 {
+            -1
+          } else if d > 0 {
+            1
+          } else {
+            0
+          }
+        })
+        ix.sorted_terms = keys
+      }
+      // Binary search the first key >= term, then collect keys while they
+      // extend `term`.
+      let mut lo = 0
+      let mut hi = ix.sorted_terms.length()
+      while lo < hi {
+        let mid = (lo + hi) / 2
+        let d = ix.sorted_terms[mid].lexical_compare(term)
+        if d < 0 {
+          lo = mid + 1
+        } else {
+          hi = mid
+        }
+      }
+      let seen : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
+      let out : Array[Int32] = []
+      let mut i = lo
+      while i < ix.sorted_terms.length() {
+        let k = ix.sorted_terms[i]
+        if k.length() < term.length() {
+          break
+        }
+        let mut is_prefix = true
+        let mut j = 0
+        while j < term.length() {
+          if k.at(j) != term.at(j) {
+            is_prefix = false
+            j = term.length()
+          }
+          j = j + 1
+        }
+        if !is_prefix {
+          break
+        }
+        match ix.terms.get(k) {
+          Some(arr) =>
+            for idx in arr {
+              let u = idx.to_uint64()
+              if seen.get(u) is None {
+                seen.set(u, true)
+                out.push(idx)
+              }
+            }
+          None => ()
+        }
+        i = i + 1
+      }
+      out
+      .mut_view()
+      .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+      out
     }
     None => []
   }
@@ -474,5 +562,5 @@ pub fn decode_inv_index(data : Bytes) -> InvIndex raise @core.MetaError {
   if p2 != body_end {
     raise @core.MetaError::Truncated(p2)
   }
-  { terms, fields, }
+  { terms, fields, sorted_terms: [], }
 }

@@ -40,6 +40,7 @@ pub(all) struct IndexEntry {
 pub(all) struct InvIndex {
   terms : @hashmap.HashMap[Bytes, Array[Int32]]
   fields : @hashmap.HashMap[Bytes, Array[Int32]]
+  mut sorted_terms : Array[Bytes]
 }
 pub fn InvIndex::encode(Self) -> Bytes
 
@@ -86,6 +87,7 @@ pub fn[W, R] Segment::has_time_range(Self[W, R]) -> Bool
 pub fn[W, R] Segment::index_interval(Self[W, R]) -> Int32
 pub fn[W, R] Segment::inv_field_postings(Self[W, R], Bytes, Bytes) -> Array[Int32]
 pub fn[W, R] Segment::inv_term_postings(Self[W, R], Bytes) -> Array[Int32]
+pub fn[W, R] Segment::inv_term_prefix_postings(Self[W, R], Bytes) -> Array[Int32]
 pub fn[W, R] Segment::is_compressed(Self[W, R]) -> Bool
 pub fn[W, R] Segment::is_ts_sorted(Self[W, R]) -> Bool
 pub fn[W, R] Segment::key_count(Self[W, R]) -> Int32
