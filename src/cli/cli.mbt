@@ -44,11 +44,18 @@
 ///                                    replica rejects forward sync so outage
 ///                                    writes are never trimmed
 ///   ha-failover <primary> <replica> [--active <link>] [--json]
+///              [--force] [--other-replicas <csv>]
 ///                                    promote the replica (role=primary),
 ///                                    mark a reachable old primary standby and
-///                                    atomically repoint the stable link
-///   ha-status <primary> <replica> [--json]
-///                                    show roles, reachability and switch time
+///                                    atomically repoint the stable link;
+///                                    refused while the primary is reachable or
+///                                    the replica is already primary (--force
+///                                    overrides); --other-replicas marks the
+///                                    remaining replicas standby and reports
+///                                    their lag
+///   ha-status <primary> [replica] [--json]
+///                                    show roles, reachability, switch time —
+///                                    and, with a replica, the lag in offsets
 ///   ha-rebalance <old-primary> <new-primary> [--json]
 ///                                    mirror the promoted primary back onto the
 ///                                    old directory and mark it standby
@@ -3911,18 +3918,52 @@ fn cmd_ha_failover(
   primary : String,
   replica : String,
   active : String?,
+  other_replicas : Array[String],
   json : Bool,
+  force : Bool,
 ) -> Unit raise @io.IoError {
   if !@backend_native.file_exists(replica) {
     raise @io.IoError::Invalid("replica not found: " + replica)
   }
+  let (r_role, _, _) = load_ha_state(replica)
+  if !force && r_role is Some(r) && r == "primary" {
+    raise @io.IoError::Invalid(
+      "refusing to fail over: " + replica + " is already primary",
+    )
+  }
+  if !force && @backend_native.file_exists(primary) {
+    raise @io.IoError::Invalid(
+      "refusing to fail over: primary still reachable (" +
+      primary +
+      "); failover is for node-down scenarios (--force overrides)",
+    )
+  }
   save_ha_state(replica, "primary", primary)
-  if @backend_native.file_exists(primary) {
+  let primary_reachable = @backend_native.file_exists(primary)
+  if primary_reachable {
     save_ha_state(primary, "standby", replica)
   }
   match active {
     Some(link) => @backend_native.replace_symlink(replica, link)
     None => ()
+  }
+  // Multi-replica topology (3.5 third round): mark the remaining replicas
+  // standby and report how far each trails the new primary, so none is left
+  // an orphan with an unknown role after the switch.
+  let others : Array[String] = []
+  for other in other_replicas {
+    if other == replica {
+      continue
+    }
+    if !@backend_native.file_exists(other) {
+      others.push("\"" + json_escape_str(other) + "\":\"unreachable\"")
+      continue
+    }
+    save_ha_state(other, "standby", replica)
+    let lag = ha_lag(replica, other)
+    others.push(
+      "\"" + json_escape_str(other) + "\":{\"lag\":" + lag.to_string() + "}",
+    )
   }
   if json {
     println(
@@ -3930,10 +3971,27 @@ fn cmd_ha_failover(
       json_escape_str(replica) +
       "\",\"from\":\"" +
       json_escape_str(primary) +
-      "\",\"active\":" +
+      "\",\"primary_reachable\":" +
+      (if primary_reachable { "true" } else { "false" }) +
+      ",\"forced\":" +
+      (if force { "true" } else { "false" }) +
+      ",\"active\":" +
       (match active {
         Some(l) => "\"" + json_escape_str(l) + "\""
         None => "null"
+      }) +
+      (if others.length() > 0 {
+        let joined = StringBuilder()
+        for o in others {
+          joined.write_string(o)
+          joined.write_string(",")
+        }
+        let body = joined.to_string()
+        ",\"other_replicas\":{" +
+        body.substring(start=0, end=body.length() - 1) +
+        "}"
+      } else {
+        ""
       }) +
       "}",
     )
@@ -3943,23 +4001,81 @@ fn cmd_ha_failover(
       Some(l) => println("active path now points at " + replica + " via " + l)
       None => ()
     }
+    if !primary_reachable {
+      println("old primary unreachable — not marked standby")
+    }
+    for o in others {
+      println("other-replica " + o)
+    }
   }
 }
 
 ///|
-fn cmd_ha_status(primary : String, replica : String, json : Bool) -> Unit {
+/// Offsets the second directory trails (+) the first by; -1 when either side
+/// cannot be opened (unreachable). Read under a shared lock so the
+/// comparison is not torn by a concurrent writer. Powers the lag report on
+/// `ha-failover --other-replicas` and `ha-status`.
+fn ha_lag(ahead : String, behind : String) -> Int64 {
+  let pa = run_locked_snapshot_offset(ahead)
+  let pb = run_locked_snapshot_offset(behind)
+  if pa < 0 || pb < 0 {
+    return (-1 : Int64)
+  }
+  pa - pb
+}
+
+///|
+/// Next offset of a directory under a shared lock; -1 when it does not exist
+/// or cannot be opened (never creates the directory).
+fn run_locked_snapshot_offset(dir : String) -> Int64 {
+  if !@backend_native.file_exists(dir) {
+    return (-1 : Int64)
+  }
+  run_locked(dir, false, () => {
+    let log = open_log_sync(dir, (0 : Int64), @log.SyncPolicy::Never)
+    let n = log.next_offset().reinterpret_as_int64()
+    close_log(log)
+    n
+  }) catch {
+    _ => (-1 : Int64)
+  }
+}
+
+///|
+/// Node status (3.5 third round): `replica` is optional — probing a single
+/// directory (or a crashed node by path) no longer needs a made-up second
+/// argument — and when both sides are reachable the report includes
+/// `lag`: how many offsets the replica trails the primary, the number a
+/// failover is allowed to lose (the async replication window).
+fn cmd_ha_status(primary : String, replica : String?, json : Bool) -> Unit {
   let p_exists = @backend_native.file_exists(primary)
-  let r_exists = @backend_native.file_exists(replica)
   let (p_role, p_at, p_from) = load_ha_state(primary)
-  let (r_role, r_at, r_from) = load_ha_state(replica)
   let pname = match p_role {
     Some(r) => r
     None => if p_exists { "primary" } else { "down" }
+  }
+  let r_exists = match replica {
+    Some(r) => @backend_native.file_exists(r)
+    None => false
+  }
+  let (r_role, r_at, r_from) = match replica {
+    Some(r) => load_ha_state(r)
+    None => (None, (0 : Int64), None)
   }
   let rname = match r_role {
     Some(r) => r
     None => if r_exists { "replica" } else { "down" }
   }
+  let lag = match replica {
+    Some(r) =>
+      if p_exists && r_exists {
+        ha_lag(primary, r)
+      } else {
+        (-1 : Int64)
+      }
+    None => (-1 : Int64)
+  }
+  let lag_json = if lag >= 0 { lag.to_string() } else { "null" }
   if json {
     println(
       "{\"primary\":{\"path\":\"" +
@@ -3975,20 +4091,28 @@ fn cmd_ha_status(primary : String, replica : String, json : Bool) -> Unit {
         Some(f) => "\"" + json_escape_str(f) + "\""
         None => "null"
       }) +
-      "},\"replica\":{\"path\":\"" +
-      json_escape_str(replica) +
-      "\",\"exists\":" +
-      (if r_exists { "true" } else { "false" }) +
-      ",\"role\":\"" +
-      json_escape_str(rname) +
-      "\",\"switched_at\":" +
-      r_at.to_string() +
-      ",\"switched_from\":" +
-      (match r_from {
-        Some(f) => "\"" + json_escape_str(f) + "\""
-        None => "null"
+      "}" +
+      (match replica {
+        Some(r) =>
+          ",\"replica\":{\"path\":\"" +
+          json_escape_str(r) +
+          "\",\"exists\":" +
+          (if r_exists { "true" } else { "false" }) +
+          ",\"role\":\"" +
+          json_escape_str(rname) +
+          "\",\"switched_at\":" +
+          r_at.to_string() +
+          ",\"switched_from\":" +
+          (match r_from {
+            Some(f) => "\"" + json_escape_str(f) + "\""
+            None => "null"
+          }) +
+          ",\"lag\":" +
+          lag_json +
+          "}"
+        None => ""
       }) +
-      "}}",
+      "}",
     )
   } else {
     println(
@@ -3999,14 +4123,24 @@ fn cmd_ha_status(primary : String, replica : String, json : Bool) -> Unit {
       " exists=" +
       (if p_exists { "yes" } else { "no" }),
     )
-    println(
-      "replica " +
-      replica +
-      " role=" +
-      rname +
-      " exists=" +
-      (if r_exists { "yes" } else { "no" }),
-    )
+    match replica {
+      Some(r) => {
+        println(
+          "replica " +
+          r +
+          " role=" +
+          rname +
+          " exists=" +
+          (if r_exists { "yes" } else { "no" }),
+        )
+        if lag >= 0 {
+          println("lag " + lag.to_string() + " record(s) behind the primary")
+        } else {
+          println("lag unknown (both sides must exist)")
+        }
+      }
+      None => ()
+    }
   }
 }
 
@@ -4072,7 +4206,10 @@ fn cmd_ha_watch(
       fails = fails + 1
     }
     if fails >= fail_threshold {
-      cmd_ha_failover(primary, replica, Some(active), json)
+      // The failover raises when the guardrails reject it (primary came
+      // back mid-watch, or another watcher already promoted the replica) —
+      // surfacing the refusal beats lying about a completed switch.
+      cmd_ha_failover(primary, replica, Some(active), [], json, false)
       println("ha-watch: primary unreachable, failover complete")
       return
     }
@@ -13563,24 +13700,54 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut active : String? = (None : String?)
+      let other_replicas : Array[String] = []
       let mut json = false
+      let mut force = false
       let mut i = 4
       while i < args.length() {
-        if args[i] == "--active" && i + 1 < args.length() {
+        let a = args[i]
+        if a == "--active" && i + 1 < args.length() {
           active = Some(args[i + 1])
           i = i + 1
-        } else if args[i] == "--json" {
+        } else if a == "--other-replicas" && i + 1 < args.length() {
+          for part in csv_to_bytes_list(args[i + 1]) {
+            other_replicas.push(@utf8.decode_lossy(part))
+          }
+          i = i + 1
+        } else if a == "--force" {
+          force = true
+        } else if a == "--json" {
           json = true
+        } else {
+          raise @io.IoError::Invalid("unknown ha-failover argument: " + a)
         }
         i = i + 1
       }
-      cmd_ha_failover(args[2], args[3], active, json)
+      cmd_ha_failover(args[2], args[3], active, other_replicas, json, force)
     }
   } else if cmd == "ha-status" {
-    if args.length() < 4 {
+    if args.length() < 3 {
       println(USAGE)
     } else {
-      cmd_ha_status(args[2], args[3], args.length() > 4 && args[4] == "--json")
+      // `replica` is optional: `ha-status <dir>` probes one node's role,
+      // `ha-status <primary> <replica>` additionally reports the lag.
+      let mut replica : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a.has_prefix("-") {
+          raise @io.IoError::Invalid("unknown ha-status argument: " + a)
+        } else if replica is None {
+          replica = Some(a)
+        } else {
+          raise @io.IoError::Invalid("unexpected extra argument: " + a)
+        }
+        i = i + 1
+      }
+      cmd_ha_status(args[2], replica, json)
     }
   } else if cmd == "ha-rebalance" {
     if args.length() < 4 {
