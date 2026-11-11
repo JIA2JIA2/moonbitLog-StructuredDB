@@ -89,8 +89,24 @@ fn normalize_template_token(t : Bytes, out : @buffer.Buffer) -> Unit {
         i = i + 1
       }
     } else {
-      out.write_bytes(slice(t, i, i + 1))
-      i = i + 1
+      // Batch-copy the plain-byte run up to the next variable start — one
+      // byte at a time dominated cluster/anomaly scans on large inputs.
+      let start = i
+      while i < n {
+        let c = t.at(i).to_int()
+        if c >= 48 && c <= 57 {
+          break
+        }
+        if c == 48 &&
+          i + 1 < n &&
+          (t.at(i + 1).to_int() == 120 || t.at(i + 1).to_int() == 88) &&
+          i + 2 < n &&
+          is_hex_digit(t.at(i + 2).to_int()) {
+          break
+        }
+        i = i + 1
+      }
+      out.write_bytes(slice(t, start, i))
     }
   }
 }

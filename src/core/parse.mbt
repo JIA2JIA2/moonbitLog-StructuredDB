@@ -234,7 +234,10 @@ pub fn level_rank(level : Bytes) -> Int32 {
 }
 
 ///|
-/// Named-level rank used by `level_rank` for non-numeric values.
+/// Named-level rank used by `level_rank` for non-numeric values. Covers the
+/// common syslog severity words: `crit`/`critical`/`alert`/`emerg`/`panic`
+/// rank as fatal (4) — they used to return -1 and be treated as unknown by
+/// every `--level-min`/error-detection consumer.
 fn level_rank_name(level : Bytes) -> Int32 {
   if level == b"debug" {
     0
@@ -244,7 +247,12 @@ fn level_rank_name(level : Bytes) -> Int32 {
     2
   } else if level == b"error" || level == b"err" {
     3
-  } else if level == b"fatal" {
+  } else if level == b"fatal" ||
+    level == b"critical" ||
+    level == b"crit" ||
+    level == b"alert" ||
+    level == b"emerg" ||
+    level == b"panic" {
     4
   } else {
     -1

@@ -9932,7 +9932,10 @@ fn cmd_anomalies(
 /// templates, so variable content collapses into message shapes — the same
 /// shape with different hosts/ids/values merges into one cluster. `--match`
 /// (default "error") selects lines (ASCII case-insensitive, key or value; an
-/// empty string matches everything). `--top N` prints the N most frequent
+/// empty string matches everything); JSON records whose level field ranks
+/// error-or-higher (`err`/`error`/`fatal`/`critical`/...) always match, so
+/// level words that do not contain the needle substring are not missed.
+/// `--top N` prints the N most frequent
 /// templates (default 20); `--min-count N` hides one-off long-tail clusters.
 /// With `--stacks`, stack-frame lines are merged into the nearest preceding
 /// non-frame line **regardless of `--match`** (frames rarely contain the
@@ -9966,15 +9969,19 @@ fn blank_line(v : Bytes) -> Bool {
 }
 
 ///|
-/// Cluster a JSON record: extract its `stack`/`stacktrace`/`exception` field
-/// and message in one pass. With a stack, the record clusters by its
+/// Cluster a JSON record: extract its `stack`/`stacktrace`/`exception` field,
+/// message and level in one pass. With a stack, the record clusters by its
 /// normalized stack (same stack + different messages/ids collapses) and
 /// counts its frame lines. Without a stack, the record clusters by its
 /// normalized message — the whole JSON used to normalize to the opaque
 /// `{<str>:<str>,...}` template, merging every record into one cluster.
-/// Returns `(cluster key, frame count, sample)`; `None` when the record is
-/// not JSON or carries neither stack nor message.
-fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes)? {
+/// Returns `(cluster key, frame count, sample, level rank)` — the rank
+/// (-1 when absent/unknown) lets the caller treat error-severity records as
+/// matches even when their message lacks the needle substring (`FATAL`
+/// /`critical`/`err` levels used to be missed by the default `--match
+/// "error"`); `None` when the record is not JSON or carries neither stack
+/// nor message.
+fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes, Int32)? {
   if value.length() == 0 || value.at(0).to_int() != 123 {
     return None
   }
@@ -9985,9 +9992,13 @@ fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes)? {
   ]
   let mut msg : Bytes? = None
   let mut stack : Bytes? = None
+  let mut lvl : Int32 = -1
   for pair in fields {
     if msg is None && @core.canonical_field(pair.0) == 5 {
       msg = Some(pair.1)
+    }
+    if lvl < 0 && @core.canonical_field(pair.0) == 1 {
+      lvl = @core.level_rank(follow_lower_ascii(pair.1))
     }
     if stack is None {
       for name in stack_names {
@@ -10005,7 +10016,7 @@ fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes)? {
     Some(s) => {
       if s.length() == 0 {
         return match msg {
-          Some(m) => Some((@core.normalize_log_template(m), 0, m))
+          Some(m) => Some((@core.normalize_log_template(m), 0, m, lvl))
           None => None
         }
       }
@@ -10022,13 +10033,13 @@ fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes)? {
         }
         i = i + 1
       }
-      Some((@core.normalize_log_template(s), frames, sample))
+      Some((@core.normalize_log_template(s), frames, sample, lvl))
     }
     None =>
       match msg {
         Some(m) =>
           if m.length() > 0 {
-            Some((@core.normalize_log_template(m), 0, m))
+            Some((@core.normalize_log_template(m), 0, m, lvl))
           } else {
             None
           }
@@ -10163,15 +10174,24 @@ fn cmd_cluster(
         if !in_time {
           return
         }
-        let pass = match_needle(rec.key, needle, true) ||
-          match_needle(rec.value, needle, true)
         let jrec = cluster_json_record(rec.value)
+        // Needle substring still matches (key/value, case-insensitive); JSON
+        // records with an error-or-higher level field count as errors even
+        // when the message lacks the needle (`FATAL`/`critical`/`err` used
+        // to be missed by the default `--match "error"`).
+        let lvl = match jrec {
+          Some((_, _, _, r)) => r
+          None => -1
+        }
+        let pass = match_needle(rec.key, needle, true) ||
+          match_needle(rec.value, needle, true) ||
+          lvl >= 3
         if stacks {
           // JSON records carry their stack inline: cluster by the normalized
           // stack (same stack + different messages/ids collapses) and count
           // the frame lines inside that record.
           match jrec {
-            Some((tpl, fr, sample)) =>
+            Some((tpl, fr, sample, _)) =>
               if pass {
                 bump_bytes(counts, tpl)
                 let prev = match frames.get(tpl) {
@@ -10231,7 +10251,7 @@ fn cmd_cluster(
           }
         } else if pass {
           match jrec {
-            Some((tpl, _, _)) => bump_bytes(counts, tpl)
+            Some((tpl, _, _, _)) => bump_bytes(counts, tpl)
             None => bump_bytes(counts, @core.normalize_log_template(rec.value))
           }
         }

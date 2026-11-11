@@ -72,6 +72,21 @@ test "level_rank maps numeric OTel severity bands" {
 }
 
 ///|
+test "level_rank maps syslog severity words to fatal" {
+  // crit/critical/alert/emerg/panic used to return -1 (unknown) and be
+  // dropped by every level-aware consumer; they rank as fatal (4).
+  assert_eq(@core.level_rank(b"critical"), 4)
+  assert_eq(@core.level_rank(b"crit"), 4)
+  assert_eq(@core.level_rank(b"alert"), 4)
+  assert_eq(@core.level_rank(b"emerg"), 4)
+  assert_eq(@core.level_rank(b"panic"), 4)
+  // err keeps its error rank; unknown words stay unknown.
+  assert_eq(@core.level_rank(b"err"), 3)
+  assert_eq(@core.level_rank(b"emerge"), -1)
+  assert_eq(@core.level_rank(b"criticality"), -1)
+}
+
+///|
 test "bytes_contains finds substrings" {
   assert_true(@core.bytes_contains(b"hello world", b"world"))
   assert_true(@core.bytes_contains(b"hello world", b"lo wo"))
