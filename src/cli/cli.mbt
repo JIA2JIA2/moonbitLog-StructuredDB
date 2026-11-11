@@ -10926,6 +10926,8 @@ fn cmd_watch(
   window_sec : String,
   metric : String?,
   metric_threshold : String?,
+  metric_stat_s : String?,
+  buffer_max_s : String?,
   level_min : String?,
   service : String?,
   every_ms : String?,
@@ -10943,8 +10945,38 @@ fn cmd_watch(
   resolve_after_s : String?,
   snooze_until_s : String?,
 ) -> Unit raise @io.IoError {
+  let scope = active_scope(dir)
   let threshold_n = @string.parse_int(threshold) catch {
     _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
+  }
+  // Metric statistic: avg smooths spikes away (2 slow requests among 20
+  // fast ones stay under an avg threshold) — max/p95 surface them.
+  let metric_stat : String = match metric_stat_s {
+    Some(s) =>
+      if s == "avg" || s == "max" || s == "p95" {
+        s
+      } else {
+        raise @io.IoError::Invalid(
+          "invalid metric-stat: " + s + " (avg|max|p95)",
+        )
+      }
+    None => "avg"
+  }
+  // Window buffer cap: a large window on a high-traffic stream used to grow
+  // the in-memory buffer without bound; the oldest records are dropped and
+  // the count is reported in the summary.
+  let buffer_max : Int32 = match buffer_max_s {
+    Some(v) => {
+      let n = @string.parse_int(v) catch {
+        _ => raise @io.IoError::Invalid("invalid buffer-max: " + v)
+      }
+      if n < 1 {
+        1
+      } else {
+        n
+      }
+    }
+    None => 100000
   }
   let min_samples : Int32 = match min_samples_s {
     Some(v) =>
@@ -11055,6 +11087,7 @@ fn cmd_watch(
   let mut notified : Int32 = 0
   let mut notify_failures : Int32 = 0
   let mut suppressed_events : Int32 = 0
+  let mut buffer_dropped : Int32 = 0
   let mut go = true
   while go && !@backend_native.shutdown_requested() {
     // Pull new records into the window buffer.
@@ -11066,7 +11099,11 @@ fn cmd_watch(
         got_new = true
         let recs = log.scan_range(from, next)
         for rec in recs {
-          buf.push(rec)
+          // RBAC scope (6.1 parity with scan/query): a scoped role must not
+          // see other tenants' records even in a long-running watch.
+          if scope_allows_key(scope, rec.key) {
+            buf.push(rec)
+          }
         }
         from = next
       }
@@ -11083,10 +11120,27 @@ fn cmd_watch(
       }
     }
     buf = fresh
+    // Buffer cap: keep the newest records, count what was dropped so the
+    // truncation is observable in the summary.
+    let excess = buf.length() - buffer_max
+    if excess > 0 {
+      let kept : Array[@core.Record] = []
+      let mut k = 0
+      for rec in buf {
+        if k >= excess {
+          kept.push(rec)
+        }
+        k = k + 1
+      }
+      buf = kept
+      buffer_dropped = buffer_dropped + excess
+    }
     // Evaluate the predicate over the window.
     let mut count = 0
     let mut sum : Double = 0.0
     let mut samples = 0
+    let mut mx : Double? = None
+    let vals : Array[Double] = []
     for rec in buf {
       let mut pass = true
       let needs_fields = match service_b {
@@ -11166,6 +11220,13 @@ fn cmd_watch(
                 match d_opt {
                   Some(d) => {
                     sum = sum + d
+                    match mx {
+                      Some(v) => if d > v { mx = Some(d) }
+                      None => mx = Some(d)
+                    }
+                    if metric_stat == "p95" {
+                      vals.push(d)
+                    }
                     samples = samples + 1
                   }
                   None => ()
@@ -11176,25 +11237,42 @@ fn cmd_watch(
         }
       }
     }
-    // Violation check: count mode or metric-average mode.
+    // Violation check: count mode or metric mode. The metric statistic is
+    // avg (legacy default) or max/p95 — avg smooths latency spikes away, so
+    // the same window can hide a breach that max/p95 expose.
     let metric_thr_v : Double = match metric_thr {
       Some(v) => v
       None => 0.0
     }
+    let metric_value : Double = if metric_b is Some(_) {
+      if metric_stat == "avg" {
+        if samples > 0 {
+          sum / samples.to_double()
+        } else {
+          0.0
+        }
+      } else if metric_stat == "max" {
+        match mx {
+          Some(v) => v
+          None => 0.0
+        }
+      } else {
+        vals.sort()
+        pct_of(vals, 0.95)
+      }
+    } else {
+      0.0
+    }
     let violated : Bool = match metric_b {
       Some(_) =>
-        samples > 0 &&
-        samples >= min_samples &&
-        sum / samples.to_double() > metric_thr_v
+        samples > 0 && samples >= min_samples && metric_value > metric_thr_v
       None => count > threshold_n
     }
     evals = evals + 1
-    let cur_value : String = match metric_b {
-      Some(_) => {
-        let avg = if samples > 0 { sum / samples.to_double() } else { 0.0 }
-        avg.to_string()
-      }
-      None => count.to_string()
+    let cur_value : String = if metric_b is Some(_) {
+      metric_value.to_string()
+    } else {
+      count.to_string()
     }
     let kind_str = if metric_mode { "metric" } else { "threshold" }
     let thr_str = match metric_thr {
@@ -11219,7 +11297,9 @@ fn cmd_watch(
           thr_str +
           ",\"window_sec\":" +
           win_s +
-          ",\"ts\":" +
+          ",\"stat\":\"" +
+          metric_stat +
+          "\",\"ts\":" +
           now.to_string() +
           sup_json +
           "}"
@@ -11227,7 +11307,9 @@ fn cmd_watch(
           println(event)
         } else if metric_mode {
           println(
-            "ALERT firing avg(" +
+            "ALERT firing " +
+            metric_stat +
+            "(" +
             bytes_to_string(
               match metric_b {
                 Some(m) => m
@@ -11290,7 +11372,9 @@ fn cmd_watch(
           thr_str +
           ",\"window_sec\":" +
           win_s +
-          ",\"ts\":" +
+          ",\"stat\":\"" +
+          metric_stat +
+          "\",\"ts\":" +
           now.to_string() +
           sup_json +
           "}"
@@ -11408,7 +11492,11 @@ fn cmd_watch(
       suppressed_events.to_string() +
       ",\"buffered\":" +
       buf.length().to_string() +
-      ",\"window_sec\":" +
+      ",\"buffer_dropped\":" +
+      buffer_dropped.to_string() +
+      ",\"stat\":\"" +
+      metric_stat +
+      "\",\"window_sec\":" +
       win_s +
       "}",
     )
@@ -11430,6 +11518,10 @@ fn cmd_watch(
       notify_failures.to_string() +
       ", suppressed " +
       suppressed_events.to_string() +
+      ", stat " +
+      metric_stat +
+      ", buffer_dropped " +
+      buffer_dropped.to_string() +
       ")",
     )
   }
@@ -11437,7 +11529,8 @@ fn cmd_watch(
 }
 
 ///   watch <dir> <match-text> --threshold N [--window-sec S] [--every ms]
-///            [--metric <field> --metric-threshold <v>] [--level-min <lv>]
+///            [--metric <field> --metric-threshold <v>] [--metric-stat <s>]
+///            [--buffer-max N] [--level-min <lv>]
 ///            [--service <svc>] [--min-samples N] [--resolve-after N]
 ///            [--snooze-until <ms>] [--escalate-sec S]
 ///            [--notify-file <f>] [--webhook <url>]
@@ -11446,17 +11539,25 @@ fn cmd_watch(
 ///            [--json] [--once]
 ///                                    sliding-window threshold watch (5.3):
 ///                                    re-evaluates the trailing window every
-///                                    cycle; count or metric-average modes
-///                                    (JSON and KV values both parsed);
-///                                    firing/resolved state machine emits one
-///                                    notification per transition, with
-///                                    --min-samples/--resolve-after guarding
-///                                    spikes and flapping (no alert storms);
+///                                    cycle; count or metric modes (JSON and
+///                                    KV values both parsed) — the metric
+///                                    statistic is `--metric-stat avg|max|p95`
+///                                    (avg default, legacy; max/p95 surface
+///                                    latency spikes that avg smooths away);
+///                                    records outside the RBAC data scope are
+///                                    never buffered; the buffer is capped at
+///                                    `--buffer-max` records (oldest dropped,
+///                                    count in the summary); firing/resolved
+///                                    state machine emits one notification per
+///                                    transition, with --min-samples/
+///                                    --resolve-after guarding spikes and
+///                                    flapping (no alert storms);
 ///                                    --snooze-until suppresses delivery
 ///                                    during maintenance (events still marked
 ///                                    suppressed=true); the summary reports
-///                                    notified/notify_failures/suppressed so
-///                                    reachability is observable; fresh
+///                                    notified/notify_failures/suppressed/
+///                                    buffer_dropped so reachability and
+///                                    truncation are observable; fresh
 ///                                    records re-evaluate immediately; events
 ///                                    are flushed for real-time pipes;
 ///                                    SIGTERM/SIGINT exits with a summary
@@ -14593,6 +14694,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut min_samples_s : String? = (None : String?)
       let mut resolve_after_s : String? = (None : String?)
       let mut snooze_until_s : String? = (None : String?)
+      let mut metric_stat_s : String? = (None : String?)
+      let mut buffer_max_s : String? = (None : String?)
       let mut notify_dry = false
       let mut json = false
       let mut once = false
@@ -14650,6 +14753,12 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--snooze-until" && i + 1 < args.length() {
           snooze_until_s = Some(args[i + 1])
           i = i + 1
+        } else if a == "--metric-stat" && i + 1 < args.length() {
+          metric_stat_s = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--buffer-max" && i + 1 < args.length() {
+          buffer_max_s = Some(args[i + 1])
+          i = i + 1
         } else if a == "--notify-dry-run" {
           notify_dry = true
         } else if a == "--json" {
@@ -14673,6 +14782,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
             },
             metric,
             metric_threshold,
+            metric_stat_s,
+            buffer_max_s,
             level_min,
             service,
             every_ms,
