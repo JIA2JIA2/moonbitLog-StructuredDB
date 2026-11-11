@@ -2302,6 +2302,7 @@ fn append_ttl_audit(
   trigger : String,
 ) -> Unit {
   let path = ttl_audit_path(dir)
+  let prev = audit_prev_hash(path)
   let line = "{\"ts\":" +
     now_ms().to_string() +
     ",\"event\":\"ttl_expire\"" +
@@ -2314,11 +2315,14 @@ fn append_ttl_audit(
     expired.to_string() +
     ",\"policy\":\"" +
     json_escape_str(policy_text) +
+    "\",\"prev\":\"" +
+    prev +
     "\"}\n"
-  ignore(
-    @backend_native.append_file(path, @utf8.encode(line)) catch {
-      _ => ()
-    },
+  let body = @utf8.encode(line)
+  ignore(@backend_native.append_file(path, body) catch { _ => () })
+  set_audit_chain_tail(
+    path,
+    @core.crc32(@core.slice(body, 0, body.length() - 1)),
   )
 }
 
@@ -2478,6 +2482,9 @@ fn cmd_ttl_audit(
     }
   }
   if json && verify {
+    // 6.3 third pass: chain integrity for the TTL trail too — a middle row
+    // removed or rewritten stays valid JSON but breaks its `prev` link.
+    let broken = audit_chain_check_file(ttl_audit_path(dir))
     println(
       "{\"lines\":" +
       total.to_string() +
@@ -2487,7 +2494,9 @@ fn cmd_ttl_audit(
       invalid.to_string() +
       ",\"status\":\"" +
       (if invalid == 0 { "ok" } else { "corrupt" }) +
-      "\"}",
+      "\",\"chain_ok\":" +
+      (if broken < 0 { "true" } else { "false" }) +
+      "}",
     )
   } else if json {
     let body = out.to_string()
@@ -2498,6 +2507,7 @@ fn cmd_ttl_audit(
     }
     println("[" + trimmed + "]")
   } else if verify {
+    let broken = audit_chain_check_file(ttl_audit_path(dir))
     println(
       "lines " +
       total.to_string() +
@@ -2505,7 +2515,12 @@ fn cmd_ttl_audit(
       valid.to_string() +
       ", invalid " +
       invalid.to_string() +
-      (if invalid == 0 { " — ok" } else { " — corrupt" }),
+      (if invalid == 0 { " — ok" } else { " — corrupt" }) +
+      (if broken < 0 {
+        ", chain ok"
+      } else {
+        ", chain broken at row " + broken.to_string()
+      }),
     )
   } else {
     println(
@@ -12363,6 +12378,9 @@ let audit_cmds : Array[String] = [
   // 6.1/6.3 third pass: configuration commands and HA state changes added
   // after M172 were leaving no trail.
    "tier-policy", "ttl-audit", "ha-watch",
+  // 6.3 third pass: destructive repair, data replication and bulk restore
+  // are key operations — they move, isolate or re-append whole segments.
+   "fsck", "replicate", "import",
 ]
 
 ///|
@@ -12448,10 +12466,144 @@ fn audit_path(dir : String) -> String {
 }
 
 ///|
+/// Render a CRC32 as 8 lowercase hex characters (6.3 chain integrity).
+fn crc32_hex(v0 : UInt32) -> String {
+  let digits : Array[Char] = [
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+  ]
+  let arr : Array[Int32] = []
+  let mut v = v0
+  let mut i = 0
+  while i < 8 {
+    arr.push((v % 16).to_int())
+    v = v / 16
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  let mut j = 7
+  while j >= 0 {
+    sb.write_char(digits[arr[j]])
+    j = j - 1
+  }
+  sb.to_string()
+}
+
+///|
+/// In-process chain tail cache: (audit path, CRC32 hex of its last complete
+/// line). Refreshed by every append in this process; rotation resets the
+/// entry so the fresh trail starts a new chain. Cross-process appends are
+/// handled by re-reading the tail on a cache miss.
+let audit_chain_cache : Array[(String, String)] = []
+
+///|
+fn set_audit_chain_tail(path : String, crc : UInt32) -> Unit {
+  let hex = crc32_hex(crc)
+  let mut i = 0
+  while i < audit_chain_cache.length() {
+    if audit_chain_cache[i].0 == path {
+      audit_chain_cache[i] = (path, hex)
+      return
+    }
+    i = i + 1
+  }
+  audit_chain_cache.push((path, hex))
+}
+
+///|
+/// CRC32-hex of the audit file's last complete line — the `prev` the next
+/// event links to (`00000000` when the file is empty). The in-process cache
+/// keeps consecutive appends O(1); a miss re-reads the file, whose size is
+/// bounded by the auto-rotate cap.
+fn audit_prev_hash(path : String) -> String {
+  for entry in audit_chain_cache {
+    if entry.0 == path {
+      return entry.1
+    }
+  }
+  let data = @backend_native.read_file(path)
+  let n = data.length()
+  let mut end = n
+  while end > 0 && data.at(end - 1).to_int() == 10 {
+    end = end - 1
+  }
+  if end == 0 {
+    set_audit_chain_tail(path, (0 : UInt32))
+    return "00000000"
+  }
+  let mut start = end
+  while start > 0 && data.at(start - 1).to_int() != 10 {
+    start = start - 1
+  }
+  let hex = crc32_hex(@core.crc32(@core.slice(data, start, end)))
+  set_audit_chain_tail(path, @core.crc32(@core.slice(data, start, end)))
+  hex
+}
+
+///|
+/// Auto-rotate threshold in bytes for the live audit trail (6.3 third
+/// pass): `MOONLOG_AUDIT_ROTATE_BYTES` overrides the 64 MiB default; 0
+/// disables auto-rotation (manual `audit --rotate` still works). Without a
+/// cap a long-lived directory grows AUDIT until the disk fills, and an
+/// audit trail the store can no longer afford to write is no trail.
+fn audit_auto_rotate_bytes() -> Int64 {
+  match @env.get_env_var("MOONLOG_AUDIT_ROTATE_BYTES") {
+    Some(s) => @string.parse_int64(s) catch { _ => 67108864L }
+    None => 67108864L
+  }
+}
+
+///|
+/// Rotate the live audit trail into `AUDIT.N` (6.3): shift existing
+/// rotations up, drop rotations beyond `keep`, move `AUDIT` to `AUDIT.1`,
+/// and start a fresh trail whose first event is rotate-complete. The caller
+/// holds the directory exclusive lock (manual `audit --rotate`) or acquired
+/// it non-blockingly (auto-rotation). Silent — callers print their own note.
+fn audit_rotate_locked(dir : String, keep_n : Int32) -> Unit {
+  let base = audit_path(dir)
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  for n in names {
+    if n.has_prefix("AUDIT.") {
+      let s = @string.parse_int(n[6:n.length()].to_owned()) catch { _ => -1 }
+      if s >= keep_n {
+        ignore(@backend_native.remove_file(dir + "/" + n))
+      }
+    }
+  }
+  let mut i = keep_n - 1
+  while i >= 1 {
+    let from = base + "." + i.to_string()
+    let to = base + "." + (i + 1).to_string()
+    if @backend_native.file_exists(from) {
+      ignore(@backend_native.rename_file(from, to))
+    }
+    i = i - 1
+  }
+  if @backend_native.file_exists(base) {
+    ignore(@backend_native.rename_file(base, base + ".1"))
+  }
+  ignore(@backend_native.write_file(base, b"") catch { _ => () })
+  set_audit_chain_tail(base, (0 : UInt32))
+  audit_log(
+    dir,
+    audit_actor(dir),
+    "audit",
+    "allow",
+    "rotate-complete keep=" + keep_n.to_string(),
+  )
+}
+
+///|
 /// Append one operation-audit event to `<dir>/AUDIT` (6.3): JSONL with
-/// ts/actor/action/decision/target, atomically appended (O_APPEND) so
-/// concurrent CLI processes never lose events. Failures are swallowed —
-/// auditing must not break the operation it observes.
+/// ts/actor/action/decision/target/prev, atomically appended (O_APPEND) so
+/// concurrent CLI processes never lose events. `prev` carries the CRC32 hex
+/// of the previous line (`00000000` at a chain head), giving `audit
+/// --verify` a tamper-evidence chain: removing, inserting or rewriting a
+/// middle row breaks the link even though every row stays individually
+/// valid JSON. Failures are swallowed — auditing must not break the
+/// operation it observes. When the live trail reaches the auto-rotate
+/// threshold it rotates first, best effort: only when the exclusive lock is
+/// immediately free (call sites already inside the lock, or losing a race,
+/// skip and retry on the next event).
 fn audit_log(
   dir : String,
   actor : String,
@@ -12462,6 +12614,26 @@ fn audit_log(
   // `rbac init` audits before cmd_rbac creates the directory; ensure_dir is
   // idempotent, so every audit path survives a not-yet-created store dir.
   ignore(@backend_native.ensure_dir(dir))
+  let cap = audit_auto_rotate_bytes()
+  if cap > (0 : Int64) {
+    let path = audit_path(dir)
+    if @backend_native.file_size(path) >= cap {
+      // timeout 0 = try-lock; a busy lock raises Syscall, which means "skip
+      // the rotation for this event" (the next event retries).
+      let lock = Some(@backend_native.DirLock::acquire_timeout(dir, true, 0)) catch {
+        _ => None
+      }
+      match lock {
+        Some(l) => {
+          audit_rotate_locked(dir, 5)
+          l.release()
+        }
+        None => ()
+      }
+    }
+  }
+  let path = audit_path(dir)
+  let prev = audit_prev_hash(path)
   let line = "{\"ts\":" +
     now_ms().to_string() +
     ",\"actor\":\"" +
@@ -12472,11 +12644,16 @@ fn audit_log(
     decision +
     "\",\"target\":\"" +
     json_escape_str(target) +
+    "\",\"prev\":\"" +
+    prev +
     "\"}\n"
-  ignore(
-    @backend_native.append_file(audit_path(dir), @utf8.encode(line)) catch {
-      _ => ()
-    },
+  let body = @utf8.encode(line)
+  ignore(@backend_native.append_file(path, body) catch { _ => () })
+  // Roll the in-process chain tail: the next event in this process links to
+  // this line without re-reading the file (CRC of the line without its \n).
+  set_audit_chain_tail(
+    path,
+    @core.crc32(@core.slice(body, 0, body.length() - 1)),
   )
 }
 
@@ -13108,6 +13285,47 @@ fn audit_read_lines(dir : String, all : Bool) -> (Array[String], Int32) {
 }
 
 ///|
+/// Walk one audit file's `prev` chain (6.3 third pass): returns -1 when
+/// every link holds, else the 1-based index of the first row whose `prev`
+/// does not match the running CRC32 of the preceding row. Rows without a
+/// `prev` field (legacy events written before the chain existed) skip the
+/// check but still feed the running CRC, so old trails stay verifiable as
+/// chained events append after them.
+fn audit_chain_check_file(path : String) -> Int32 {
+  let data = @backend_native.read_file(path)
+  let n = data.length()
+  let mut expected = "00000000"
+  let mut idx : Int32 = 0
+  let mut start = 0
+  while start < n {
+    let mut e = start
+    while e < n && data.at(e).to_int() != 10 {
+      e = e + 1
+    }
+    if e == start {
+      start = start + 1
+      continue
+    }
+    idx = idx + 1
+    let row = @core.slice(data, start, e)
+    let fields = @core.json_object_fields(row) catch { _ => [] }
+    let mut row_prev : String? = None
+    for pair in fields {
+      if pair.0 == b"prev" {
+        row_prev = Some(@utf8.decode_lossy(pair.1))
+      }
+    }
+    match row_prev {
+      Some(p) => if p != expected { return idx }
+      None => ()
+    }
+    expected = crc32_hex(@core.crc32(row))
+    start = e + 1
+  }
+  -1
+}
+
+///|
 /// Audit trail query (6.3): filter AUDIT events by actor/action/decision and
 /// event-time window, newest first. `--json` prints the original JSONL lines
 /// (machine-readable), text mode renders ts/actor/action/decision/target.
@@ -13141,42 +13359,8 @@ fn cmd_audit(
       raise @io.IoError::Invalid("keep must be >= 1")
     }
     run_locked(dir, true, () => {
-      let base = dir + "/AUDIT"
-      let names = @backend_native.list_dir(dir) catch { _ => [] }
-      for n in names {
-        if n.has_prefix("AUDIT.") {
-          let s = @string.parse_int(n[6:n.length()].to_owned()) catch {
-            _ => -1
-          }
-          if s >= keep_n {
-            ignore(@backend_native.remove_file(dir + "/" + n))
-          }
-        }
-      }
-      let mut i = keep_n - 1
-      while i >= 1 {
-        let from = base + "." + i.to_string()
-        let to = base + "." + (i + 1).to_string()
-        if @backend_native.file_exists(from) {
-          ignore(@backend_native.rename_file(from, to))
-        }
-        i = i - 1
-      }
-      if @backend_native.file_exists(base) {
-        ignore(@backend_native.rename_file(base, base + ".1"))
-      }
-      @backend_native.write_file(base, b"")
+      audit_rotate_locked(dir, keep_n)
       println("rotated: AUDIT -> AUDIT.1 (keep " + keep_n.to_string() + ")")
-      // The dispatch-level allow event for `audit --rotate` landed in the
-      // archived file; record completion in the fresh live trail so the new
-      // AUDIT is never empty after a rotation.
-      audit_log(
-        dir,
-        audit_actor(dir),
-        "audit",
-        "allow",
-        "rotate-complete keep=" + keep_n.to_string(),
-      )
     })
     return
   }
@@ -13254,6 +13438,41 @@ fn cmd_audit(
     }
   }
   if verify {
+    // 6.3 third pass: chain integrity — walk every reported file's `prev`
+    // links, so a removed/inserted/rewritten middle row is flagged even
+    // though it stays valid JSON (the line-level valid/invalid counts above
+    // cannot see it).
+    let chain_paths : Array[String] = []
+    if all {
+      let names = @backend_native.list_dir(dir) catch { _ => [] }
+      let rotated : Array[(Int32, String)] = []
+      for n in names {
+        if n.has_prefix("AUDIT.") {
+          let s = @string.parse_int(n[6:n.length()].to_owned()) catch {
+            _ => -1
+          }
+          if s >= 1 {
+            rotated.push((s, dir + "/" + n))
+          }
+        }
+      }
+      rotated.sort_by(fn(a, b) { b.0.compare(a.0) })
+      for item in rotated {
+        chain_paths.push(item.1)
+      }
+    }
+    if @backend_native.file_exists(audit_path(dir)) {
+      chain_paths.push(audit_path(dir))
+    }
+    let mut chain_ok = true
+    let mut chain_where = ""
+    for p in chain_paths {
+      let broken = audit_chain_check_file(p)
+      if broken >= 0 {
+        chain_ok = false
+        chain_where = p + "#" + broken.to_string()
+      }
+    }
     if json {
       println(
         "{\"files\":" +
@@ -13268,7 +13487,11 @@ fn cmd_audit(
         earliest.to_string() +
         ",\"latest_ms\":" +
         latest.to_string() +
-        "}",
+        ",\"chain_ok\":" +
+        (if chain_ok { "true" } else { "false" }) +
+        ",\"chain_broken\":\"" +
+        chain_where +
+        "\"}",
       )
     } else {
       println(
@@ -13287,7 +13510,9 @@ fn cmd_audit(
           @core.format_utc(latest, "minute")
         } else {
           "empty"
-        }),
+        }) +
+        " chain=" +
+        (if chain_ok { "ok" } else { "broken(" + chain_where + ")" }),
       )
     }
     return
@@ -13319,16 +13544,32 @@ fn cmd_audit(
     }
     i = i - 1
   }
-  println(
-    "(" +
-    total.to_string() +
-    " events, " +
-    (matched.length() - start).to_string() +
-    " shown" +
-    (if invalid > 0 { ", invalid=" + invalid.to_string() } else { "" }) +
-    (if all { ", all rotations" } else { "" }) +
-    ")",
-  )
+  // 6.3 third pass: the tail note used to pollute `--json` stdout (same
+  // channel bug M160/M201 fixed for query/trend) — send it to stderr so the
+  // JSON stream stays parseable end to end.
+  if !json {
+    println(
+      "(" +
+      total.to_string() +
+      " events, " +
+      (matched.length() - start).to_string() +
+      " shown" +
+      (if invalid > 0 { ", invalid=" + invalid.to_string() } else { "" }) +
+      (if all { ", all rotations" } else { "" }) +
+      ")",
+    )
+  } else {
+    eprintln(
+      "(" +
+      total.to_string() +
+      " events, " +
+      (matched.length() - start).to_string() +
+      " shown" +
+      (if invalid > 0 { ", invalid=" + invalid.to_string() } else { "" }) +
+      (if all { ", all rotations" } else { "" }) +
+      ")",
+    )
+  }
 }
 
 ///|
