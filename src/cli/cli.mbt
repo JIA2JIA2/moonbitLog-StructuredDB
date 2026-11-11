@@ -159,6 +159,17 @@
 ///                                    durability flush is timed separately),
 ///                                    optionally after N warm-up records,
 ///                                    then reopen and verify no record was lost
+///   query <dir> [--since] [--until] [--level] [--level-min] [--level-max]
+///              [--service] [--host] [--trace-id] [--contains]
+///              [--where name=value] [--indexed] [--sort-by-time] [--json]
+///              [--limit N] [--require-time] [--timeout ms] [--explain]
+///                                    structured filtering with pushdown:
+///                                    level equality/range (numeric OTel
+///                                    severity bands included), service/host/
+///                                    trace_id equality, an arbitrary
+///                                    --where name=value equality, and time
+///                                    bounds — all AND-combinable; --explain
+///                                    reports what the storage layer executed
 ///   search <dir> <text> [--field key|value|both] [--ignore-case] [--limit N]
 ///                       [--from off] [--to off] [--inverted] [--wildcard]
 ///                       [--since <ms>] [--until <ms>] [--require-time]
@@ -1016,6 +1027,32 @@ fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
     return @core.json_object_fields(value) catch { _ => [] }
   }
   @core.parse_kv_pairs(value)
+}
+
+///|
+
+///|
+/// Custom `--field name=value` refinement (4.2 third round): the field name
+/// resolves through the unified schema (2.2) so alias spellings hit the same
+/// slot, unknown names compare literally (case-insensitive), and the value
+/// compares case-insensitively (field columns store lowercase).
+fn field_filter_match(
+  fields : Array[(Bytes, Bytes)],
+  ff : (Bytes, Bytes),
+) -> Bool {
+  let q_slot = @core.canonical_field(ff.0)
+  for pair in fields {
+    let p_slot = @core.canonical_field(pair.0)
+    let km = if q_slot >= 0 && p_slot >= 0 {
+      q_slot == p_slot
+    } else {
+      follow_lower_ascii(pair.0) == follow_lower_ascii(ff.0)
+    }
+    if km && follow_lower_ascii(pair.1) == follow_lower_ascii(ff.1) {
+      return true
+    }
+  }
+  false
 }
 
 ///|
@@ -7122,6 +7159,7 @@ fn cmd_query(
   limit : String?,
   indexed : Bool,
   sort_by_time : Bool,
+  field_filter : (String, String)?,
   json : Bool,
   require_time : Bool,
   timeout : String?,
@@ -7142,6 +7180,10 @@ fn cmd_query(
   }
   let trace_b : Bytes? = match trace_id {
     Some(s) => Some(@utf8.encode(s))
+    None => None
+  }
+  let field_ff : (Bytes, Bytes)? = match field_filter {
+    Some(f) => Some((@utf8.encode(f.0), @utf8.encode(f.1)))
     None => None
   }
   let contains_b : Bytes? = match contains {
@@ -7254,6 +7296,19 @@ fn cmd_query(
       Some(r) => r
       None => 4
     }
+    // Equal-level filters enumerate the rank's whole shape set too: the
+    // linear path matches through `level_rank` (so `--level 17`, `--level
+    // error` and `--level ERROR` all agree), and the pushdown must probe the
+    // same shape set or it would miss the numeric form stored in the field
+    // column (4.2 third round).
+    let lo_e : Int32 = match level_b {
+      Some(l) => @core.level_rank(follow_lower_ascii(l))
+      None => lo_r
+    }
+    let hi_e : Int32 = match level_b {
+      Some(l) => @core.level_rank(follow_lower_ascii(l))
+      None => hi_r
+    }
     let table : Array[(Int32, Bytes)] = [
       (0, b"debug"),
       (1, b"info"),
@@ -7261,14 +7316,23 @@ fn cmd_query(
       (3, b"error"),
       (4, b"fatal"),
     ]
+    // Numeric OTel severity bands per rank (M190): `severity_number=17`
+    // stores `level=17` in the field column, not `level=error`.
+    let digits : Array[Array[Bytes]] = [
+      [b"1", b"2", b"3", b"4", b"5", b"6", b"7", b"8"],
+      [b"9", b"10", b"11", b"12"],
+      [b"13", b"14", b"15", b"16"],
+      [b"17", b"18", b"19", b"20"],
+      [b"21", b"22", b"23", b"24"],
+    ]
     for pair in table {
       let (r, v) = pair
-      if r >= lo_r && r <= hi_r {
-        match level_b {
-          // Case-insensitive equality (3.2): field columns store lowercase
-          // values, so `--level ERROR` must fold to the table's `error`.
-          Some(l) => if follow_lower_ascii(l) == v { vals.push(v) }
-          None => vals.push(v)
+      if r >= lo_e && r <= hi_e {
+        // Case-insensitive equality (3.2): field columns store lowercase
+        // values, so `--level ERROR` must fold to the table's `error`.
+        vals.push(v)
+        for dv in digits[r] {
+          vals.push(dv)
         }
       }
     }
@@ -7300,6 +7364,37 @@ fn cmd_query(
     }
     match trace_b {
       Some(t) => idx_filters.push((b"trace_id", [follow_lower_ascii(t)], false))
+      None => ()
+    }
+    // Custom field filter (4.2 third round): field columns hold arbitrary
+    // `name=value` pairs, so the condition pushes down like the built-in
+    // ones. Alias names resolve to their canonical column (`severity_number`
+    // probes `level`); values probe both spellings since non-canonical
+    // fields keep their literal case in the column.
+    match field_ff {
+      Some(ff) => {
+        let slot = @core.canonical_field(ff.0)
+        let fname = if slot == 1 {
+          b"level"
+        } else if slot == 2 {
+          b"service"
+        } else if slot == 3 {
+          b"host"
+        } else if slot == 4 {
+          b"trace_id"
+        } else if slot == 5 {
+          b"message"
+        } else {
+          ff.0
+        }
+        let v_l = follow_lower_ascii(ff.1)
+        let vals2 : Array[Bytes] = if v_l == ff.1 {
+          [ff.1]
+        } else {
+          [v_l, ff.1]
+        }
+        idx_filters.push((fname, vals2, false))
+      }
       None => ()
     }
   }
@@ -7497,6 +7592,18 @@ fn cmd_query(
                     trace_b,
                     contains_b,
                   )
+                  // Custom `--where` refinement (4.2 third round): the
+                  // pushdown probed the field column, the refinement confirms
+                  // the parsed field set.
+                  if hit {
+                    match field_ff {
+                      Some(ff) =>
+                        if !field_filter_match(fields, ff) {
+                          hit = false
+                        }
+                      None => ()
+                    }
+                  }
                 }
               }
               if hit && scope_allows_key(scope, r.key) {
@@ -7632,6 +7739,13 @@ fn cmd_query(
               trace_b,
               contains_b,
             )
+            // Custom `--where` refinement (4.2 third round).
+            if hit {
+              match field_ff {
+                Some(ff) => if !field_filter_match(fields, ff) { hit = false }
+                None => ()
+              }
+            }
           }
         }
         if hit {
@@ -13275,6 +13389,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut limit : String? = (None : String?)
       let mut indexed = false
       let mut sort_by_time = false
+      let mut field_filter : (String, String)? = (None : (String, String)?)
       let mut json = false
       let mut require_time = false
       let mut timeout : String? = (None : String?)
@@ -13325,6 +13440,26 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           json = true
         } else if a == "--explain" {
           explain = true
+        } else if a == "--where" && i + 1 < args.length() {
+          let spec = args[i + 1]
+          let eq = spec.find("=")
+          match eq {
+            Some(e) =>
+              if e == 0 {
+                raise @io.IoError::Invalid("invalid --where: " + spec)
+              } else {
+                field_filter = Some(
+                  (spec[0:e].to_owned(), spec[e + 1:spec.length()].to_owned()),
+                )
+              }
+            None =>
+              raise @io.IoError::Invalid(
+                "invalid --where: " + spec + " (name=value)",
+              )
+          }
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown query argument: " + a)
         }
         i = i + 1
       }
@@ -13342,6 +13477,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         limit,
         indexed,
         sort_by_time,
+        field_filter,
         json,
         require_time,
         timeout,
