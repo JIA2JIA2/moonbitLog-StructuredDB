@@ -196,3 +196,51 @@ test "tokenize emits UTF-8 character unigrams for CJK" {
   // ASCII whitespace never produces a token.
   assert_eq(@segment.tokenize(b"  ", 16).length(), 0)
 }
+
+///|
+test "field columns normalize aliases, JSON and value case (3.2)" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  // OTel JSON record: `parse_kv_pairs` sees no pairs, so before the JSON
+  // flattening the field columns stayed empty and `--indexed` pushdown
+  // skipped the whole segment (false negatives).
+  ignore(
+    seg.append(
+      b"log",
+      b"{\"severity_text\":\"ERROR\",\"service\":{\"name\":\"orders\"},\"message\":\"boom\"}",
+      (1 : Int64),
+    ) catch {
+      _ => panic()
+    },
+  )
+  // Alias-shaped KV record: names squash to the 2.2 canonical slots.
+  ignore(
+    seg.append(b"svc", b"severity=Warn service_name=orders", (2 : Int64)) catch {
+      _ => panic()
+    },
+  )
+  // Non-canonical fields keep their literal name/value.
+  ignore(
+    seg.append(b"log", b"order_id=AB-42 status=OK", (3 : Int64)) catch {
+      _ => panic()
+    },
+  )
+  seg.build_inv_index()
+  // JSON values land in the columns as canonical name + lowercase value.
+  assert_eq(seg.inv_field_postings(b"level", b"error"), [0])
+  assert_eq(seg.inv_field_postings(b"service", b"orders"), [0, 1])
+  assert_eq(seg.inv_field_postings(b"message", b"boom"), [0])
+  // Alias names and mixed-case values fold into the same columns.
+  assert_eq(seg.inv_field_postings(b"level", b"warn"), [1])
+  // Probing the original casing misses (values are stored folded)…
+  assert_eq(seg.inv_field_postings(b"level", b"ERROR").length(), 0)
+  // …and non-canonical fields stay literal.
+  assert_eq(seg.inv_field_postings(b"order_id", b"AB-42"), [2])
+  assert_eq(seg.inv_field_postings(b"status", b"OK"), [2])
+  // Keys keep their original case in the `__key__` column.
+  assert_eq(seg.inv_field_postings(b"__key__", b"svc"), [1])
+}

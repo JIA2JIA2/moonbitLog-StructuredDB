@@ -6633,7 +6633,9 @@ fn cmd_query(
       let (r, v) = pair
       if r >= lo_r && r <= hi_r {
         match level_b {
-          Some(l) => if l == v { vals.push(v) }
+          // Case-insensitive equality (3.2): field columns store lowercase
+          // values, so `--level ERROR` must fold to the table's `error`.
+          Some(l) => if follow_lower_ascii(l) == v { vals.push(v) }
           None => vals.push(v)
         }
       }
@@ -6644,20 +6646,28 @@ fn cmd_query(
   }
   let idx_filters : Array[(Bytes, Array[Bytes], Bool)] = []
   if indexed {
+    // 3.2: field columns store canonical names with ASCII-lowercase values
+    // (aliases squashed to the 2.2 slots, JSON records flattened), so
+    // pushdown probes lowercase values. The raw value is probed too for
+    // `service`, whose `__key__=` column keeps the original key case.
     match level_values {
       Some(vals) => idx_filters.push((b"level", vals, false))
       None => ()
     }
     match service_b {
-      Some(s) => idx_filters.push((b"service", [s], true))
+      Some(s) => {
+        let s_l = follow_lower_ascii(s)
+        let vals : Array[Bytes] = if s_l == s { [s] } else { [s_l, s] }
+        idx_filters.push((b"service", vals, true))
+      }
       None => ()
     }
     match host_b {
-      Some(h) => idx_filters.push((b"host", [h], false))
+      Some(h) => idx_filters.push((b"host", [follow_lower_ascii(h)], false))
       None => ()
     }
     match trace_b {
-      Some(t) => idx_filters.push((b"trace_id", [t], false))
+      Some(t) => idx_filters.push((b"trace_id", [follow_lower_ascii(t)], false))
       None => ()
     }
   }

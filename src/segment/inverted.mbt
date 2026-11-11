@@ -14,7 +14,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 4
+const INV_VERSION : UInt32 = 5
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -102,6 +102,61 @@ fn inv_add(
 }
 
 ///|
+/// ASCII lowercase copy (field-column values are probed case-insensitively
+/// by the pushdown, so alias-shaped records must be stored folded).
+fn inv_lower_bytes(b : Bytes) -> Bytes {
+  let out = @buffer.Buffer::Buffer()
+  let n = b.length()
+  let mut i = 0
+  while i < n {
+    let c = b.at(i).to_int()
+    if c >= 65 && c <= 90 {
+      out.write_byte((c + 32).to_byte())
+    } else {
+      out.write_byte(b.at(i))
+    }
+    i = i + 1
+  }
+  out.to_bytes()
+}
+
+///|
+/// Add one `name=value` field-column entry, normalizing through the unified
+/// schema (2.2): the field name is squashed to its canonical slot name
+/// (`severity_text` → `level`, `service.name` → `service`) and the value is
+/// ASCII-lowercased for the five non-ts slots. Query-side pushdown probes
+/// exactly those canonical names with lowercase values — without this,
+/// alias-shaped KV records and SDK-style JSON records miss the columns and
+/// `query --indexed` would skip whole segments containing matches (false
+/// negatives). Non-canonical fields keep their literal name/value.
+fn inv_add_field(
+  fields : @hashmap.HashMap[Bytes, Array[Int32]],
+  name : Bytes,
+  value : Bytes,
+  idx : Int32,
+) -> Unit {
+  let slot = @core.canonical_field(name)
+  let (nb, vb) = if slot == 1 {
+    (b"level", inv_lower_bytes(value))
+  } else if slot == 2 {
+    (b"service", inv_lower_bytes(value))
+  } else if slot == 3 {
+    (b"host", inv_lower_bytes(value))
+  } else if slot == 4 {
+    (b"trace_id", inv_lower_bytes(value))
+  } else if slot == 5 {
+    (b"message", inv_lower_bytes(value))
+  } else {
+    (name, value)
+  }
+  let fb = @buffer.Buffer::Buffer()
+  fb.write_bytes(nb)
+  fb.write_bytes(b"=")
+  fb.write_bytes(vb)
+  inv_add(fields, fb.to_bytes(), idx)
+}
+
+///|
 /// Build (or rebuild) the inverted + field-column index by streaming every
 /// record once: the key and the value are tokenized into terms; the exact
 /// `name=value` pairs of the value plus `__key__=<key>` go into the field
@@ -124,11 +179,26 @@ pub fn[W, R : @io.LogReader] Segment::build_inv_index(
       inv_add(terms, tok, idx)
     }
     for pair in @core.parse_kv_pairs(rec.value) {
-      let fb = @buffer.Buffer::Buffer()
-      fb.write_bytes(pair.0)
-      fb.write_bytes(b"=")
-      fb.write_bytes(pair.1)
-      inv_add(fields, fb.to_bytes(), idx)
+      inv_add_field(fields, pair.0, pair.1, idx)
+    }
+    if rec.value.length() > 0 && rec.value.at(0).to_int() == 123 {
+      // JSON/OTel records (2.1): the exact `name=value` columns are built
+      // from the flattened fields too — `parse_kv_pairs` sees no pairs in a
+      // JSON object, so without this SDK-style values have empty columns and
+      // `query --indexed` pushdown would skip the whole segment even when it
+      // holds matches.
+      let flat : Array[(Bytes, Bytes)]? = Some(
+        @core.json_object_fields(rec.value),
+      ) catch {
+        _ => None
+      }
+      match flat {
+        Some(pairs) =>
+          for pair in pairs {
+            inv_add_field(fields, pair.0, pair.1, idx)
+          }
+        None => ()
+      }
     }
     let kb = @buffer.Buffer::Buffer()
     kb.write_bytes(b"__key__=")
