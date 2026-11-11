@@ -4035,6 +4035,104 @@ fn drill_sidecar_stats(dir : String) -> (Int32, Int64) {
 }
 
 ///|
+/// File names of the audit trail inside `dir` (6.5): the live `AUDIT` plus
+/// its rotated `AUDIT.N` siblings. These travel with a backup, so a recovery
+/// drill can reconcile the restored copy's accountability history.
+fn drill_audit_names(dir : String) -> Array[String] {
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let found : Array[String] = []
+  for name in names {
+    if name == "AUDIT" || name.has_prefix("AUDIT.") {
+      found.push(name)
+    }
+  }
+  found
+}
+
+///|
+/// Count and byte size of the audit trail files inside `dir` (6.5).
+fn drill_audit_stats(dir : String) -> (Int32, Int64) {
+  let mut files = 0
+  let mut bytes : Int64 = 0
+  for name in drill_audit_names(dir) {
+    files = files + 1
+    let s = @backend_native.file_size(dir + "/" + name)
+    if s > 0 {
+      bytes = bytes + s
+    }
+  }
+  (files, bytes)
+}
+
+///|
+/// Audit-trail reconciliation for a recovery drill (6.5): "absent" when the
+/// backup carries no audit files, "ok" when the restored copy carries the
+/// identical set byte for byte, and "mismatch" otherwise — a lost rotation
+/// or a truncated trail would silently drop the accountability history a
+/// disaster recovery is supposed to preserve.
+fn drill_audit_check(bak : String, rst : String) -> String {
+  let src_names = drill_audit_names(bak)
+  let dst_names = drill_audit_names(rst)
+  if src_names.length() == 0 && dst_names.length() == 0 {
+    return "absent"
+  }
+  if src_names.length() != dst_names.length() {
+    return "mismatch"
+  }
+  for name in src_names {
+    let dst_has = @backend_native.file_exists(rst + "/" + name)
+    if !dst_has {
+      return "mismatch"
+    }
+    let a = @backend_native.read_file(bak + "/" + name)
+    let b = @backend_native.read_file(rst + "/" + name)
+    if a != b {
+      return "mismatch"
+    }
+  }
+  "ok"
+}
+
+///|
+/// Whether every audit file of `dir` still walks a clean `prev` chain (6.5):
+/// the drill verifies the restored copy's trail end to end, since a
+/// byte-identical set with a broken link would mean the history was
+/// rewritten rather than preserved.
+fn drill_audit_chain_ok(dir : String) -> Bool {
+  for name in drill_audit_names(dir) {
+    if audit_chain_check_file(dir + "/" + name) != (-1 : Int32) {
+      return false
+    }
+  }
+  true
+}
+
+///|
+/// Idempotency-state reconciliation for a recovery drill (6.5): the batch-id
+/// ledger `BATCHES` has no embedded copy inside the segments (unlike dedup
+/// ids, which rebuild from `__uid=` markers), so a lost ledger would let
+/// already-confirmed batches replay as duplicate data. "absent" when the
+/// backup carries none, "ok" when the restored copy matches byte for byte.
+fn drill_batches_check(bak : String, rst : String) -> String {
+  let src_has = @backend_native.file_exists(bak + "/BATCHES")
+  let dst_has = @backend_native.file_exists(rst + "/BATCHES")
+  if !src_has && !dst_has {
+    return "absent"
+  }
+  if src_has && dst_has {
+    let a = @backend_native.read_file(bak + "/BATCHES")
+    let b = @backend_native.read_file(rst + "/BATCHES")
+    if a == b {
+      "ok"
+    } else {
+      "mismatch"
+    }
+  } else {
+    "mismatch"
+  }
+}
+
+///|
 fn drill_config_check(dir : String, rst : String) -> String {
   let files = [
     "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "TIER", "SELFMON/thresholds",
@@ -4069,9 +4167,10 @@ fn drill_config_check(dir : String, rst : String) -> String {
 /// One-key recovery drill (6.5): back `dir` up into a scratch directory,
 /// restore it into a second one, fast-verify the restored copy, reconcile
 /// record counts and offsets against the live directory, compare the policy
-/// files and spot-read the first and last record — proving a real restore
-/// succeeds end to end. The live directory is only ever read (under its
-/// shared lock) and the scratch directories are removed unless `--keep`.
+/// files and spot-read the first and last record, and reconcile the audit
+/// trail plus the batch-id ledger against the backup — proving a real
+/// restore succeeds end to end. The live directory is only ever read (under
+/// its shared lock) and the scratch directories are removed unless `--keep`.
 fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
   let bak = dir + ".drill-backup"
@@ -4085,6 +4184,11 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
   let mut src_records = -1
   let mut match_ok = false
   let mut config_status = "absent"
+  let mut audit_status = "absent"
+  let mut audit_files = 0
+  let mut audit_bytes : Int64 = 0
+  let mut audit_chain_ok = true
+  let mut batches_status = "absent"
   let mut spot_ok = false
   let mut index_ok = false
   let mut src_index_files = 0
@@ -4148,6 +4252,12 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
     spot_ok = spot
     let data_ok = verify_ok && next_ok && verify_records == src_records && spot
     config_status = drill_config_check(dir, rst)
+    audit_status = drill_audit_check(bak, rst)
+    let (a_f, a_b) = drill_audit_stats(bak)
+    audit_files = a_f
+    audit_bytes = a_b
+    audit_chain_ok = drill_audit_chain_ok(rst)
+    batches_status = drill_batches_check(bak, rst)
     let (s_if, s_ib) = drill_sidecar_stats(dir)
     let (r_if, r_ib) = drill_sidecar_stats(rst)
     src_index_files = s_if
@@ -4155,7 +4265,12 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
     rst_index_files = r_if
     rst_index_bytes = r_ib
     index_ok = s_if == r_if && s_ib == r_ib
-    match_ok = data_ok && config_status != "mismatch" && index_ok
+    match_ok = data_ok &&
+      config_status != "mismatch" &&
+      index_ok &&
+      audit_status != "mismatch" &&
+      audit_chain_ok &&
+      batches_status != "mismatch"
     verify_status = if data_ok { "ok" } else { "fail" }
     close_log(src_log)
     close_log(rst_log)
@@ -4176,6 +4291,17 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
     (if spot_ok { "ok" } else { "fail" }),
   )
   println("config: " + config_status)
+  println(
+    "audit: files=" +
+    audit_files.to_string() +
+    " bytes=" +
+    audit_bytes.to_string() +
+    " status=" +
+    audit_status +
+    " chain=" +
+    (if audit_chain_ok { "ok" } else { "broken" }),
+  )
+  println("idempotency: batches=" + batches_status)
   println(
     "index: files=" +
     src_index_files.to_string() +

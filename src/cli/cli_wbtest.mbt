@@ -64,3 +64,86 @@ test "selfmon_window_boundary locates the in-window tail (6.4)" {
   }
   assert_eq(selfmon_window_boundary(spaced, 1001L), 0)
 }
+
+///|
+test "drill audit and batches reconciliation (6.5)" {
+  let bak = "/tmp/moonlog-wbtest-drill-bak"
+  let rst = "/tmp/moonlog-wbtest-drill-rst"
+  remove_tree(bak)
+  remove_tree(rst)
+  ignore(@backend_native.ensure_dir(bak))
+  ignore(@backend_native.ensure_dir(rst))
+  // No audit trail and no batch ledger on either side: absent.
+  assert_eq(drill_audit_check(bak, rst), "absent")
+  assert_eq(drill_batches_check(bak, rst), "absent")
+  assert_eq(drill_audit_stats(bak), (0, 0L))
+  // Identical audit set (live AUDIT + one rotation) on both sides: ok.
+  let row1 = b"{\"ts\":1,\"actor\":\"local\",\"action\":\"query\"}\n"
+  let row2 = b"{\"ts\":0,\"actor\":\"local\",\"action\":\"stats\"}\n"
+  @backend_native.write_file(bak + "/AUDIT", row1) catch {
+    _ => ()
+  }
+  @backend_native.write_file(bak + "/AUDIT.1", row2) catch {
+    _ => ()
+  }
+  @backend_native.write_file(rst + "/AUDIT", row1) catch {
+    _ => ()
+  }
+  @backend_native.write_file(rst + "/AUDIT.1", row2) catch {
+    _ => ()
+  }
+  assert_eq(drill_audit_check(bak, rst), "ok")
+  assert_eq(
+    drill_audit_stats(bak),
+    (2, (row1.length() + row2.length()).to_int64()),
+  )
+  // A rotation only the backup carries: mismatch (the history was lossy).
+  @backend_native.write_file(bak + "/AUDIT.2", b"{\"ts\":2}\n") catch {
+    _ => ()
+  }
+  assert_eq(drill_audit_check(bak, rst), "mismatch")
+  // A rewritten live trail: mismatch (byte-for-byte reconciliation).
+  @backend_native.write_file(rst + "/AUDIT", b"{\"ts\":9}\n") catch {
+    _ => ()
+  }
+  assert_eq(drill_audit_check(bak, rst), "mismatch")
+  // Batch ledger: identical on both sides is ok, one-sided is a mismatch.
+  @backend_native.write_file(bak + "/BATCHES", b"batch-77\n") catch {
+    _ => ()
+  }
+  @backend_native.write_file(rst + "/BATCHES", b"batch-77\n") catch {
+    _ => ()
+  }
+  assert_eq(drill_batches_check(bak, rst), "ok")
+  ignore(@backend_native.remove_file(rst + "/BATCHES"))
+  assert_eq(drill_batches_check(bak, rst), "mismatch")
+  remove_tree(bak)
+  remove_tree(rst)
+}
+
+///|
+test "drill audit chain walk flags a rewritten trail (6.5)" {
+  let dir = "/tmp/moonlog-wbtest-drill-chain"
+  remove_tree(dir)
+  // audit_log appends a linked trail: row N's prev is the CRC32 of row N-1.
+  audit_log(dir, "local", "query", "allow", "t1")
+  audit_log(dir, "local", "stats", "allow", "t2")
+  audit_log(dir, "local", "backup", "allow", "t3")
+  assert_eq(drill_audit_names(dir).length(), 1)
+  assert_true(drill_audit_chain_ok(dir))
+  // Rewriting the middle row keeps that row's own prev link valid but
+  // breaks the link of the row after it — exactly the tampering shape the
+  // chain exists to catch (row-level JSON checks stay green).
+  let data = @backend_native.read_file(dir + "/AUDIT")
+  let (rows, _) = split_complete_lines(data, true)
+  assert_eq(rows.length(), 3)
+  let mut tampered : Bytes = b""
+  for i in 0..<rows.length() {
+    tampered = tampered + rows[i] + (if i == 1 { b" " } else { b"" }) + b"\n"
+  }
+  @backend_native.write_file(dir + "/AUDIT", tampered) catch {
+    _ => ()
+  }
+  assert_false(drill_audit_chain_ok(dir))
+  remove_tree(dir)
+}
