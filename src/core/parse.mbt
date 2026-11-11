@@ -1,13 +1,33 @@
 ///|
-/// Parse space-separated `name=value` pairs from a log line. Empty segments
-/// and segments without `=` are skipped; only the first `=` in a segment
-/// separates the name from the value (values may contain further `=`).
+/// Parse space-separated `name=value` pairs from a log line (logfmt). Empty
+/// segments and segments without `=` are skipped; only the first `=` in a
+/// segment separates the name from the value (values may contain further `=`).
+/// A value may be double-quoted to carry spaces (`message="user login failed"`)
+/// — spaces inside quotes never split segments and `\"` / `\\` unescape to
+/// `"` / `\`. An unterminated quote keeps the rest of the line in the current
+/// segment.
 pub fn parse_kv_pairs(line : Bytes) -> Array[(Bytes, Bytes)] {
   let out : Array[(Bytes, Bytes)] = []
   let mut start = 0
   let mut i = 0
+  let mut in_quotes = false
   while i <= line.length() {
-    if i == line.length() || line.at(i).to_int() == 32 {
+    if i == line.length() {
+      if i > start {
+        match split_kv_segment(slice(line, start, i)) {
+          Some(pair) => out.push(pair)
+          None => ()
+        }
+      }
+      break
+    }
+    let c = line.at(i).to_int()
+    if c == 92 && i + 1 < line.length() && line.at(i + 1).to_int() == 34 {
+      // `\"` never opens or closes quoting: it stays inside the segment.
+      i = i + 1
+    } else if c == 34 {
+      in_quotes = !in_quotes
+    } else if !in_quotes && c == 32 {
       if i > start {
         match split_kv_segment(slice(line, start, i)) {
           Some(pair) => out.push(pair)
@@ -93,15 +113,58 @@ fn lower_ascii(b : Int32) -> Int32 {
 
 ///|
 /// Split one `name=value` segment; returns None when the segment has no `=`.
+/// A value wrapped in double quotes is unquoted with `\"` / `\\` unescaped
+/// (logfmt); a bare value is kept byte-exactly.
 fn split_kv_segment(seg : Bytes) -> (Bytes, Bytes)? {
   let mut i = 0
   while i < seg.length() {
     if seg.at(i).to_int() == 61 {
-      return Some((slice(seg, 0, i), slice(seg, i + 1, seg.length())))
+      let name = slice(seg, 0, i)
+      let raw = slice(seg, i + 1, seg.length())
+      if raw.length() >= 2 &&
+        raw.at(0).to_int() == 34 &&
+        raw.at(raw.length() - 1).to_int() == 34 {
+        return Some((name, kv_unquote(slice(raw, 1, raw.length() - 1))))
+      }
+      return Some((name, raw))
     }
     i = i + 1
   }
   None
+}
+
+///|
+/// Unescape `\"` to `"` and `\\` to `\` inside a quoted logfmt value. Values
+/// without a backslash are returned as-is (no copy).
+fn kv_unquote(inner : Bytes) -> Bytes {
+  let mut i = 0
+  let mut escaped = false
+  while i < inner.length() {
+    if inner.at(i).to_int() == 92 {
+      escaped = true
+      break
+    }
+    i = i + 1
+  }
+  if !escaped {
+    return inner
+  }
+  let buf = @buffer.Buffer::Buffer()
+  i = 0
+  while i < inner.length() {
+    let c = inner.at(i).to_int()
+    if c == 92 && i + 1 < inner.length() {
+      let next = inner.at(i + 1).to_int()
+      if next == 34 || next == 92 {
+        buf.write_byte(next.to_byte())
+        i = i + 2
+        continue
+      }
+    }
+    buf.write_byte(c.to_byte())
+    i = i + 1
+  }
+  buf.to_bytes()
 }
 
 ///|
@@ -125,7 +188,54 @@ pub fn shell_quote(s : String) -> String {
 ///|
 /// Severity rank for common log levels: debug=0, info=1, warn/warning=2,
 /// error/err=3, fatal=4. Unknown levels return -1 (never filtered by severity).
+/// Numeric level values follow the OTel severity_number bands (2.2):
+/// 1-8 → debug(0), 9-12 → info(1), 13-16 → warn(2), 17-20 → error(3),
+/// 21-24 → fatal(4); 0 and out-of-range numbers stay unknown (-1).
 pub fn level_rank(level : Bytes) -> Int32 {
+  let n = level.length()
+  if n >= 1 && n <= 2 {
+    let mut all_digits = true
+    let mut i = 0
+    while i < n {
+      let c = level.at(i).to_int()
+      if c < 48 || c > 57 {
+        all_digits = false
+        i = n
+      }
+      i = i + 1
+    }
+    if all_digits {
+      let v = if n == 1 {
+        level.at(0).to_int() - 48
+      } else {
+        (level.at(0).to_int() - 48) * 10 + (level.at(1).to_int() - 48)
+      }
+      if v >= 1 && v <= 24 {
+        if v <= 8 {
+          0
+        } else if v <= 12 {
+          1
+        } else if v <= 16 {
+          2
+        } else if v <= 20 {
+          3
+        } else {
+          4
+        }
+      } else {
+        -1
+      }
+    } else {
+      level_rank_name(level)
+    }
+  } else {
+    level_rank_name(level)
+  }
+}
+
+///|
+/// Named-level rank used by `level_rank` for non-numeric values.
+fn level_rank_name(level : Bytes) -> Int32 {
   if level == b"debug" {
     0
   } else if level == b"info" {

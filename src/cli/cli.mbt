@@ -303,6 +303,13 @@
 ///                                    --partition then roll partitions
 ///                                    automatically (explicit flags override)
 ///
+///   schema-policy <dir> [on|off] [--json]
+///                                    show or persist the directory-level
+///                                    unified-schema policy (2.2): ingest/fifo/
+///                                    http without --schema then normalize the
+///                                    six canonical fields automatically
+///                                    (--schema overrides, --no-schema opts out)
+///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
 /// CLI invocation never observes a half-written directory.
 type CliLog = @log.Log[
@@ -355,7 +362,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.4"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -493,6 +500,66 @@ fn save_partition_policy(dir : String, unit : String) -> Unit raise @io.IoError 
     dir + "/" + PARTITION_FILE,
     @utf8.encode(unit + "\n"),
   )
+}
+
+///|
+/// Directory-level unified-schema policy `<dir>/SCHEMA` (one line: on|off).
+/// Persisting it turns the 2.2 schema normalization on for every ingestion
+/// path (ingest/fifo/http) without repeating `--schema` — the cross-service
+/// field agreement lives in the directory, not in each agent's command line.
+/// An explicit `--schema` overrides it, `--no-schema` opts a single run out,
+/// and a missing or malformed file means off (safe fallback).
+const SCHEMA_FILE : String = "SCHEMA"
+
+///|
+fn load_schema_policy(dir : String) -> Bool {
+  let path = dir + "/" + SCHEMA_FILE
+  if !@backend_native.file_exists(path) {
+    return false
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  for line in lines {
+    if @utf8.decode_lossy(line).trim() == "on" {
+      return true
+    }
+  }
+  false
+}
+
+///|
+fn save_schema_policy(dir : String, on : Bool) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  @backend_native.write_file(
+    dir + "/" + SCHEMA_FILE,
+    @utf8.encode(if on { "on\n" } else { "off\n" }),
+  )
+}
+
+///|
+/// Show or set the directory-level unified-schema policy (`SCHEMA`). With no
+/// mode it prints the current policy; `on` persists normalization for later
+/// write commands (ingest/fifo/http without `--schema`), `off` clears it.
+fn cmd_schema_policy(
+  dir : String,
+  mode : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  match mode {
+    Some(m) => {
+      if m != "on" && m != "off" {
+        raise @io.IoError::Invalid("invalid schema policy: " + m + " (on|off)")
+      }
+      save_schema_policy(dir, m == "on")
+    }
+    None => ()
+  }
+  let on = load_schema_policy(dir)
+  if json {
+    println("{\"schema\":\"" + (if on { "on" } else { "off" }) + "\"}")
+  } else {
+    println("schema: " + (if on { "on" } else { "off" }) + " (dir " + dir + ")")
+  }
 }
 
 ///|
@@ -2506,6 +2573,7 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name == "TTL" ||
       name == "QUOTA" ||
       name == "PARTITION" ||
+      name == "SCHEMA" ||
       name == "AUDIT" ||
       name == "TTL_AUDIT" {
       out.push(name)
@@ -3227,7 +3295,9 @@ fn drill_sidecar_stats(dir : String) -> (Int32, Int64) {
 
 ///|
 fn drill_config_check(dir : String, rst : String) -> String {
-  let files = ["RBAC", "TTL", "QUOTA", "PARTITION", "SELFMON/thresholds"]
+  let files = [
+    "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "SELFMON/thresholds",
+  ]
   let mut result = "absent"
   for f in files {
     let src_has = @backend_native.file_exists(dir + "/" + f)
@@ -6585,15 +6655,19 @@ fn cmd_query(
                 None => ()
               }
               if hit {
-                let fields = @core.parse_kv_pairs(r.value)
+                // ctx_value_fields also flattens JSON values (2.1), so
+                // unified-schema filtering and range levels cover SDK-style
+                // JSON records (severity_text/service.name/...), not just
+                // `name=value` storage.
+                let fields = ctx_value_fields(r.value)
                 let mut lv : Bytes? = None
                 for pair in fields {
-                  if pair.0 == b"level" {
+                  if @core.canonical_field(pair.0) == 1 {
                     lv = Some(pair.1)
                   }
                 }
                 let lr = match lv {
-                  Some(l) => @core.level_rank(l)
+                  Some(l) => @core.level_rank(follow_lower_ascii(l))
                   None => -1
                 }
                 let ranged = match min_rank {
@@ -6718,15 +6792,17 @@ fn cmd_query(
           None => ()
         }
         if hit {
-          let fields = @core.parse_kv_pairs(rec.value)
+          // Same as the indexed path: flatten JSON values so unified-schema
+          // filtering and range levels cover SDK-style JSON records.
+          let fields = ctx_value_fields(rec.value)
           let mut lv : Bytes? = None
           for pair in fields {
-            if pair.0 == b"level" {
+            if @core.canonical_field(pair.0) == 1 {
               lv = Some(pair.1)
             }
           }
           let lr = match lv {
-            Some(l) => @core.level_rank(l)
+            Some(l) => @core.level_rank(follow_lower_ascii(l))
             None => -1
           }
           let ranged = match min_rank {
@@ -10214,9 +10290,9 @@ let audit_cmds : Array[String] = [
   "cursor-list", "stats", "partitions", "export", "export-jsonl", "archive", "backup",
   "drill", "purge", "delete", "prune", "prune-bytes", "prune-before", "prune-expired",
   "prune-superseded", "merge", "compact", "compact-expired", "compress", "tier",
-  "ttl-expire", "restore", "recover", "maintain", "rbac", "partition-policy", "ha-failover",
-  "ha-rebalance", "ha-status", "quota", "audit", "ttl-expire", "restore", "recover",
-  "maintain", "rbac",
+  "ttl-expire", "restore", "recover", "maintain", "rbac", "partition-policy", "schema-policy",
+  "ha-failover", "ha-rebalance", "ha-status", "quota", "audit", "ttl-expire", "restore",
+  "recover", "maintain", "rbac",
 ]
 
 ///|
@@ -11717,6 +11793,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       }
       cmd_partition_policy(args[2], unit, json)
     }
+  } else if cmd == "schema-policy" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut mode : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else {
+          mode = Some(a)
+        }
+        i = i + 1
+      }
+      cmd_schema_policy(args[2], mode, json)
+    }
   } else if cmd == "partitions" {
     if args.length() < 3 {
       println(USAGE)
@@ -11830,6 +11924,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut idempotent = false
       let mut dedup_field : String? = (None : String?)
       let mut schema = false
+      let mut no_schema = false
       let mut clock_skew : String? = (None : String?)
       let mut clock_skew_field : String? = (None : String?)
       let mut mask = false
@@ -11906,6 +12001,19 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--schema" {
           schema = true
+        } else if a == "--no-schema" {
+          no_schema = true
+        } else if a == "--clock-skew" && i + 1 < args.length() {
+          clock_skew = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--mask" {
+          mask = true
+        } else if a == "--meta" && i + 1 < args.length() {
+          meta_str = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--partition" && i + 1 < args.length() {
+          partition_str = Some(args[i + 1])
+          i = i + 1
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
@@ -11973,7 +12081,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         sampling,
         from_bytes,
-        schema,
+        // Explicit --schema wins, --no-schema opts out, and the persisted
+        // `SCHEMA` policy (schema-policy on) enables normalization by default
+        // for every write path.
+        schema: !no_schema && (schema || load_schema_policy(args[2])),
         clock_skew_ms: skew_ms,
         clock_skew_field_bytes: match clock_skew_field {
           Some(s) => Some(@utf8.encode(s))
@@ -12023,6 +12134,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut idempotent = false
       let mut dedup_field : String? = (None : String?)
       let mut schema = false
+      let mut no_schema = false
       let mut clock_skew : String? = (None : String?)
       let mut clock_skew_field : String? = (None : String?)
       let mut mask = false
@@ -12092,6 +12204,19 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--schema" {
           schema = true
+        } else if a == "--no-schema" {
+          no_schema = true
+        } else if a == "--clock-skew" && i + 1 < args.length() {
+          clock_skew = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--mask" {
+          mask = true
+        } else if a == "--meta" && i + 1 < args.length() {
+          meta_str = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--partition" && i + 1 < args.length() {
+          partition_str = Some(args[i + 1])
+          i = i + 1
         } else if a == "--clock-skew" && i + 1 < args.length() {
           clock_skew = Some(args[i + 1])
           i = i + 1
@@ -12150,7 +12275,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         sampling,
         from_bytes: None,
-        schema,
+        // Same policy merge as ingest: explicit flag, --no-schema opt-out,
+        // directory `SCHEMA` policy as the default.
+        schema: !no_schema && (schema || load_schema_policy(args[2])),
         clock_skew_ms: skew_ms,
         clock_skew_field_bytes: match clock_skew_field {
           Some(s) => Some(@utf8.encode(s))

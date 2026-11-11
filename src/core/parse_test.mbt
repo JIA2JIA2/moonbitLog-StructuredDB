@@ -24,6 +24,54 @@ test "parse_kv_pairs handles empty input and single segment" {
 }
 
 ///|
+test "parse_kv_pairs keeps quoted values intact (logfmt)" {
+  // A quoted value carries spaces without splitting segments.
+  let pairs = @core.parse_kv_pairs(b"message=\"user login failed\" host=n1")
+  assert_eq(pairs.length(), 2)
+  assert_eq(pairs[0], (b"message", b"user login failed"))
+  assert_eq(pairs[1], (b"host", b"n1"))
+  // Escaped quotes unescape to `"`; `=` inside quotes stays in the value.
+  let esc = @core.parse_kv_pairs(b"msg=\"say \\\"hi\\\" now\" k=a=b")
+  assert_eq(esc.length(), 2)
+  assert_eq(esc[0], (b"msg", b"say \"hi\" now"))
+  assert_eq(esc[1], (b"k", b"a=b"))
+  // Backslash escape.
+  let bs = @core.parse_kv_pairs(b"msg=\"back\\\\slash x\" tail=1")
+  assert_eq(bs[0], (b"msg", b"back\\slash x"))
+  assert_eq(bs[1], (b"tail", b"1"))
+  // Unterminated quote keeps the rest of the line in one segment.
+  let open = @core.parse_kv_pairs(b"msg=\"unclosed rest of line")
+  assert_eq(open.length(), 1)
+  assert_eq(open[0], (b"msg", b"\"unclosed rest of line"))
+  // Bare values (no quotes) are byte-exactly unchanged.
+  let bare = @core.parse_kv_pairs(b"level=error trace_id=t9")
+  assert_eq(bare[0], (b"level", b"error"))
+  assert_eq(bare[1], (b"trace_id", b"t9"))
+}
+
+///|
+test "level_rank maps numeric OTel severity bands" {
+  // 1-8 → debug, 9-12 → info, 13-16 → warn, 17-20 → error, 21-24 → fatal.
+  assert_eq(@core.level_rank(b"1"), 0)
+  assert_eq(@core.level_rank(b"8"), 0)
+  assert_eq(@core.level_rank(b"9"), 1)
+  assert_eq(@core.level_rank(b"12"), 1)
+  assert_eq(@core.level_rank(b"13"), 2)
+  assert_eq(@core.level_rank(b"16"), 2)
+  assert_eq(@core.level_rank(b"17"), 3)
+  assert_eq(@core.level_rank(b"20"), 3)
+  assert_eq(@core.level_rank(b"21"), 4)
+  assert_eq(@core.level_rank(b"24"), 4)
+  // 0 (undefined) and out-of-range numbers stay unknown.
+  assert_eq(@core.level_rank(b"0"), -1)
+  assert_eq(@core.level_rank(b"25"), -1)
+  assert_eq(@core.level_rank(b"100"), -1)
+  // Named levels still map through the string table.
+  assert_eq(@core.level_rank(b"warn"), 2)
+  assert_eq(@core.level_rank(b"nonsense"), -1)
+}
+
+///|
 test "bytes_contains finds substrings" {
   assert_true(@core.bytes_contains(b"hello world", b"world"))
   assert_true(@core.bytes_contains(b"hello world", b"lo wo"))

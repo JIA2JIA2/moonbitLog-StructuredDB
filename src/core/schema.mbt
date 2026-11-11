@@ -32,6 +32,7 @@ pub fn canonical_field(name : Bytes) -> Int32 {
   } else if s == b"level" ||
     s == b"severity" ||
     s == b"severitytext" ||
+    s == b"severitynumber" ||
     s == b"lvl" {
     1
   } else if s == b"service" ||
@@ -56,7 +57,7 @@ let ts_names : Array[Bytes] = [b"ts", b"timestamp", b"time"]
 
 ///|
 let level_names : Array[Bytes] = [
-  b"level", b"severity", b"severitytext", b"lvl",
+  b"level", b"severity", b"severitytext", b"severitynumber", b"lvl",
 ]
 
 ///|
@@ -122,10 +123,44 @@ pub fn schema_from_fields(
 }
 
 ///|
+/// Quote a field value for the canonical `name=value` serialization when it
+/// contains spaces (logfmt quoting): the value is wrapped in double quotes
+/// with embedded `"` escaped, so `parse_kv_pairs` reads the exact value back.
+/// Values without spaces stay bare.
+fn kv_quote_value(v : Bytes) -> Bytes {
+  let mut has_space = false
+  let mut i = 0
+  while i < v.length() {
+    if v.at(i).to_int() == 32 {
+      has_space = true
+      break
+    }
+    i = i + 1
+  }
+  if !has_space {
+    return v
+  }
+  let buf = @buffer.Buffer::Buffer()
+  buf.write_byte((34 : Byte))
+  i = 0
+  while i < v.length() {
+    let c = v.at(i).to_int()
+    if c == 34 || c == 92 {
+      buf.write_byte((92 : Byte))
+    }
+    buf.write_byte(c.to_byte())
+    i = i + 1
+  }
+  buf.write_byte((34 : Byte))
+  buf.to_bytes()
+}
+
+///|
 /// Canonical value for a schema record: the standard fields re-serialized in
 /// fixed order (level, host, trace_id, message) as a `name=value` string, so
 /// every service ingested with `--schema` has the same shape. Absent fields
-/// are skipped.
+/// are skipped; values containing spaces are logfmt-quoted so a re-parse
+/// round-trips.
 pub fn schema_value(f : SchemaFields) -> Bytes {
   let v = @buffer.Buffer::Buffer()
   let mut first = true
@@ -136,7 +171,7 @@ pub fn schema_value(f : SchemaFields) -> Bytes {
       }
       first = false
       v.write_bytes(b"level=")
-      v.write_bytes(l)
+      v.write_bytes(kv_quote_value(l))
     }
     None => ()
   }
@@ -147,7 +182,7 @@ pub fn schema_value(f : SchemaFields) -> Bytes {
       }
       first = false
       v.write_bytes(b"host=")
-      v.write_bytes(h)
+      v.write_bytes(kv_quote_value(h))
     }
     None => ()
   }
@@ -158,7 +193,7 @@ pub fn schema_value(f : SchemaFields) -> Bytes {
       }
       first = false
       v.write_bytes(b"trace_id=")
-      v.write_bytes(t)
+      v.write_bytes(kv_quote_value(t))
     }
     None => ()
   }
@@ -169,7 +204,7 @@ pub fn schema_value(f : SchemaFields) -> Bytes {
       }
       first = false
       v.write_bytes(b"message=")
-      v.write_bytes(m)
+      v.write_bytes(kv_quote_value(m))
     }
     None => ()
   }

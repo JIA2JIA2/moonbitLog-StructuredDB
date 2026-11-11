@@ -202,3 +202,82 @@ test "schema_matches compares values case-insensitively and level synonyms" {
     ),
   )
 }
+
+///|
+test "severity_number maps onto the level slot with OTel bands" {
+  // The field name squashes to a level alias.
+  assert_eq(@core.canonical_field(b"severity_number"), 1)
+  assert_eq(@core.canonical_field(b"SeverityNumber"), 1)
+  // Extraction keeps the raw numeric value; band matching turns it into a
+  // rank, so `severity_number=17` equals `error` but not `warn`.
+  let fields = @core.parse_kv_pairs(
+    b"severity_number=17 service=orders host=n1 trace_id=t9 message=boom",
+  )
+  let f = @core.schema_from_fields(fields, (0 : Int64))
+  match f.level {
+    Some(v) => assert_eq(v, b"17")
+    None => panic()
+  }
+  assert_true(
+    @core.schema_matches(
+      fields,
+      b"orders",
+      b"severity_number=17",
+      Some(b"error"),
+      None,
+      None,
+      None,
+      None,
+    ),
+  )
+  assert_true(
+    !@core.schema_matches(
+      fields,
+      b"orders",
+      b"severity_number=17",
+      Some(b"warn"),
+      None,
+      None,
+      None,
+      None,
+    ),
+  )
+}
+
+///|
+test "schema_value quotes values with spaces so re-parse round-trips" {
+  // A message with spaces is stored logfmt-quoted…
+  let f = @core.schema_from_fields(
+    @core.parse_kv_pairs(
+      b"level=error trace_id=t9 message=\"user login failed\"",
+    ),
+    (0 : Int64),
+  )
+  let v = @core.schema_value(f)
+  assert_eq(v, b"level=error trace_id=t9 message=\"user login failed\"")
+  // …and the stored value re-parses to the exact original message.
+  let back = @core.parse_kv_pairs(v)
+  let f2 = @core.schema_from_fields(back, (0 : Int64))
+  match f2.message {
+    Some(m) => assert_eq(m, b"user login failed")
+    None => panic()
+  }
+  // Embedded quotes and backslashes survive the round-trip too.
+  let f3 = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"message=\"say \\\"hi\\\" now\""),
+    (0 : Int64),
+  )
+  let v3 = @core.schema_value(f3)
+  assert_eq(v3, b"message=\"say \\\"hi\\\" now\"")
+  let back3 = @core.parse_kv_pairs(v3)
+  match @core.schema_from_fields(back3, (0 : Int64)).message {
+    Some(m) => assert_eq(m, b"say \"hi\" now")
+    None => panic()
+  }
+  // Values without spaces stay bare.
+  let f4 = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"message=boom"),
+    (0 : Int64),
+  )
+  assert_eq(@core.schema_value(f4), b"message=boom")
+}
