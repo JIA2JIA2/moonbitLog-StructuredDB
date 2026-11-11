@@ -77,11 +77,13 @@ test "quota_for_role prefers the exact role then default" {
     Some(r) => assert_eq(r.write_bytes, 20L)
     None => panic()
   }
-  // Unknown roles and anonymous callers fall back to the default rule.
+  // An identified role with no line of its own is unlimited — the anonymous
+  // `default` line must not throttle an operator's admin/other role.
   match @core.quota_for_role(rules, b"tenant-z") {
-    Some(r) => assert_eq(r.write_bytes, 10L)
-    None => panic()
+    Some(_) => panic()
+    None => ()
   }
+  // Anonymous callers (no RBAC / unmatched token) fall back to `default`.
   match @core.quota_for_role(rules, b"") {
     Some(r) => assert_eq(r.write_bytes, 10L)
     None => panic()

@@ -1186,6 +1186,7 @@ fn cmd_put(
           _ => ()
         }
         quota_record_write(dir, rule, incoming)
+        quota_charge_storage_keys(dir, [(kb, incoming)])
         println("offset " + off.to_string())
         @backend_native.flush_meta(dir, log)
       } else {
@@ -1288,6 +1289,11 @@ fn cmd_put_batch(
     let log = open_log_sync(dir, load_partition_policy(dir), batch_entry_sync())
     let offsets = log.append_batch(recs)
     quota_record_write(dir, rule, incoming)
+    let charge : Array[(Bytes, Int64)] = []
+    for r in recs {
+      charge.push((r.0, (r.0.length() + r.1.length()).to_int64()))
+    }
+    quota_charge_storage_keys(dir, charge)
     match batch_id {
       Some(bid) => record_batch_id(dir, ids, bid)
       None => ()
@@ -2211,6 +2217,8 @@ fn cmd_fsck(
         println("mode " + (if fast { "fast" } else { "full" }) + " (post-fix)")
         print_verify(report)
         close_log(log)
+        // 6.2: repair isolates/truncates segments, shrinking tenant scopes.
+        quota_recalc_storage_quiet(dir)
       }
     })
   } else {
@@ -2236,6 +2244,9 @@ fn cmd_prune(dir : String, keep : String) -> Unit raise @io.IoError {
     println("dropped " + dropped.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    // 6.2: dropped segments shrink every tenant scope's payload measure —
+    // refresh the ledgers so a stale (too-high) count cannot keep rejecting.
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2253,6 +2264,7 @@ fn cmd_prune_bytes(dir : String, max : String) -> Unit raise @io.IoError {
     println("dropped " + dropped.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2271,6 +2283,7 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
     println("dropped " + dropped.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2645,6 +2658,7 @@ fn cmd_prune_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
     println("dropped " + dropped.to_string())
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -2665,6 +2679,7 @@ fn cmd_prune_superseded(dir : String, dry_run : Bool) -> Unit raise @io.IoError 
       })
       println("dropped " + dropped.to_string())
       @backend_native.flush_meta(dir, log)
+      quota_recalc_storage_quiet(dir)
     }
     close_log(log)
   })
@@ -3708,6 +3723,10 @@ fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
     println("imported " + n.to_string() + " records")
     println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
+    // 6.2: imported records land inside tenant scopes without passing the
+    // write path, so refresh the storage ledgers right away instead of
+    // leaving them understated until the next compact.
+    quota_recalc_storage_quiet(dir)
   })
 }
 
@@ -4687,6 +4706,10 @@ fn cmd_follow(
   service : String?,
   flush : Bool,
 ) -> Unit raise @io.IoError {
+  // 6.2 tenant concurrency quota: a resident follower holds a process and a
+  // poll loop for as long as it runs, so it must count against the role's
+  // query-concurrent slots like any other query entry point.
+  acquire_tenant_query_quota(dir)
   let scope = active_scope(dir)
   let mut from : UInt64 = (0 : UInt64)
   if start == "tail" {
@@ -5539,6 +5562,7 @@ fn ingest_lines(
     let mut window_duplicates = 0
     let mut window_ts_fallback = 0
     let mut window_bytes : Int64 = 0
+    let window_charge : Array[(Bytes, Int64)] = []
     let window_dedup : Array[(UInt64, Bytes)] = []
     run_locked(dir, true, () => {
       // 6.2 write/storage quota: the pre-check runs inside the directory lock
@@ -5664,6 +5688,7 @@ fn ingest_lines(
                 window_ts_fallback = window_ts_fallback + 1
               }
               window_bytes = window_bytes + (k.length() + v.length()).to_int64()
+              window_charge.push((k, (k.length() + v.length()).to_int64()))
               match (dedup, uid) {
                 (Some(seen), Some(u)) => {
                   seen.set(u, true)
@@ -5681,6 +5706,7 @@ fn ingest_lines(
       close_log(log)
       dedup_append_entries(dir, window_dedup)
       quota_record_write(dir, rule, window_bytes)
+      quota_charge_storage_keys(dir, window_charge)
     })
     written = written + window_written
     sampled_out = sampled_out + window_sampled
@@ -6462,6 +6488,15 @@ fn handle_http_connection(
       }
       if http_queue_enqueue(q, kept, incoming) {
         quota_record_write(dir, rule, incoming)
+        // Charge tenant storage by data-scope ownership: parse each kept
+        // line's key (the drain re-parses anyway) and add the payload bytes
+        // to every tenant scope the keys land in, matching the recalc pass.
+        let charge : Array[(Bytes, Int64)] = []
+        for line in kept {
+          let (hk, hv, _) = parse_ingest_line(line, q.opts)
+          charge.push((hk, (hk.length() + hv.length()).to_int64()))
+        }
+        quota_charge_storage_keys(dir, charge)
         if batch_id_req.length() > 0 {
           record_batch_id(dir, q.batch_ids, batch_id_req)
         }
@@ -11317,6 +11352,10 @@ fn cmd_watch(
   snooze_until_s : String?,
   realert_sec_s : String?,
 ) -> Unit raise @io.IoError {
+  // 6.2 tenant concurrency quota: a resident watch re-evaluates every second
+  // (5.3) and buffers a whole window in memory, so it must count against the
+  // role's query-concurrent slots like the rest of the query entry points.
+  acquire_tenant_query_quota(dir)
   let scope = active_scope(dir)
   let threshold_n = @string.parse_int(threshold) catch {
     _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
@@ -12745,9 +12784,11 @@ fn quota_window_usage(dir : String, r : @core.QuotaRule) -> @core.QuotaUsage {
 }
 
 ///|
-/// Persist an admitted write's bytes into the role's window usage. Called
-/// only after the data is accepted, so rejected requests never consume
-/// budget; a spent budget survives restarts (usage lives on disk).
+/// Persist an admitted write's bytes into the invoking role's write-window
+/// usage (6.2). Called only after the data is accepted, so rejected requests
+/// never consume budget; a spent budget survives restarts (usage lives on
+/// disk). Tenant *storage* is charged separately by data-scope ownership —
+/// see `quota_charge_storage_keys`.
 fn quota_record_write(
   dir : String,
   rule : @core.QuotaRule?,
@@ -12756,15 +12797,6 @@ fn quota_record_write(
   let r = match rule {
     Some(r) => r
     None => return
-  }
-  // Tenant storage ledger: append-only payload bytes inside the role's scope.
-  if r.storage_bytes >= 0 {
-    let used = quota_storage_used(dir, r)
-    ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
-    @backend_native.write_file(
-      quota_storage_path(dir, r),
-      @utf8.encode("bytes=" + (used + incoming).to_string()),
-    )
   }
   if r.write_bytes < 0 {
     return
@@ -12777,6 +12809,94 @@ fn quota_record_write(
     used: usage.used + incoming,
   }
   @backend_native.write_file(path, @core.encode_quota_usage(updated))
+}
+
+///|
+/// Charge storage payload bytes to every tenant whose data scope owns the
+/// written keys (6.2 third pass): the storage ledger measures the bytes that
+/// live inside a scope regardless of which role appended them, which is the
+/// same measure the recalculation pass scans. The previous incremental path
+/// charged only the invoking role's own ledger, so an unscoped role's writes
+/// into a tenant prefix stayed invisible until the next compact/recalc made
+/// them jump in (ledger 11 → 20066 in the baseline smoke) — the two paths
+/// disagreed and the tenant quota could be bypassed between recalcs.
+fn quota_charge_storage_keys(
+  dir : String,
+  entries : Array[(Bytes, Int64)],
+) -> Unit raise @io.IoError {
+  if entries.length() == 0 {
+    return
+  }
+  let rules = load_quota_rules(dir)
+  let scoped : Array[@core.QuotaRule] = []
+  for r in rules {
+    if r.storage_bytes >= 0 {
+      scoped.push(r)
+    }
+  }
+  if scoped.length() == 0 {
+    return
+  }
+  let deltas : Array[Int64] = Array::make(scoped.length(), (0 : Int64))
+  let scopes : Array[Bytes?] = []
+  for r in scoped {
+    scopes.push(role_scope(dir, r.role))
+  }
+  for e in entries {
+    let mut s = 0
+    while s < scoped.length() {
+      // Overlapping scopes all charge (the recalc scans each scope
+      // independently, so this keeps the incremental measure aligned).
+      if scope_allows_key(scopes[s], e.0) {
+        deltas[s] = deltas[s] + e.1
+      }
+      s = s + 1
+    }
+  }
+  let mut s = 0
+  while s < scoped.length() {
+    if deltas[s] > (0 : Int64) {
+      let r = scoped[s]
+      let path = quota_storage_path(dir, r)
+      // Read the ledger directly: a missing ledger means the init scan in
+      // `quota_storage_used` would run *after* this run's records already
+      // landed, so the scan already includes this run's bytes and charging
+      // `deltas[s]` on top double-counted them (k1 was charged 2x in the
+      // smoke). A present ledger is pre-write state and takes the delta
+      // normally.
+      let data = @backend_native.read_file(path)
+      let mut cur : Int64 = -1
+      if data.length() > 0 {
+        for pair in @core.parse_kv_pairs(data) {
+          if pair.0 == b"bytes" {
+            let v = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+              _ => -1
+            }
+            if v >= (0 : Int64) {
+              cur = v
+            }
+          }
+        }
+      }
+      let final_val = if cur >= (0 : Int64) {
+        cur + deltas[s]
+      } else {
+        // Ledger missing: scan now (the writes are already on disk) and
+        // seed the ledger with that, without adding this run's delta.
+        tenant_storage_bytes(dir, scopes[s])
+      }
+      ignore(@backend_native.ensure_dir(dir + "/QUOTA_STATE"))
+      ignore(
+        @backend_native.write_file(
+          path,
+          @utf8.encode("bytes=" + final_val.to_string()),
+        ) catch {
+          _ => ()
+        },
+      )
+    }
+    s = s + 1
+  }
 }
 
 ///|
@@ -13212,17 +13332,64 @@ fn cmd_audit(
 }
 
 ///|
-fn cmd_quota(dir : String, recalc : Bool) -> Unit {
+fn cmd_quota(dir : String, recalc : Bool, json : Bool) -> Unit {
   if recalc {
     quota_recalc_storage(dir)
   }
   let rules = load_quota_rules(dir)
   if rules.length() == 0 {
+    if json {
+      println(
+        "{\"roles\":[],\"directory_payload_bytes\":" +
+        tenant_storage_bytes(dir, (None : Bytes?)).to_string() +
+        "}",
+      )
+      return
+    }
     println(
       "no quota policy: " +
       dir +
       "/QUOTA absent — per-tenant limits (write/storage/query-concurrent/retain-days) are disabled",
     )
+    return
+  }
+  if json {
+    // Machine-readable view: unlimited is -1, usage fields appear only for
+    // the dimensions the rule actually meters (same shape as the text lines).
+    let sb = StringBuilder()
+    sb.write_string("{\"roles\":[")
+    let mut first = true
+    for r in rules {
+      if !first {
+        sb.write_string(",")
+      }
+      first = false
+      sb.write_string(
+        "{\"role\":\"" + json_escape_str(bytes_to_string(r.role)) + "\"",
+      )
+      sb.write_string(",\"write_bytes\":" + r.write_bytes.to_string())
+      sb.write_string(",\"storage_bytes\":" + r.storage_bytes.to_string())
+      sb.write_string(",\"query_concurrent\":" + r.query_concurrent.to_string())
+      sb.write_string(",\"retain_days\":" + r.retain_days.to_string())
+      if r.write_bytes >= 0 {
+        sb.write_string(
+          ",\"used\":" + quota_window_usage(dir, r).used.to_string(),
+        )
+      }
+      if r.storage_bytes >= 0 {
+        sb.write_string(
+          ",\"storage_used\":" + quota_storage_used(dir, r).to_string(),
+        )
+      }
+      sb.write_string("}")
+    }
+    sb.write_string("]")
+    sb.write_string(
+      ",\"directory_payload_bytes\":" +
+      tenant_storage_bytes(dir, (None : Bytes?)).to_string() +
+      "}",
+    )
+    println(sb.to_string())
     return
   }
   for r in rules {
@@ -13537,6 +13704,16 @@ fn cmd_bench_write(
   } else {
     warmup_n
   }
+  // 6.2 third pass: the benchmark writes through its own append loop, not
+  // the quota-checked ingest paths — pre-check the estimated payload and
+  // record the actual bytes afterwards, or an open-mode `default` budget
+  // could be bypassed by a single bench run.
+  let rule = active_quota_rule(dir)
+  let per_record : Int64 = (prefix_bytes.length() + value.length() + 24).to_int64()
+  match quota_write_error(dir, rule, (total + warmup) * per_record) {
+    Some(msg) => raise @io.IoError::Invalid(msg)
+    None => ()
+  }
   let mut run_start = now_ms()
   let mut run_end = run_start
   run_locked(dir, true, () => {
@@ -13579,6 +13756,13 @@ fn cmd_bench_write(
     log.flush()
     @backend_native.flush_meta(dir, log)
     close_log(log)
+    quota_record_write(dir, rule, written * per_record)
+    quota_charge_storage_keys(dir, [
+      (
+        prefix_bytes,
+        written * (prefix_bytes.length() + value.length()).to_int64(),
+      ),
+    ])
   })
   let elapsed = run_end - run_start
   let flush_ms = now_ms() - run_end
@@ -15832,16 +16016,19 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
   } else if cmd == "quota" {
     let mut recalc = false
+    let mut json = false
     let mut i = 3
     while i < args.length() {
       if args[i] == "--recalc" {
         recalc = true
+      } else if args[i] == "--json" {
+        json = true
       } else {
         raise @io.IoError::Invalid("unknown quota option: " + args[i])
       }
       i = i + 1
     }
-    cmd_quota(args[2], recalc)
+    cmd_quota(args[2], recalc, json)
   } else if cmd == "drill" {
     let keep = args.length() > 3 && args[3] == "--keep"
     cmd_drill(args[2], keep)

@@ -122,20 +122,27 @@ pub fn parse_quota_line(line : Bytes) -> QuotaRule? {
 
 ///|
 /// Effective quota for `role`: the exact role's rule when present, otherwise
-/// the reserved `default` rule, otherwise no quota at all (None). An empty
-/// role name (anonymous callers) never matches a named rule and falls
-/// straight through to `default`.
+/// no quota at all — an identified role that has no QUOTA line is unlimited,
+/// so an operator's `admin` role is never throttled by the anonymous `default`
+/// line. The reserved `default` rule backs only callers with no resolved role
+/// (open mode without RBAC, or a token that matches no role). This keeps the
+/// tenant=key semantics of the QUOTA file: a role is metered only when a line
+/// names it.
 pub fn quota_for_role(rules : Array[QuotaRule], role : Bytes) -> QuotaRule? {
-  let mut default_rule : QuotaRule? = None
+  if role.length() > 0 {
+    for r in rules {
+      if r.role == role {
+        return Some(r)
+      }
+    }
+    return None
+  }
   for r in rules {
-    if r.role == role {
+    if r.role == b"default" {
       return Some(r)
     }
-    if r.role == b"default" {
-      default_rule = Some(r)
-    }
   }
-  default_rule
+  None
 }
 
 ///|
