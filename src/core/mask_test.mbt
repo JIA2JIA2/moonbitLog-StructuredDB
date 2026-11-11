@@ -120,3 +120,28 @@ test "mask_sensitive handles JSON fields and provider secret prefixes" {
     b"task=disk-usage-report-2026",
   )
 }
+
+///|
+test "mask_sensitive covers 18-digit numeric IDs and Luhn cards" {
+  // The common 18-digit national-ID shape whose check digit is a number
+  // (not X) — previously landed in plaintext.
+  assert_eq(
+    @core.mask_sensitive(b"id=110101199001011234", []),
+    b"id=110***********1234",
+  )
+  // A 16-digit run passing the Luhn checksum is a payment card.
+  assert_eq(
+    @core.mask_sensitive(b"card=4111111111111111", []),
+    b"card=411*********1111",
+  )
+  // A 16-digit run failing Luhn (e.g. an order id) stays intact.
+  assert_eq(
+    @core.mask_sensitive(b"order=1234567812345678", []),
+    b"order=1234567812345678",
+  )
+  // Inside JSON strings the same shapes are masked.
+  assert_eq(
+    @core.mask_sensitive(b"{\"card\":\"4111111111111111\"}", []),
+    b"{\"card\":\"411*********1111\"}",
+  )
+}

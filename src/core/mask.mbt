@@ -226,6 +226,29 @@ fn provider_secret_len(b : Bytes, i : Int32) -> Int32 {
 }
 
 ///|
+/// Luhn checksum (mod 10) over the digit run `[i, j)` — distinguishes real
+/// payment-card numbers from other 16-digit numeric runs (order ids, dates);
+/// a random digit string passes it with ~10% probability, the same order as
+/// the existing 15-digit ID trade-off.
+fn luhn_ok(value : Bytes, i : Int32, j : Int32) -> Bool {
+  let mut sum : Int64 = 0
+  let mut pos = 0
+  let mut k = j - 1
+  while k >= i {
+    let d = (value.at(k).to_int() - 48).to_int64()
+    if pos % 2 == 1 {
+      let dd = d * 2
+      sum = sum + (if dd > 9 { dd - 9 } else { dd })
+    } else {
+      sum = sum + d
+    }
+    pos = pos + 1
+    k = k - 1
+  }
+  sum % 10 == 0
+}
+
+///|
 /// Mask sensitive content in a log value before it is written (2.4). Single
 /// scan, no regex engine; every byte that is not part of a match is copied
 /// verbatim. A `name=value` segment whose field name is in the built-in
@@ -233,9 +256,12 @@ fn provider_secret_len(b : Bytes, i : Int32) -> Int32 {
 /// `extra` (ASCII case-insensitive) becomes `name=[REDACTED]`; `Bearer <t>`
 /// runs (token >= 8 chars) and JWT-shaped runs (`eyJ` prefix, two dots)
 /// become `[REDACTED]`; an 11-digit CN mobile number keeps 3+4 digits
-/// (`138****5678`); a 15-digit or 17-digit+X ID number keeps first 3 / last
-/// 4; a hex run of 20+ chars (md5/sha1/sha256 — UUID segments and epoch
-/// nanoseconds stay below the bar) becomes `[REDACTED]`.
+/// (`138****5678`); a 15-digit, 18-digit or 17-digit+X ID number keeps first
+/// 3 / last 4 (the 18-digit form covers check digits that are numbers, not
+/// X); a 16-digit numeric run passing the Luhn checksum is a payment card
+/// and keeps first 3 / last 4 too; a hex run of 20+ chars (md5/sha1/sha256 —
+/// UUID segments and epoch nanoseconds stay below the bar) becomes
+/// `[REDACTED]`.
 pub fn mask_sensitive(value : Bytes, extra : Array[Bytes]) -> Bytes {
   let out = @buffer.Buffer::Buffer()
   let len = value.length()
@@ -343,6 +369,12 @@ pub fn mask_sensitive(value : Bytes, extra : Array[Bytes]) -> Bytes {
           l == 17 &&
           j < len &&
           lower_byte(value.at(j).to_int()) == 120
+        // An 18-digit numeric run is the common national-ID shape whose
+        // check digit is a number, not X (17-digit+X only covers part).
+        let id18n = all_digit && l == 18
+        // A 16-digit numeric run passing the Luhn checksum is a payment
+        // card; non-card runs (order ids, dates) fail it and stay plain.
+        let card16 = all_digit && l == 16 && luhn_ok(value, i, j)
         if mobile {
           out.write_bytes(slice(value, i, i + 3))
           out.write_bytes(b"****")
@@ -363,6 +395,20 @@ pub fn mask_sensitive(value : Bytes, extra : Array[Bytes]) -> Bytes {
           out.write_bytes(slice(value, i + 14, i + 17))
           out.write_bytes(slice(value, j, j + 1))
           i = j + 1
+          continue
+        }
+        if id18n {
+          out.write_bytes(slice(value, i, i + 3))
+          out.write_bytes(b"***********")
+          out.write_bytes(slice(value, i + 14, j))
+          i = j
+          continue
+        }
+        if card16 {
+          out.write_bytes(slice(value, i, i + 3))
+          out.write_bytes(b"*********")
+          out.write_bytes(slice(value, i + 12, j))
+          i = j
           continue
         }
         if l >= 20 {
