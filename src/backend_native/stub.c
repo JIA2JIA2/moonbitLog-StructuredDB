@@ -650,3 +650,10 @@ MOONBIT_FFI_EXPORT
 int32_t moonlog_fflush_stdout(void) {
   return fflush(stdout);
 }
+
+MOONBIT_FFI_EXPORT
+void moonlog_exit_process(int32_t code) {
+  fflush(stdout);
+  fflush(stderr);
+  exit(code);
+}

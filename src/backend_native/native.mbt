@@ -95,6 +95,18 @@ pub fn flush_stdout() -> Unit {
 }
 
 ///|
+extern "C" fn moonlog_exit_process(code : Int32) -> Unit = "moonlog_exit_process"
+
+///|
+/// Terminate the CLI process with a non-zero exit status (4.3: rejected
+/// queries must be observable to shell pipelines). C stdout/stderr are
+/// flushed first so buffered error messages are not lost.
+pub fn exit_process(code : Int32) -> Unit {
+  ignore(moonlog_fflush_stdout())
+  moonlog_exit_process(code)
+}
+
+///|
 /// Try to acquire one query-concurrency slot (4.6): non-blocking exclusive
 /// flock on `<dir>/QLOCK.<i>` (the base `moonlog_flock` is already
 /// LOCK_NB). Returns the held fd, or -1 when the slot is busy; the caller

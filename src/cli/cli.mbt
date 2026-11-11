@@ -17,9 +17,12 @@
 ///   put-batch <dir> <k> <v> ...      append several key/value records at once
 ///   delete <dir> <key>               append a tombstone for a key
 ///   get <dir> <offset>               fetch one record by offset
-///   scan <dir> [from] [to]           list records in [from, to)
+///   scan <dir> [from] [to]           list records in [from, to); forced time
+///                                    range via --since/--until/--require-time
 ///   scan-prefix <dir> <prefix>       list live keys beginning with a prefix
+///                                    (forced time range --since/--until)
 ///   scan-range <dir> <lo> [hi]       list live keys in [lo, hi), hi optional
+///                                    (forced time range --since/--until)
 ///   scan-time <dir> <lo> <hi>        list records with timestamp in [lo, hi)
 ///   tail <dir> <n>                   list the most recent n records
 ///   recover <dir>                    open + recover, then report counts
@@ -296,7 +299,8 @@
 ///   getkey-live <dir> <key> <ttl>    fetch a value unless it has expired
 ///   has-key <dir> <key>              report presence via the segment Bloom filters
 ///   export <dir> <file>              write all records to a portable file
-///   export-jsonl <dir> <file> [base64]
+///   export-jsonl <dir> <file> [base64]  forced time range via --from/--until
+///                                    and --require-time
 ///                                    write records as JSON Lines with
 ///                                    filters --prefix/--match/--from/--until
 ///                                    --level/--service/--host/--trace-id;
@@ -1294,6 +1298,9 @@ fn cmd_scan(
   dir : String,
   from : String?,
   to : String?,
+  since : String?,
+  until : String?,
+  require_time : Bool,
 ) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
@@ -1305,17 +1312,36 @@ fn cmd_scan(
       Some(s) => parse_offset(s)
       None => log.next_offset()
     }
+    let (lo_ts, hi_ts) = scan_time_bounds("scan", since, until, require_time)
     // Streamed: large ranges never materialise in memory.
     let scope = active_scope(dir)
     let mut count = 0
-    log.for_each_while(lo, hi, rec => {
-      if !scope_allows_key(scope, rec.key) {
-        return true
-      }
-      print_record(rec)
-      count = count + 1
-      true
-    })
+    // 4.3: with time bounds over the whole offset range, walk by time so
+    // segments outside the window are skipped without decoding (pushdown).
+    let full_offset = from is None && to is None
+    let ts_bounded = lo_ts > 0 || hi_ts < TS_MAX
+    if full_offset && ts_bounded {
+      log.for_each_time_range(lo_ts, hi_ts, rec => {
+        if !scope_allows_key(scope, rec.key) {
+          return true
+        }
+        print_record(rec)
+        count = count + 1
+        true
+      })
+    } else {
+      log.for_each_while(lo, hi, rec => {
+        if !scope_allows_key(scope, rec.key) {
+          return true
+        }
+        if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
+          return true
+        }
+        print_record(rec)
+        count = count + 1
+        true
+      })
+    }
     println("(" + count.to_string() + " records)")
     close_log(log)
   })
@@ -1323,15 +1349,27 @@ fn cmd_scan(
 
 ///|
 /// List the latest live record for every key starting with `prefix`, sorted
-/// by key.
-fn cmd_scan_prefix(dir : String, prefix : String) -> Unit raise @io.IoError {
+/// by key. Forced time range (4.3): without `--since` the listing degrades to
+/// the default window; `--require-time` rejects the unbounded form and
+/// `--since 0` lists every live key regardless of age.
+fn cmd_scan_prefix(
+  dir : String,
+  prefix : String,
+  since : String?,
+  until : String?,
+  require_time : Bool,
+) -> Unit raise @io.IoError {
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let (lo_ts, hi_ts) = scan_time_bounds(
+      "scan-prefix", since, until, require_time,
+    )
     let scope = active_scope(dir)
     let recs = log.scan_prefix(@utf8.encode(prefix))
     let mut count = 0
     for rec in recs {
-      if scope_allows_key(scope, rec.key) {
+      if scope_allows_key(scope, rec.key) &&
+        scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
         print_record(rec)
         count = count + 1
       }
@@ -1343,11 +1381,15 @@ fn cmd_scan_prefix(dir : String, prefix : String) -> Unit raise @io.IoError {
 
 ///|
 /// List the latest live record for every key in the half-open range `[lo, hi)`,
-/// sorted by key. When `hi` is omitted the range is unbounded above.
+/// sorted by key. When `hi` is omitted the range is unbounded above. Forced
+/// time range (4.3) applies on top of the key range via `--since/--until`.
 fn cmd_scan_range(
   dir : String,
   lo : String,
   hi : String?,
+  since : String?,
+  until : String?,
+  require_time : Bool,
 ) -> Unit raise @io.IoError {
   let hi_bytes = match hi {
     Some(s) => @utf8.encode(s)
@@ -1355,11 +1397,15 @@ fn cmd_scan_range(
   }
   run_locked(dir, false, () => {
     let log = open_log(dir)
+    let (lo_ts, hi_ts) = scan_time_bounds(
+      "scan-range", since, until, require_time,
+    )
     let scope = active_scope(dir)
     let recs = log.scan_key_range(@utf8.encode(lo), hi_bytes)
     let mut count = 0
     for rec in recs {
-      if scope_allows_key(scope, rec.key) {
+      if scope_allows_key(scope, rec.key) &&
+        scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
         print_record(rec)
         count = count + 1
       }
@@ -3459,6 +3505,7 @@ fn cmd_export_jsonl(
   match_text : String?,
   from_ts : String?,
   until_ts : String?,
+  require_time : Bool,
   level : String?,
   service : String?,
   host : String?,
@@ -3498,24 +3545,12 @@ fn cmd_export_jsonl(
     service is Some(_) ||
     host is Some(_) ||
     trace is Some(_)
-  let from = match from_ts {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid --from: " + s)
-        },
-      )
-    None => None
-  }
-  let until = match until_ts {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid --until: " + s)
-        },
-      )
-    None => None
-  }
+  // Forced time range (4.3): without `--from` the export degrades to the
+  // default window (last 24h); `--from 0` is an explicit full-history
+  // export; `--require-time` rejects the unbounded form.
+  let (lo_ts, hi_ts) = scan_time_bounds(
+    "export-jsonl", from_ts, until_ts, require_time,
+  )
   run_locked(dir, false, () => {
     let log = open_log(dir)
     let scope = active_scope(dir)
@@ -3558,13 +3593,8 @@ fn cmd_export_jsonl(
         !@core.bytes_contains(rec.value, mb) {
         return true
       }
-      match from {
-        Some(f) => if rec.timestamp < f { return true }
-        None => ()
-      }
-      match until {
-        Some(u) => if rec.timestamp >= u { return true }
-        None => ()
+      if !scan_ts_allows(rec.timestamp, lo_ts, hi_ts) {
+        return true
       }
       buf.write_bytes(b"{\"offset\":")
       buf.write_bytes(@utf8.encode(rec.offset.to_string()))
@@ -7110,6 +7140,63 @@ fn query_window_ms() -> Int64 {
     Some(v) => @string.parse_int64(v) catch { _ => 86_400_000 }
     None => 86_400_000
   }
+}
+
+///|
+/// Sentinel upper bound meaning "no --until given".
+const TS_MAX : Int64 = 9223372036854775807L
+
+///|
+/// Whether a record timestamp passes the half-open `[lo, hi)` epoch-ms bounds
+/// of the 4.3 forced time range. `lo <= 0` and `hi >= TS_MAX` mean unbounded.
+fn scan_ts_allows(rec_ts : Int64, lo_ts : Int64, hi_ts : Int64) -> Bool {
+  (lo_ts <= 0 || rec_ts >= lo_ts) && (hi_ts >= TS_MAX || rec_ts < hi_ts)
+}
+
+///|
+/// 4.3 forced time range tri-state shared by the scan-family and
+/// export-jsonl: without an explicit `--since` the command degrades to the
+/// default window (last 24h, `MOONLOG_QUERY_WINDOW_MS`) instead of scanning
+/// unbounded; with `--require-time` such a scan is rejected outright;
+/// `--since 0` is an explicit full-history scan and bypasses both. Returns
+/// the half-open `[lo, hi)` epoch-ms bounds (`lo=0`/`hi=TS_MAX` = unbounded).
+fn scan_time_bounds(
+  cmd : String,
+  since : String?,
+  until : String?,
+  require_time : Bool,
+) -> (Int64, Int64) raise @io.IoError {
+  let lo : Int64 = match since {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid since: " + s)
+      }
+    None => {
+      if require_time {
+        raise @io.IoError::Invalid(
+          cmd +
+          " requires --since (unbounded scans are disabled by --require-time); pass --since 0 to scan everything explicitly",
+        )
+      }
+      let win = query_window_ms()
+      println(
+        "INFO " +
+        cmd +
+        " scoped to the last " +
+        (win / (1000 : Int64)).to_string() +
+        "s (default window; pass --since to override, --since 0 for everything)",
+      )
+      now_ms() - win
+    }
+  }
+  let hi : Int64 = match until {
+    Some(s) =>
+      @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid until: " + s)
+      }
+    None => TS_MAX
+  }
+  (lo, hi)
 }
 
 ///|
@@ -12648,21 +12735,90 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       cmd_get(args[2], args[3])
     }
   } else if cmd == "scan" {
-    let from = if args.length() > 3 { Some(args[3]) } else { None }
-    let to = if args.length() > 4 { Some(args[4]) } else { None }
-    cmd_scan(args[2], from, to)
+    let pos_args : Array[String] = []
+    let mut since : String? = (None : String?)
+    let mut until : String? = (None : String?)
+    let mut require_time = false
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--since" && i + 1 < args.length() {
+        since = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--until" && i + 1 < args.length() {
+        until = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--require-time" {
+        require_time = true
+      } else if a.length() > 0 && a[:1] == "-" {
+        raise @io.IoError::Invalid("unknown scan option: " + a)
+      } else {
+        pos_args.push(a)
+      }
+      i = i + 1
+    }
+    if pos_args.length() > 2 {
+      raise @io.IoError::Invalid("too many positional arguments for scan")
+    }
+    let from = if pos_args.length() > 0 { Some(pos_args[0]) } else { None }
+    let to = if pos_args.length() > 1 { Some(pos_args[1]) } else { None }
+    cmd_scan(args[2], from, to, since, until, require_time)
   } else if cmd == "scan-prefix" {
-    if args.length() < 4 {
+    let pos_args : Array[String] = []
+    let mut since : String? = (None : String?)
+    let mut until : String? = (None : String?)
+    let mut require_time = false
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--since" && i + 1 < args.length() {
+        since = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--until" && i + 1 < args.length() {
+        until = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--require-time" {
+        require_time = true
+      } else if a.length() > 0 && a[:1] == "-" {
+        raise @io.IoError::Invalid("unknown scan-prefix option: " + a)
+      } else {
+        pos_args.push(a)
+      }
+      i = i + 1
+    }
+    if pos_args.length() != 1 {
       println(USAGE)
     } else {
-      cmd_scan_prefix(args[2], args[3])
+      cmd_scan_prefix(args[2], pos_args[0], since, until, require_time)
     }
   } else if cmd == "scan-range" {
-    if args.length() < 4 {
+    let pos_args : Array[String] = []
+    let mut since : String? = (None : String?)
+    let mut until : String? = (None : String?)
+    let mut require_time = false
+    let mut i = 3
+    while i < args.length() {
+      let a = args[i]
+      if a == "--since" && i + 1 < args.length() {
+        since = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--until" && i + 1 < args.length() {
+        until = Some(args[i + 1])
+        i = i + 1
+      } else if a == "--require-time" {
+        require_time = true
+      } else if a.length() > 0 && a[:1] == "-" {
+        raise @io.IoError::Invalid("unknown scan-range option: " + a)
+      } else {
+        pos_args.push(a)
+      }
+      i = i + 1
+    }
+    if pos_args.length() < 1 || pos_args.length() > 2 {
       println(USAGE)
     } else {
-      let hi = if args.length() > 4 { Some(args[4]) } else { None }
-      cmd_scan_range(args[2], args[3], hi)
+      let hi = if pos_args.length() > 1 { Some(pos_args[1]) } else { None }
+      cmd_scan_range(args[2], pos_args[0], hi, since, until, require_time)
     }
   } else if cmd == "scan-time" {
     if args.length() < 5 {
@@ -14421,6 +14577,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut match_text : String? = (None : String?)
       let mut from_ts : String? = (None : String?)
       let mut until_ts : String? = (None : String?)
+      let mut require_time = false
       let mut level : String? = (None : String?)
       let mut service : String? = (None : String?)
       let mut host : String? = (None : String?)
@@ -14452,6 +14609,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--trace-id" && i + 1 < args.length() {
           trace = Some(args[i + 1])
           i = i + 1
+        } else if a == "--require-time" {
+          require_time = true
         } else if a == "text" || a == "base64" {
           mode = a
         } else {
@@ -14467,6 +14626,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         match_text,
         from_ts,
         until_ts,
+        require_time,
         level,
         service,
         host,
@@ -15106,28 +15266,33 @@ fn main {
   let args = @env.args()
   dispatch(args) catch {
     @io.IoError::Closed => {
-      println("error: io closed")
+      eprintln("error: io closed")
       selfmon_report_error(args, "io closed")
+      @backend_native.exit_process(1)
     }
     @io.IoError::OutOfBounds(o) => {
-      println("error: out of bounds " + o.to_string())
+      eprintln("error: out of bounds " + o.to_string())
       selfmon_report_error(args, "out of bounds " + o.to_string())
+      @backend_native.exit_process(1)
     }
     @io.IoError::Corrupt(o) => {
-      println("error: corrupt at " + o.to_string())
+      eprintln("error: corrupt at " + o.to_string())
       selfmon_report_error(args, "corrupt at " + o.to_string())
+      @backend_native.exit_process(1)
     }
     @io.IoError::Syscall(c) => {
-      println("error: syscall " + c.to_string())
+      eprintln("error: syscall " + c.to_string())
       selfmon_report_error(args, "syscall " + c.to_string())
+      @backend_native.exit_process(1)
     }
     @io.IoError::Invalid(m) => {
-      println("error: " + m)
+      eprintln("error: " + m)
       // Quota rejections (6.2) are expected tenant behavior, not store
       // breakage — keep them out of the failure-rate gauge.
       if !@core.bytes_contains(@utf8.encode(m), b"quota exceeded") {
         selfmon_report_error(args, m)
       }
+      @backend_native.exit_process(1)
     }
   }
 }
