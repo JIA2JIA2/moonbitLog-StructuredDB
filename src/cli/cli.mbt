@@ -8387,6 +8387,15 @@ fn pct_of(sorted : Array[Double], q : Double) -> Double {
 }
 
 ///|
+/// Percent for the dashboard text panel: raw Double toString prints long
+/// fractions (`30.76923076923077%`), which is unreadable on a wallboard.
+/// Round to two decimals.
+fn fmt_pct(v : Double) -> String {
+  let r = (v * 100.0 + 0.5).to_int().to_double() / 100.0
+  r.to_string()
+}
+
+///|
 /// Multi-dimensional count/quantile aggregation (5.1). Group dimensions are
 /// record key/value/kind/UTC hour/key prefix or a value field (`--kv-field`,
 /// KV or JSON-flattened). `--quantile` adds per-bucket count/min/avg/
@@ -8788,7 +8797,14 @@ fn sorted_latency(vals : Array[Double]?) -> Array[Double] {
 /// objects (2.1 flattening), so SDK-appended structured logs work; error =
 /// severity rank >= 3 from a recognized level field (case-insensitive), or —
 /// only when no level field exists — a literal "error" substring (avoids the
-/// old false positive on `{"level":"INFO","msg":"no error"}`).
+/// old false positive on `{"level":"INFO","msg":"no error"}`). The panel
+/// calls out the worst windows: a `peak errors` line (highest per-bucket
+/// error rate) and a `peak latency p95` line, both with **record-level
+/// --since/--until bounds** repeated in the drill-down hint — the operator
+/// copies them instead of converting bucket labels to epoch ms; the JSON
+/// summary carries the same bounds (`peak`/`latency_peak`). Percentages print
+/// rounded to two decimals on the text panel; per-bucket/dimension samples
+/// are sorted once and shared across renderers.
 fn cmd_dashboard(
   dir : String,
   last_sec : String,
@@ -8899,6 +8915,13 @@ fn cmd_dashboard(
     )
     let bucket_lat : @hashmap.HashMap[String, Array[Double]] = @hashmap.HashMap::HashMap([],
     )
+    // Per-bucket record time bounds: the peak drill-down hint carries the
+    // concrete --since/--until values so the operator can copy them directly
+    // instead of converting bucket labels to epoch ms by hand.
+    let bucket_first_ts : @hashmap.HashMap[String, Int64] = @hashmap.HashMap::HashMap([],
+    )
+    let bucket_last_ts : @hashmap.HashMap[String, Int64] = @hashmap.HashMap::HashMap([],
+    )
     let dim_total : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
     let dim_err : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
     let dim_lat : @hashmap.HashMap[Bytes, Array[Double]] = @hashmap.HashMap::HashMap([],
@@ -8956,6 +8979,20 @@ fn cmd_dashboard(
         total = total + 1
         let label = @core.format_utc(rec.timestamp, bucket)
         bump_string(bucket_total, label)
+        match bucket_first_ts.get(label) {
+          Some(v) =>
+            if rec.timestamp < v {
+              bucket_first_ts.set(label, rec.timestamp)
+            }
+          None => bucket_first_ts.set(label, rec.timestamp)
+        }
+        match bucket_last_ts.get(label) {
+          Some(v) =>
+            if rec.timestamp > v {
+              bucket_last_ts.set(label, rec.timestamp)
+            }
+          None => bucket_last_ts.set(label, rec.timestamp)
+        }
         let level_v = ctx_field_from_pairs(fields, level_names)
         let is_err = match level_v {
           Some(l) => @core.level_rank(follow_lower_ascii(l)) >= 3
@@ -9025,18 +9062,66 @@ fn cmd_dashboard(
     labels.sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
     let mut max_total : Int32 = 0
     let mut max_p95 : Double = 0.0
+    // Sort each bucket once; the JSON/text renderers re-use this instead of
+    // re-sorting the same samples on every pass.
+    let bucket_sorted : @hashmap.HashMap[String, Array[Double]] = @hashmap.HashMap::HashMap([],
+    )
+    // Peak buckets: the worst error-rate and the worst p95 windows, with
+    // their record-level time bounds so the drill-down hint carries concrete
+    // --since/--until values (the operator used to convert bucket labels to
+    // epoch ms by hand).
+    let mut peak_err_label : String = ""
+    let mut peak_err_rate : Double = -1.0
+    let mut peak_p95_label : String = ""
+    let mut peak_p95 : Double = -1.0
     for label in labels {
       match bucket_total.get(label) {
         Some(c) => if c > max_total { max_total = c }
         None => ()
       }
       let lat = sorted_latency(bucket_lat.get(label))
+      bucket_sorted.set(label, lat)
       if lat.length() > 0 {
         let p = pct_of(lat, 0.95)
         if p > max_p95 {
           max_p95 = p
         }
+        if p > peak_p95 {
+          peak_p95 = p
+          peak_p95_label = label
+        }
       }
+      let t = match bucket_total.get(label) {
+        Some(c) => c
+        None => 0
+      }
+      let e = match bucket_err.get(label) {
+        Some(c) => c
+        None => 0
+      }
+      if t > 0 {
+        let rate = e.to_double() * 100.0 / t.to_double()
+        if rate > peak_err_rate {
+          peak_err_rate = rate
+          peak_err_label = label
+        }
+      }
+    }
+    let peak_err_since : Int64 = match bucket_first_ts.get(peak_err_label) {
+      Some(v) => v
+      None => 0
+    }
+    let peak_err_until : Int64 = match bucket_last_ts.get(peak_err_label) {
+      Some(v) => v
+      None => 0
+    }
+    let peak_p95_since : Int64 = match bucket_first_ts.get(peak_p95_label) {
+      Some(v) => v
+      None => 0
+    }
+    let peak_p95_until : Int64 = match bucket_last_ts.get(peak_p95_label) {
+      Some(v) => v
+      None => 0
     }
     let err_rate : Double = if total > 0 {
       errors.to_double() * 100.0 / total.to_double()
@@ -9053,10 +9138,14 @@ fn cmd_dashboard(
     }
     let dim_top = top_counts(dim_items, top_n)
     let mut max_dim : Int32 = 0
+    // Sort each dimension's samples once; JSON and text renderers share it.
+    let dim_sorted : @hashmap.HashMap[Bytes, Array[Double]] = @hashmap.HashMap::HashMap([],
+    )
     for item in dim_top {
       if item.1 > max_dim {
         max_dim = item.1
       }
+      dim_sorted.set(item.0, sorted_latency(dim_lat.get(item.0)))
     }
     if json {
       let mut s = "{\"dir\":\"" +
@@ -9087,7 +9176,10 @@ fn cmd_dashboard(
         } else {
           0.0
         }
-        let lat = sorted_latency(bucket_lat.get(label))
+        let lat = match bucket_sorted.get(label) {
+          Some(a) => a
+          None => []
+        }
         let ln = lat.length()
         if !first {
           s = s + ","
@@ -9124,6 +9216,40 @@ fn cmd_dashboard(
         ",\"services\":" +
         svc_counts.length().to_string() +
         "}"
+      if peak_err_label != "" {
+        let pe = match bucket_err.get(peak_err_label) {
+          Some(c) => c
+          None => 0
+        }
+        let pt = match bucket_total.get(peak_err_label) {
+          Some(c) => c
+          None => 0
+        }
+        s = s +
+          ",\"peak\":{\"window\":\"" +
+          peak_err_label +
+          "\",\"total\":" +
+          pt.to_string() +
+          ",\"errors\":" +
+          pe.to_string() +
+          ",\"since\":" +
+          peak_err_since.to_string() +
+          ",\"until\":" +
+          peak_err_until.to_string() +
+          "}"
+      }
+      if qfield is Some(_) && peak_p95_label != "" {
+        s = s +
+          ",\"latency_peak\":{\"window\":\"" +
+          peak_p95_label +
+          "\",\"p95\":" +
+          peak_p95.to_string() +
+          ",\"since\":" +
+          peak_p95_since.to_string() +
+          ",\"until\":" +
+          peak_p95_until.to_string() +
+          "}"
+      }
       match qfield {
         Some(qf) => {
           qvals
@@ -9169,7 +9295,10 @@ fn cmd_dashboard(
         } else {
           0.0
         }
-        let dlat = sorted_latency(dim_lat.get(item.0))
+        let dlat = match dim_sorted.get(item.0) {
+          Some(a) => a
+          None => []
+        }
         let dn = dlat.length()
         if !first_dim {
           s = s + ","
@@ -9250,7 +9379,7 @@ fn cmd_dashboard(
           "  err=" +
           e.to_string() +
           " (" +
-          rate.to_string() +
+          fmt_pct(rate) +
           "%)  |" +
           bar,
         )
@@ -9261,15 +9390,48 @@ fn cmd_dashboard(
         " errors=" +
         errors.to_string() +
         " err_rate=" +
-        err_rate.to_string() +
+        fmt_pct(err_rate) +
         "% services=" +
         svc_counts.length().to_string(),
       )
+      if peak_err_label != "" {
+        let pe = match bucket_err.get(peak_err_label) {
+          Some(c) => c
+          None => 0
+        }
+        let pt = match bucket_total.get(peak_err_label) {
+          Some(c) => c
+          None => 0
+        }
+        let prate = if pt > 0 {
+          pe.to_double() * 100.0 / pt.to_double()
+        } else {
+          0.0
+        }
+        println(
+          "peak errors: " +
+          peak_err_label +
+          " err=" +
+          pe.to_string() +
+          " (" +
+          fmt_pct(prate) +
+          "% of " +
+          pt.to_string() +
+          ")  [drill: --since " +
+          peak_err_since.to_string() +
+          " --until " +
+          peak_err_until.to_string() +
+          "]",
+        )
+      }
       match qfield {
         Some(qf) => {
           println("latency trend (" + bytes_to_string(qf) + ", p95 bars):")
           for label in labels {
-            let lat = sorted_latency(bucket_lat.get(label))
+            let lat = match bucket_sorted.get(label) {
+              Some(a) => a
+              None => []
+            }
             let n = lat.length()
             if n > 0 {
               let p95 = pct_of(lat, 0.95)
@@ -9303,6 +9465,19 @@ fn cmd_dashboard(
                 bar,
               )
             }
+          }
+          if peak_p95_label != "" {
+            println(
+              "peak latency p95: " +
+              peak_p95_label +
+              " p95=" +
+              peak_p95.to_string() +
+              "  [drill: --since " +
+              peak_p95_since.to_string() +
+              " --until " +
+              peak_p95_until.to_string() +
+              "]",
+            )
           }
           qvals
           .mut_view()
@@ -9357,7 +9532,10 @@ fn cmd_dashboard(
         } else {
           0.0
         }
-        let dlat = sorted_latency(dim_lat.get(item.0))
+        let dlat = match dim_sorted.get(item.0) {
+          Some(a) => a
+          None => []
+        }
         let dn = dlat.length()
         let p95 = if dn > 0 { pct_of(dlat, 0.95) } else { 0.0 }
         let bars = if max_dim > 0 {
@@ -9387,16 +9565,30 @@ fn cmd_dashboard(
           " err=" +
           de.to_string() +
           " (" +
-          drate.to_string() +
+          fmt_pct(drate) +
           "%)" +
           lat_part +
           "  |" +
           bar,
         )
       }
-      println(
-        "(drill-down: --since/--until <ms> --bucket minute, then trend/query/context)",
-      )
+      if peak_err_label != "" {
+        println(
+          "(drill-down: peak errors at " +
+          peak_err_label +
+          " → --since " +
+          peak_err_since.to_string() +
+          " --until " +
+          peak_err_until.to_string() +
+          " --bucket " +
+          bucket +
+          ", then trend/query/context)",
+        )
+      } else {
+        println(
+          "(drill-down: --since/--until <ms> --bucket minute, then trend/query/context)",
+        )
+      }
     }
   })
 }
