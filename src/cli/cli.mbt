@@ -297,11 +297,14 @@
 ///   partitions <dir> [--unit day|hour] [--json]
 ///                                    group segments by event-time partition
 ///                                    bucket (segment count/records/bytes/UTC span)
-///   partition-policy <dir> [day|hour|off] [--json]
+///   partition-policy <dir> [day|hour|off] [--roll-size N] [--json]
 ///                                    show or persist the directory-level
 ///                                    partition policy: write commands without
 ///                                    --partition then roll partitions
-///                                    automatically (explicit flags override)
+///                                    automatically (explicit flags override);
+///                                    --roll-size sets the segment size every
+///                                    write path rolls at (3.1: single-partition
+///                                    size is controllable; default 1 MiB)
 ///
 ///   schema-policy <dir> [on|off] [--json]
 ///                                    show or persist the directory-level
@@ -494,12 +497,79 @@ fn load_partition_policy(dir : String) -> Int64 {
 }
 
 ///|
-fn save_partition_policy(dir : String, unit : String) -> Unit raise @io.IoError {
+/// Directory-level roll size from the `PARTITION` file's optional second
+/// line (`roll <bytes>`, 3.1 "single-partition size is controllable").
+/// Every write path opens the log through `open_log_sync`, so one persisted
+/// value governs segment size everywhere without repeating `--roll-size`.
+/// 0/absent means the built-in default (1 MiB).
+fn load_roll_size(dir : String) -> Int64 {
+  let path = dir + "/" + PARTITION_FILE
+  if !@backend_native.file_exists(path) {
+    return (0 : Int64)
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  let mut unit_seen = false
+  for line in lines {
+    let s = @utf8.decode_lossy(line).trim()
+    if s.length() == 0 {
+      continue
+    }
+    if s == "day" || s == "hour" || s == "off" {
+      unit_seen = true
+      continue
+    }
+    // `roll <bytes>` (byte-level prefix check: 'r','o','l','l',' ').
+    if line.length() > 5 &&
+      line.at(0).to_int() == 114 &&
+      line.at(1).to_int() == 111 &&
+      line.at(2).to_int() == 108 &&
+      line.at(3).to_int() == 108 &&
+      line.at(4).to_int() == 32 {
+      let v = @string.parse_int64(
+        @utf8.decode_lossy(@core.slice(line, 5, line.length())),
+      ) catch {
+        _ => (0 : Int64)
+      }
+      if v > 0 {
+        return v
+      }
+      return 0
+    }
+    // First non-unit line without a `roll` prefix: the file is a bare unit
+    // written by an older version — stop scanning.
+    if unit_seen {
+      return 0
+    }
+  }
+  0
+}
+
+///|
+/// Effective roll size for `dir`: the persisted `roll <bytes>` line when
+/// present, else the built-in default.
+fn effective_roll_size(dir : String) -> Int64 {
+  let v = load_roll_size(dir)
+  if v > 0 {
+    v
+  } else {
+    ROLL_SIZE
+  }
+}
+
+///|
+fn save_partition_policy(
+  dir : String,
+  unit : String,
+  roll : Int64,
+) -> Unit raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
-  @backend_native.write_file(
-    dir + "/" + PARTITION_FILE,
-    @utf8.encode(unit + "\n"),
-  )
+  let body = if roll > 0 {
+    unit + "\nroll " + roll.to_string() + "\n"
+  } else {
+    unit + "\n"
+  }
+  @backend_native.write_file(dir + "/" + PARTITION_FILE, @utf8.encode(body))
 }
 
 ///|
@@ -571,7 +641,9 @@ fn open_log_sync(
   ignore(@backend_native.ensure_dir(dir))
   let log = @backend_native.open_log_dir(
     dir,
-    ROLL_SIZE,
+    // 3.1: the persisted `roll <bytes>` line governs segment size for every
+    // write path; absent, the built-in default applies.
+    effective_roll_size(dir),
     sync=policy,
     partition_ms=partition,
   )
@@ -1206,6 +1278,7 @@ struct PartitionStat {
 fn cmd_partition_policy(
   dir : String,
   unit : String?,
+  roll_size : String?,
   json : Bool,
 ) -> Unit raise @io.IoError {
   match unit {
@@ -1215,15 +1288,52 @@ fn cmd_partition_policy(
           "invalid partition: " + u + " (day|hour|off)",
         )
       }
-      save_partition_policy(dir, u)
+      save_partition_policy(dir, u, requested_roll_size(roll_size))
     }
-    None => ()
+    None =>
+      // Unit stays as persisted; an explicit --roll-size still updates it.
+      match roll_size {
+        Some(_) => {
+          let u = partition_unit_name(load_partition_policy(dir))
+          save_partition_policy(dir, u, requested_roll_size(roll_size))
+        }
+        None => ()
+      }
   }
   let name = partition_unit_name(load_partition_policy(dir))
+  let roll = effective_roll_size(dir)
   if json {
-    println("{\"partition\":\"" + name + "\"}")
+    println(
+      "{\"partition\":\"" + name + "\",\"roll_size\":" + roll.to_string() + "}",
+    )
   } else {
-    println("partition: " + name + " (dir " + dir + ")")
+    println(
+      "partition: " +
+      name +
+      ", roll-size " +
+      roll.to_string() +
+      " bytes (dir " +
+      dir +
+      ")",
+    )
+  }
+}
+
+///|
+/// Parse an explicit `--roll-size <bytes>` (positive integer). Returns 0 to
+/// keep the persisted/default size.
+fn requested_roll_size(s : String?) -> Int64 raise @io.IoError {
+  match s {
+    Some(v) => {
+      let n = @string.parse_int64(v) catch {
+        _ => raise @io.IoError::Invalid("invalid roll-size: " + v)
+      }
+      if n <= 0 {
+        raise @io.IoError::Invalid("invalid roll-size: " + v + " (must be > 0)")
+      }
+      n
+    }
+    None => 0
   }
 }
 
@@ -11820,18 +11930,24 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut unit : String? = (None : String?)
+      let mut roll_size : String? = (None : String?)
       let mut json = false
       let mut i = 3
       while i < args.length() {
         let a = args[i]
         if a == "--json" {
           json = true
+        } else if a == "--roll-size" && i + 1 < args.length() {
+          roll_size = Some(args[i + 1])
+          i = i + 1
         } else if a == "day" || a == "hour" || a == "off" {
           unit = Some(a)
+        } else {
+          raise @io.IoError::Invalid("unknown partition-policy argument: " + a)
         }
         i = i + 1
       }
-      cmd_partition_policy(args[2], unit, json)
+      cmd_partition_policy(args[2], unit, roll_size, json)
     }
   } else if cmd == "schema-policy" {
     if args.length() < 3 {
