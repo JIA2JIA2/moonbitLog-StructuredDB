@@ -720,10 +720,20 @@ fn save_tier_policy(
   ignore(@backend_native.ensure_dir(dir))
   let body = if cold_dir == "off" || cold_dir.length() == 0 {
     "off\n"
-  } else if warm > 0 {
-    cold_dir + "\nwarm " + warm.to_string() + "\n"
   } else {
-    cold_dir + "\n"
+    // warm < 0 (no --warm given) keeps the persisted count — or the load
+    // default of 1 when the policy file does not exist yet. An explicit
+    // count, including 0, is written verbatim: a `warm 0` line is what
+    // makes `tier_log_dir` move every rolled segment to the cold tier.
+    let effective = if warm >= 0 {
+      warm
+    } else if @backend_native.file_exists(dir + "/" + TIER_FILE) {
+      let (_, existing) = load_tier_policy(dir)
+      existing
+    } else {
+      1
+    }
+    cold_dir + "\nwarm " + effective.to_string() + "\n"
   }
   @backend_native.write_file(dir + "/" + TIER_FILE, @utf8.encode(body))
 }
@@ -767,7 +777,9 @@ fn cmd_tier_policy(
 }
 
 ///|
-/// Parse an explicit `--warm <N>` (>= 0); 0 keeps the persisted value.
+/// Parse an explicit `--warm <N>` (>= 0); absent keeps the persisted value
+/// (sentinel -1). An explicit 0 is a real value — every rolled segment
+/// tiers to cold — not "keep whatever was there".
 fn requested_warm(s : String?) -> Int64 raise @io.IoError {
   match s {
     Some(v) => {
@@ -781,7 +793,7 @@ fn requested_warm(s : String?) -> Int64 raise @io.IoError {
       }
       n
     }
-    None => 0
+    None => -1
   }
 }
 

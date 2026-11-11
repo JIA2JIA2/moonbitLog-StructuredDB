@@ -216,3 +216,28 @@ test "restore gates on manifest-declared segments (6.5)" {
   remove_tree(bak)
   remove_tree(rst)
 }
+
+///|
+test "tier policy roundtrips an explicit warm 0 (M214)" {
+  let dir = "/tmp/moonlog-wbtest-tier-warm0"
+  remove_tree(dir)
+  ignore(@backend_native.ensure_dir(dir))
+  let cold = "/tmp/moonlog-wbtest-tier-warm0-cold"
+  // First setup without --warm: load default of 1 (backwards compatible).
+  save_tier_policy(dir, cold, requested_warm((None : String?)))
+  assert_eq(load_tier_policy(dir), (cold, 1L))
+  // An explicit --warm 0 must persist as 0 — the old save dropped the
+  // second line at 0, silently degrading every rolled segment to warm.
+  save_tier_policy(dir, cold, requested_warm(Some("0")))
+  assert_eq(load_tier_policy(dir), (cold, 0L))
+  // Updating without --warm keeps the persisted 0.
+  save_tier_policy(dir, cold, requested_warm((None : String?)))
+  assert_eq(load_tier_policy(dir), (cold, 0L))
+  // Explicit positive values and the off reset keep working.
+  save_tier_policy(dir, cold, requested_warm(Some("3")))
+  assert_eq(load_tier_policy(dir), (cold, 3L))
+  save_tier_policy(dir, "off", requested_warm(Some("0")))
+  assert_eq(load_tier_policy(dir), ("", 0L))
+  remove_tree(dir)
+  remove_tree(cold)
+}
