@@ -235,8 +235,12 @@
 ///                                    to segments; shares the query guards and
 ///                                    scans without the writer lock
 ///   trend <dir> [--bucket minute|hour|day] [--match <text>] [--width N]
-///               [--since <ts>] [--until <ts>]
-///                                    time-bucket histogram as text bars;
+///               [--since <ts>] [--until <ts>] [--json]
+///               [--level-min <lv>] [--service <svc>]
+///                                    time-bucket histogram as text bars
+///                                    (or JSON lines with --json);
+///                                    --level-min/--service narrow the stream
+///                                    via the unified schema (JSON and KV);
 ///                                    default window is the last 24h
 ///                                    (--since 0 for everything), pushed
 ///                                    down to segments; shares the query
@@ -1080,6 +1084,30 @@ fn ctx_field_from_pairs(
     }
   }
   None
+}
+
+///|
+/// Unified-schema field extraction for aggregate's grouping/quantile fields
+/// (2.2/4.2 parity): the requested name resolves through the canonical slot
+/// (severity/lvl → level, app → service, ...), so `--kv-field severity` hits
+/// the same aliases as `query --where`; otherwise the name compares
+/// case-insensitively and literally. The last matching pair wins (same
+/// as the previous byte-exact behavior).
+fn ctx_extract_field(pairs : Array[(Bytes, Bytes)], f : Bytes) -> Bytes? {
+  let q_slot = @core.canonical_field(f)
+  let mut found : Bytes? = None
+  for pair in pairs {
+    let p_slot = @core.canonical_field(pair.0)
+    let km = if q_slot >= 0 && p_slot >= 0 {
+      q_slot == p_slot
+    } else {
+      follow_lower_ascii(pair.0) == follow_lower_ascii(f)
+    }
+    if km {
+      found = Some(pair.1)
+    }
+  }
+  found
 }
 
 ///|
@@ -8481,20 +8509,21 @@ fn cmd_aggregate(
           None => true
         }
         if pass {
+          // One value parse per record: the grouping field and the quantile
+          // field share the same flattened pairs (JSON flattening is the
+          // allocation-heavy part of every aggregate pass).
+          let pairs : Array[(Bytes, Bytes)] = if field is Some(_) ||
+            qfield is Some(_) {
+            ctx_value_fields(rec.value)
+          } else {
+            []
+          }
           let bucket : Bytes = match field {
-            Some(f) => {
-              let pairs = ctx_value_fields(rec.value)
-              let mut found : Bytes? = None
-              for pair in pairs {
-                if pair.0 == f {
-                  found = Some(pair.1)
-                }
-              }
-              match found {
+            Some(f) =>
+              match ctx_extract_field(pairs, f) {
                 Some(v) => v
                 None => b"<missing>"
               }
-            }
             None =>
               if by == "value" {
                 rec.value
@@ -8518,15 +8547,8 @@ fn cmd_aggregate(
               }
           }
           match qfield {
-            Some(qf) => {
-              let qpairs = ctx_value_fields(rec.value)
-              let mut qv : Bytes? = None
-              for qp in qpairs {
-                if qp.0 == qf {
-                  qv = Some(qp.1)
-                }
-              }
-              match qv {
+            Some(qf) =>
+              match ctx_extract_field(pairs, qf) {
                 Some(raw) => {
                   let d_opt = Some(
                     @string.parse_double(@utf8.decode_lossy(raw)),
@@ -8544,7 +8566,6 @@ fn cmd_aggregate(
                 }
                 None => skipped = skipped + 1
               }
-            }
             None => ()
           }
           bump_bytes(counts, bucket)
@@ -10207,6 +10228,9 @@ fn cmd_trend(
   width : String?,
   since : String?,
   until : String?,
+  json : Bool,
+  level_min : String?,
+  service : String?,
 ) -> Unit raise @io.IoError {
   let scope = active_scope(dir)
   if bucket != "minute" && bucket != "hour" && bucket != "day" {
@@ -10225,6 +10249,20 @@ fn cmd_trend(
     Some(s) => Some(@utf8.encode(s))
     None => None
   }
+  let service_b : Bytes? = match service {
+    Some(sv) => Some(@utf8.encode(sv))
+    None => None
+  }
+  let min_rank : Int32? = match level_min {
+    Some(l) => {
+      let r = @core.level_rank(@utf8.encode(l))
+      if r < 0 {
+        raise @io.IoError::Invalid("invalid level: " + l)
+      }
+      Some(r)
+    }
+    None => None
+  }
   // Time scoping and guards (5.1): the histogram is bounded by the same
   // default window as query/search and pushed down to segment min_ts/max_ts;
   // it also shares the 4.6 slot/guard and scans outside the writer lock.
@@ -10237,11 +10275,13 @@ fn cmd_trend(
       )
     None => {
       let win = query_window_ms()
-      println(
-        "INFO trend scoped to the last " +
-        (win / (1000 : Int64)).to_string() +
-        "s (default window; pass --since to override, --since 0 for everything)",
-      )
+      if !json {
+        println(
+          "INFO trend scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+      }
       Some(now_ms() - win)
     }
   }
@@ -10266,6 +10306,7 @@ fn cmd_trend(
   run_read_snapshot(dir, log => {
     let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
     let mut abort_msg : String? = None
+    let mut seen_recs : Int64 = 0
     for seg in log.segments {
       if abort_msg is Some(_) {
         break
@@ -10308,12 +10349,54 @@ fn cmd_trend(
         if !in_time {
           return
         }
-        let pass = match needle {
+        let mut pass = match needle {
           Some(n) =>
             match_needle(rec.key, n, true) || match_needle(rec.value, n, true)
           None => true
         }
         if pass {
+          // Structured filters (5.1 parity with follow/query): --service
+          // matches the record key or the flattened service field,
+          // --level-min needs a known severity (JSON and KV values alike).
+          let needs_fields = service_b is Some(_) || min_rank is Some(_)
+          if needs_fields {
+            let sf = @core.schema_from_fields(
+              ctx_value_fields(rec.value),
+              (0 : Int64),
+            )
+            match service_b {
+              Some(sb) => {
+                let mut sm = ctx_bytes_eq_ci(rec.key, sb)
+                if !sm {
+                  sm = match sf.service {
+                    Some(sv) => ctx_bytes_eq_ci(sv, sb)
+                    None => false
+                  }
+                }
+                if !sm {
+                  pass = false
+                }
+              }
+              None => ()
+            }
+            if pass {
+              match min_rank {
+                Some(r) => {
+                  let lr = match sf.level {
+                    Some(l) => @core.level_rank(follow_lower_ascii(l))
+                    None => -1
+                  }
+                  if lr < 0 || lr < r {
+                    pass = false
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+        }
+        if pass {
+          seen_recs = seen_recs + 1
           bump_string(counts, @core.format_utc(rec.timestamp, bucket))
         }
       })
@@ -10334,28 +10417,56 @@ fn cmd_trend(
         None => ()
       }
     }
-    for label in labels {
-      match counts.get(label) {
-        Some(c) => {
-          let bars = if max_count > 0 { c * bar_width / max_count } else { 0 }
-          let bar = StringBuilder()
-          let mut i = 0
-          while i < bars {
-            bar.write_string("█")
-            i = i + 1
+    if json {
+      let mut s = "{\"bucket\":\"" +
+        bucket +
+        "\",\"total\":" +
+        seen_recs.to_string() +
+        ",\"buckets\":["
+      let mut first = true
+      for label in labels {
+        match counts.get(label) {
+          Some(c) => {
+            if !first {
+              s = s + ","
+            }
+            first = false
+            s = s +
+              "{\"label\":\"" +
+              json_escape_str(label) +
+              "\",\"count\":" +
+              c.to_string() +
+              "}"
           }
-          println(label + "  " + bar.to_string() + " " + c.to_string())
+          None => ()
         }
-        None => ()
       }
+      s = s + "],\"bucket_count\":" + labels.length().to_string() + "}"
+      println(s)
+    } else {
+      for label in labels {
+        match counts.get(label) {
+          Some(c) => {
+            let bars = if max_count > 0 { c * bar_width / max_count } else { 0 }
+            let bar = StringBuilder()
+            let mut i = 0
+            while i < bars {
+              bar.write_string("█")
+              i = i + 1
+            }
+            println(label + "  " + bar.to_string() + " " + c.to_string())
+          }
+          None => ()
+        }
+      }
+      println(
+        "(max " +
+        max_count.to_string() +
+        ", " +
+        labels.length().to_string() +
+        " buckets)",
+      )
     }
-    println(
-      "(max " +
-      max_count.to_string() +
-      ", " +
-      labels.length().to_string() +
-      " buckets)",
-    )
   })
 }
 
@@ -13955,6 +14066,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--until" && i + 1 < args.length() {
           until = Some(args[i + 1])
           i = i + 1
+        } else if a.length() >= 2 && a[0].to_int() == 45 && a[1].to_int() == 45 {
+          raise @io.IoError::Invalid("unknown aggregate option: " + a)
+        } else {
+          raise @io.IoError::Invalid("unexpected aggregate argument: " + a)
         }
         i = i + 1
       }
@@ -14015,6 +14130,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut width : String? = (None : String?)
       let mut since : String? = (None : String?)
       let mut until : String? = (None : String?)
+      let mut json = false
+      let mut level_min : String? = (None : String?)
+      let mut service : String? = (None : String?)
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -14033,10 +14151,30 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--until" && i + 1 < args.length() {
           until = Some(args[i + 1])
           i = i + 1
+        } else if a == "--json" {
+          json = true
+        } else if a == "--level-min" && i + 1 < args.length() {
+          level_min = Some(args[i + 1])
+          i = i + 1
+        } else if a == "--service" && i + 1 < args.length() {
+          service = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown trend option: " + a)
         }
         i = i + 1
       }
-      cmd_trend(args[2], bucket, match_text, width, since, until)
+      cmd_trend(
+        args[2],
+        bucket,
+        match_text,
+        width,
+        since,
+        until,
+        json,
+        level_min,
+        service,
+      )
     }
   } else if cmd == "dashboard" {
     if args.length() < 3 {
