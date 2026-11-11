@@ -10662,12 +10662,50 @@ fn abs_double(v : Double) -> Double {
 ///|
 /// Deliver an alert event to the configured external channels: append it as a
 /// JSON line to `--notify-file` and/or POST it to `--webhook` via curl. The
-/// caller prints the human-readable line itself.
+/// caller prints the human-readable line itself. With `notify_dry` nothing is
+/// delivered — a dry-run event describes the payload instead (previously
+/// `--notify-dry-run` only covered the 5.4 fan-out channels and the webhook
+/// was still POSTed for real). curl runs with `-f`, so an HTTP-level failure
+/// (4xx/5xx) counts as a delivery failure — the bare exit code only saw
+/// transport errors and reported unreachable endpoints as success.
 fn dispatch_notification(
   event_json : String,
   notify_file : String?,
   webhook : String?,
+  notify_dry : Bool,
+  json : Bool,
 ) -> Int32 raise @io.IoError {
+  if notify_dry {
+    match webhook {
+      Some(url) =>
+        if json {
+          println(
+            "{\"kind\":\"dry-run\",\"channel\":\"webhook\",\"url\":\"" +
+            json_escape_str(url) +
+            "\",\"payload\":" +
+            event_json +
+            "}",
+          )
+        } else {
+          println("[dry-run] webhook POST " + event_json + " -> " + url)
+        }
+      None => ()
+    }
+    match notify_file {
+      Some(path) =>
+        if json {
+          println(
+            "{\"kind\":\"dry-run\",\"channel\":\"notify-file\",\"path\":\"" +
+            json_escape_str(path) +
+            "\"}",
+          )
+        } else {
+          println("[dry-run] notify-file append -> " + path)
+        }
+      None => ()
+    }
+    return 0
+  }
   match notify_file {
     Some(path) => {
       let existing = @backend_native.read_file(path)
@@ -10681,7 +10719,7 @@ fn dispatch_notification(
   let mut failures : Int32 = 0
   match webhook {
     Some(url) => {
-      let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+      let cmd = "curl -s -f -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' --data " +
         @core.shell_quote(event_json) +
         " " +
         @core.shell_quote(url)
@@ -10732,7 +10770,7 @@ fn notify_extra(
           println("[dry-run] dingtalk --data " + payload + " -> " + url)
         }
       } else {
-        let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+        let cmd = "curl -s -f -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' --data " +
           @core.shell_quote(payload) +
           " " +
           @core.shell_quote(url)
@@ -10762,7 +10800,7 @@ fn notify_extra(
           println("[dry-run] wecom --data " + payload + " -> " + url)
         }
       } else {
-        let cmd = "curl -s -m 5 -X POST -H 'Content-Type: application/json' --data " +
+        let cmd = "curl -s -f -m 5 -o /dev/null -X POST -H 'Content-Type: application/json' --data " +
           @core.shell_quote(payload) +
           " " +
           @core.shell_quote(url)
@@ -10861,7 +10899,9 @@ fn cmd_alert(
       }
       if c > threshold_n {
         alerts = alerts + 1
-        let event = "{\"kind\":\"threshold\",\"window\":\"" +
+        let event = "{\"kind\":\"threshold\",\"rule\":\"" +
+          json_escape_str(match_text) +
+          "\",\"window\":\"" +
           label +
           "\",\"count\":" +
           c.to_string() +
@@ -10880,16 +10920,28 @@ fn cmd_alert(
             threshold_n.to_string(),
           )
         }
-        ignore(dispatch_notification(event, notify_file, webhook))
+        ignore(dispatch_notification(event, notify_file, webhook, false, json))
       }
     }
-    println(
-      "(windows " +
-      labels.length().to_string() +
-      ", alerts " +
-      alerts.to_string() +
-      ")",
-    )
+    if json {
+      // stdout must stay parseable in --json mode: the text footer used to
+      // break line-by-line JSON consumers.
+      println(
+        "{\"kind\":\"summary\",\"windows\":" +
+        labels.length().to_string() +
+        ",\"alerts\":" +
+        alerts.to_string() +
+        "}",
+      )
+    } else {
+      println(
+        "(windows " +
+        labels.length().to_string() +
+        ", alerts " +
+        alerts.to_string() +
+        ")",
+      )
+    }
     close_log(log)
   })
 }
@@ -10944,6 +10996,7 @@ fn cmd_watch(
   min_samples_s : String?,
   resolve_after_s : String?,
   snooze_until_s : String?,
+  realert_sec_s : String?,
 ) -> Unit raise @io.IoError {
   let scope = active_scope(dir)
   let threshold_n = @string.parse_int(threshold) catch {
@@ -11006,6 +11059,20 @@ fn cmd_watch(
         _ => raise @io.IoError::Invalid("invalid snooze-until: " + v)
       }
     None => 0
+  }
+  // Re-alert period (5.4): while firing, re-send the alert every S seconds
+  // so an ongoing outage stays visible — the transition dedup would
+  // otherwise stay silent for hours. 0 disables (legacy behaviour).
+  let realert_ms : Int64 = match realert_sec_s {
+    Some(v) =>
+      (@string.parse_int64(v) catch {
+        _ => raise @io.IoError::Invalid("invalid re-alert-sec: " + v)
+      }) *
+      (1000 : Int64)
+    None => 0
+  }
+  if realert_ms < 0 {
+    raise @io.IoError::Invalid("re-alert-sec must be >= 0")
   }
   let win_ms = (@string.parse_int64(window_sec) catch {
       _ => raise @io.IoError::Invalid("invalid window-sec: " + window_sec)
@@ -11088,6 +11155,8 @@ fn cmd_watch(
   let mut notify_failures : Int32 = 0
   let mut suppressed_events : Int32 = 0
   let mut buffer_dropped : Int32 = 0
+  let mut realerts : Int32 = 0
+  let mut last_realert : Int64 = 0
   let mut go = true
   while go && !@backend_native.shutdown_requested() {
     // Pull new records into the window buffer.
@@ -11289,8 +11358,11 @@ fn cmd_watch(
         firing = true
         firings = firings + 1
         fired_at = now
+        last_realert = now
         let event = "{\"kind\":\"" +
           kind_str +
+          "\",\"rule\":\"" +
+          json_escape_str(match_text) +
           "\",\"state\":\"firing\",\"value\":" +
           cur_value +
           ",\"threshold\":" +
@@ -11344,7 +11416,7 @@ fn cmd_watch(
           let fails = notify_extra(
               summary, dingtalk, wecom, email_to, smtp_url, notify_dry, json,
             ) +
-            dispatch_notification(event, notify_file, webhook)
+            dispatch_notification(event, notify_file, webhook, notify_dry, json)
           if fails > 0 {
             notify_failures = notify_failures + fails
             if !json {
@@ -11366,6 +11438,8 @@ fn cmd_watch(
         calm_rounds = 0
         let event = "{\"kind\":\"" +
           kind_str +
+          "\",\"rule\":\"" +
+          json_escape_str(match_text) +
           "\",\"state\":\"resolved\",\"value\":" +
           cur_value +
           ",\"threshold\":" +
@@ -11400,7 +11474,7 @@ fn cmd_watch(
           let fails = notify_extra(
               summary, dingtalk, wecom, email_to, smtp_url, notify_dry, json,
             ) +
-            dispatch_notification(event, notify_file, webhook)
+            dispatch_notification(event, notify_file, webhook, notify_dry, json)
           if fails > 0 {
             notify_failures = notify_failures + fails
             if !json {
@@ -11415,12 +11489,81 @@ fn cmd_watch(
         @backend_native.flush_stdout()
       }
     }
+    // Re-alert (5.4): while still firing, re-send the alert every
+    // --re-alert-sec so an ongoing outage stays visible — the transition
+    // dedup alone would go silent after the first ALERT. Bounded by the
+    // period (no storm) and suppressed by --snooze-until like any delivery.
+    if violated && firing && realert_ms > 0 && now - last_realert >= realert_ms {
+      realerts = realerts + 1
+      last_realert = now
+      let event = "{\"kind\":\"" +
+        kind_str +
+        "\",\"rule\":\"" +
+        json_escape_str(match_text) +
+        "\",\"state\":\"firing\",\"realert\":true,\"value\":" +
+        cur_value +
+        ",\"threshold\":" +
+        thr_str +
+        ",\"window_sec\":" +
+        win_s +
+        ",\"stat\":\"" +
+        metric_stat +
+        "\",\"ts\":" +
+        now.to_string() +
+        sup_json +
+        "}"
+      if json {
+        println(event)
+      } else {
+        println(
+          "ALERT re-firing " +
+          kind_str +
+          " value=" +
+          cur_value +
+          " over window " +
+          win_s +
+          "s",
+        )
+      }
+      let summary = "ALERT still firing " +
+        kind_str +
+        " value=" +
+        cur_value +
+        " over window " +
+        win_s +
+        "s"
+      if suppressed {
+        suppressed_events = suppressed_events + 1
+        if !json {
+          println("  (notification suppressed)")
+        }
+      } else {
+        notified = notified + 1
+        let fails = notify_extra(
+            summary, dingtalk, wecom, email_to, smtp_url, notify_dry, json,
+          ) +
+          dispatch_notification(event, notify_file, webhook, notify_dry, json)
+        if fails > 0 {
+          notify_failures = notify_failures + fails
+          if !json {
+            println(
+              "warning: " +
+              fails.to_string() +
+              " notification channel(s) failed",
+            )
+          }
+        }
+      }
+      @backend_native.flush_stdout()
+    }
     // Escalation (5.4): still firing after --escalate-sec -> one ESCALATED
     // notification per episode (bounded, no storm).
     if esc_ms > 0 && firing && !escalated && now - fired_at >= esc_ms {
       escalated = true
       escalations = escalations + 1
-      let event = "{\"kind\":\"escalation\",\"state\":\"escalated\",\"value\":" +
+      let event = "{\"kind\":\"escalation\",\"rule\":\"" +
+        json_escape_str(match_text) +
+        "\",\"state\":\"escalated\",\"value\":" +
         cur_value +
         ",\"elapsed_ms\":" +
         (now - fired_at).to_string() +
@@ -11447,7 +11590,9 @@ fn cmd_watch(
         }
       } else {
         notified = notified + 1
-        let fails = dispatch_notification(event, notify_file, webhook) +
+        let fails = dispatch_notification(
+            event, notify_file, webhook, notify_dry, json,
+          ) +
           notify_extra(
             summary, dingtalk, wecom, email_to, smtp_url, notify_dry, json,
           )
@@ -11494,6 +11639,8 @@ fn cmd_watch(
       buf.length().to_string() +
       ",\"buffer_dropped\":" +
       buffer_dropped.to_string() +
+      ",\"realerts\":" +
+      realerts.to_string() +
       ",\"stat\":\"" +
       metric_stat +
       "\",\"window_sec\":" +
@@ -11518,6 +11665,8 @@ fn cmd_watch(
       notify_failures.to_string() +
       ", suppressed " +
       suppressed_events.to_string() +
+      ", re-alerts " +
+      realerts.to_string() +
       ", stat " +
       metric_stat +
       ", buffer_dropped " +
@@ -11532,7 +11681,7 @@ fn cmd_watch(
 ///            [--metric <field> --metric-threshold <v>] [--metric-stat <s>]
 ///            [--buffer-max N] [--level-min <lv>]
 ///            [--service <svc>] [--min-samples N] [--resolve-after N]
-///            [--snooze-until <ms>] [--escalate-sec S]
+///            [--snooze-until <ms>] [--escalate-sec S] [--re-alert-sec S]
 ///            [--notify-file <f>] [--webhook <url>]
 ///            [--dingtalk <url>] [--wecom <url>]
 ///            [--email <to> --smtp-url <url>] [--notify-dry-run]
@@ -11552,6 +11701,9 @@ fn cmd_watch(
 ///                                    transition, with --min-samples/
 ///                                    --resolve-after guarding spikes and
 ///                                    flapping (no alert storms);
+///                                    --re-alert-sec re-sends the alert every
+///                                    S seconds while still firing (0=off) so
+///                                    an ongoing outage stays visible;
 ///                                    --snooze-until suppresses delivery
 ///                                    during maintenance (events still marked
 ///                                    suppressed=true); the summary reports
@@ -11666,7 +11818,9 @@ fn cmd_baseline(
             ",\"z\":" +
             z.to_string() +
             "}"
-          ignore(dispatch_notification(event, notify_file, webhook))
+          ignore(
+            dispatch_notification(event, notify_file, webhook, false, false),
+          )
         }
         println(
           label +
@@ -14694,6 +14848,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut min_samples_s : String? = (None : String?)
       let mut resolve_after_s : String? = (None : String?)
       let mut snooze_until_s : String? = (None : String?)
+      let mut realert_sec_s : String? = (None : String?)
       let mut metric_stat_s : String? = (None : String?)
       let mut buffer_max_s : String? = (None : String?)
       let mut notify_dry = false
@@ -14753,6 +14908,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--snooze-until" && i + 1 < args.length() {
           snooze_until_s = Some(args[i + 1])
           i = i + 1
+        } else if a == "--re-alert-sec" && i + 1 < args.length() {
+          realert_sec_s = Some(args[i + 1])
+          i = i + 1
         } else if a == "--metric-stat" && i + 1 < args.length() {
           metric_stat_s = Some(args[i + 1])
           i = i + 1
@@ -14800,6 +14958,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
             min_samples_s,
             resolve_after_s,
             snooze_until_s,
+            realert_sec_s,
           )
         None => raise @io.IoError::Invalid("watch requires --threshold")
       }
