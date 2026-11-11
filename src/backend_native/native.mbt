@@ -1735,15 +1735,34 @@ pub fn restore_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
   if !file_exists(mpath) {
     raise @io.IoError::Invalid("not a backup (missing MANIFEST): " + src)
   }
-  let manifest_ok = try {
-    let m = @log.decode_manifest(read_file(mpath))
-    ignore(m.encode())
-    true
-  } catch {
-    _ => false
+  let decoded : @log.Manifest? = Some(@log.decode_manifest(read_file(mpath))) catch {
+    _ => (None : @log.Manifest?)
   }
-  if !manifest_ok {
-    raise @io.IoError::Invalid("corrupt MANIFEST in backup: " + src)
+  let m = match decoded {
+    Some(m) => m
+    None => raise @io.IoError::Invalid("corrupt MANIFEST in backup: " + src)
+  }
+  // Completeness gate: the manifest names every segment with its exact byte
+  // size, so an interrupted backup (manifest copied but a segment file still
+  // missing or truncated) is rejected here instead of restoring silently
+  // short — during a disaster recovery the source may no longer exist to
+  // reconcile against, making this the last line of defense.
+  for i in 0..<m.segment_bases.length() {
+    let seg = src + "/" + @segment.segment_file_name(m.segment_bases[i])
+    if !file_exists(seg) {
+      raise @io.IoError::Invalid("incomplete backup (segment missing): " + seg)
+    }
+    let actual = file_size(seg)
+    if actual != m.segment_sizes[i] {
+      raise @io.IoError::Invalid(
+        "incomplete backup (segment size mismatch): " +
+        seg +
+        " file=" +
+        actual.to_string() +
+        " manifest=" +
+        m.segment_sizes[i].to_string(),
+      )
+    }
   }
   ignore(ensure_dir(dst))
   if list_dir(dst).length() > 0 {

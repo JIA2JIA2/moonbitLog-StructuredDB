@@ -147,3 +147,72 @@ test "drill audit chain walk flags a rewritten trail (6.5)" {
   assert_false(drill_audit_chain_ok(dir))
   remove_tree(dir)
 }
+
+///|
+test "restore gates on manifest-declared segments (6.5)" {
+  let src = "/tmp/moonlog-wbtest-restore-gate-src"
+  let bak = "/tmp/moonlog-wbtest-restore-gate-bak"
+  let rst = "/tmp/moonlog-wbtest-restore-gate-rst"
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+  // Build a real multi-segment directory (small roll size forces rolls).
+  ignore(@backend_native.ensure_dir(src))
+  let log = @backend_native.open_log_dir(src, 200)
+  for i in 0..<8 {
+    ignore(
+      log.append(
+        @utf8.encode("key" + i.to_string()),
+        @utf8.encode("payload-0123456789-0123456789-" + i.to_string()),
+        1000L + i.to_int64(),
+      ),
+    )
+  }
+  log.flush()
+  @backend_native.flush_meta(src, log)
+  close_log(log)
+  let copied = @backend_native.backup_log_dir(src, bak)
+  assert_true(copied >= 2)
+  // A complete backup restores fine and keeps the segment count.
+  assert_eq(@backend_native.restore_log_dir(bak, rst), copied)
+  remove_tree(rst)
+  let segs : Array[String] = []
+  for name in @backend_native.list_dir(bak) {
+    if name.has_suffix(".log") {
+      segs.push(name)
+    }
+  }
+  let victim = bak + "/" + segs[segs.length() - 1]
+  let original = @backend_native.read_file(victim)
+  // A truncated segment (crash between the manifest copy and the segment
+  // copy) is rejected on size instead of restoring silently short.
+  @backend_native.write_file(
+    victim,
+    @core.slice(original, 0, original.length() - 3),
+  ) catch {
+    _ => ()
+  }
+  let mut raised = false
+  ignore(@backend_native.restore_log_dir(bak, rst)) catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+  @backend_native.write_file(victim, original) catch {
+    _ => ()
+  }
+  // A missing segment is rejected too.
+  ignore(@backend_native.remove_file(victim))
+  raised = false
+  ignore(@backend_native.restore_log_dir(bak, rst)) catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+  @backend_native.write_file(victim, original) catch {
+    _ => ()
+  }
+  // The gate is not over-strict: the intact backup still restores.
+  assert_eq(@backend_native.restore_log_dir(bak, rst), copied)
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+}

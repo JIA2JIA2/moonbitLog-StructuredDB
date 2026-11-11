@@ -285,12 +285,15 @@
 ///                                    manage RBAC roles; once an RBAC file
 ///                                    exists every command needs a
 ///                                    MOONLOG_TOKEN role that allows it
-///   backup <dir> <dst>               copy a snapshot into dst (incremental
+///   backup <dir> <dst> [--json]      copy a snapshot into dst (incremental
 ///                                    when dst already holds an earlier backup)
-///   restore <src> <dst>              materialize a backup into dst
-///   drill <dir> [--keep]             one-key recovery drill (6.5): backup ->
+///   restore <src> <dst> [--json]     materialize a backup into dst (rejects
+///                                    a backup whose segments do not match
+///                                    the manifest)
+///   drill <dir> [--keep] [--json]    one-key recovery drill (6.5): backup ->
 ///                                    restore -> verify -> reconcile records/
-///                                    config/index -> report, then clean up
+///                                    config/index/audit/batches -> report,
+///                                    then clean up
 ///   selfmon <dir> [--json]           independent health sweep (6.4): disk
 ///                                    watermark, writer backlog (crash
 ///                                    residue), collection latency (unknown
@@ -3926,7 +3929,11 @@ fn cmd_purge(
 /// sidecars and manifest. Offsets are preserved, so the restored copy
 /// continues where the source stopped and committed cursor positions remain
 /// meaningful against it.
-fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
+fn cmd_backup(
+  src : String,
+  dst : String,
+  json : Bool,
+) -> Unit raise @io.IoError {
   run_locked(src, true, () => {
     let log = open_log(src)
     log.flush()
@@ -3947,27 +3954,48 @@ fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
       }
     }
     let (idx_files, idx_bytes) = drill_sidecar_stats(dst)
-    println(
-      "backed up " +
-      n.to_string() +
-      " segments to " +
-      dst +
-      " (files=" +
-      files.to_string() +
-      " bytes=" +
-      bytes.to_string() +
-      " index_files=" +
-      idx_files.to_string() +
-      " index_bytes=" +
-      idx_bytes.to_string() +
-      " selfmon_thresholds=" +
-      (if @backend_native.file_exists(dst + "/SELFMON/thresholds") {
-        "present"
-      } else {
-        "absent"
-      }) +
-      ")",
-    )
+    let thresholds = if @backend_native.file_exists(dst + "/SELFMON/thresholds") {
+      "present"
+    } else {
+      "absent"
+    }
+    if json {
+      println(
+        "{\"segments\":" +
+        n.to_string() +
+        ",\"files\":" +
+        files.to_string() +
+        ",\"bytes\":" +
+        bytes.to_string() +
+        ",\"index_files\":" +
+        idx_files.to_string() +
+        ",\"index_bytes\":" +
+        idx_bytes.to_string() +
+        ",\"selfmon_thresholds\":\"" +
+        thresholds +
+        "\",\"dst\":\"" +
+        json_escape_str(dst) +
+        "\"}",
+      )
+    } else {
+      println(
+        "backed up " +
+        n.to_string() +
+        " segments to " +
+        dst +
+        " (files=" +
+        files.to_string() +
+        " bytes=" +
+        bytes.to_string() +
+        " index_files=" +
+        idx_files.to_string() +
+        " index_bytes=" +
+        idx_bytes.to_string() +
+        " selfmon_thresholds=" +
+        thresholds +
+        ")",
+      )
+    }
   })
 }
 
@@ -3975,13 +4003,35 @@ fn cmd_backup(src : String, dst : String) -> Unit raise @io.IoError {
 /// Restore a backup made by `backup` into the empty directory `dst`, then
 /// verify the restored copy (fast mode) so a silently corrupt backup is
 /// caught before it is put into service.
-fn cmd_restore(src : String, dst : String) -> Unit raise @io.IoError {
+fn cmd_restore(
+  src : String,
+  dst : String,
+  json : Bool,
+) -> Unit raise @io.IoError {
   let n = @backend_native.restore_log_dir(src, dst)
-  println("restored " + n.to_string() + " segments to " + dst)
   run_locked(dst, false, () => {
     let log = open_log(dst)
     let report = log.verify_fast()
-    print_verify(report)
+    if json {
+      let ok = report.first_bad_offset is None &&
+        report.first_bad_checksum is None
+      println(
+        "{\"segments\":" +
+        n.to_string() +
+        ",\"dst\":\"" +
+        json_escape_str(dst) +
+        "\",\"verify\":{\"segments\":" +
+        report.segments.to_string() +
+        ",\"records\":" +
+        report.records.to_string() +
+        ",\"status\":\"" +
+        (if ok { "ok" } else { "fail" }) +
+        "\"}}",
+      )
+    } else {
+      println("restored " + n.to_string() + " segments to " + dst)
+      print_verify(report)
+    }
     close_log(log)
   })
 }
@@ -4171,7 +4221,7 @@ fn drill_config_check(dir : String, rst : String) -> String {
 /// trail plus the batch-id ledger against the backup — proving a real
 /// restore succeeds end to end. The live directory is only ever read (under
 /// its shared lock) and the scratch directories are removed unless `--keep`.
-fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
+fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
   ignore(@backend_native.ensure_dir(dir))
   let bak = dir + ".drill-backup"
   let rst = dir + ".drill-restore"
@@ -4277,6 +4327,61 @@ fn cmd_drill(dir : String, keep : Bool) -> Unit raise @io.IoError {
   })
 
   let status = if match_ok { "ok" } else { "fail" }
+  if json {
+    // Machine-readable drill report (6.5 fourth round): same facts as the
+    // text view, one JSON object on stdout so scheduled drills can assert
+    // on status instead of screen-scraping.
+    if !keep {
+      remove_tree(bak)
+      remove_tree(rst)
+    }
+    println(
+      "{\"status\":\"" +
+      status +
+      "\",\"backup\":{\"files\":" +
+      backup_files.to_string() +
+      ",\"path\":\"" +
+      json_escape_str(bak) +
+      "\"},\"restore\":{\"segments\":" +
+      restored_segs.to_string() +
+      ",\"path\":\"" +
+      json_escape_str(rst) +
+      "\"},\"verify\":{\"status\":\"" +
+      verify_status +
+      "\",\"records\":" +
+      verify_records.to_string() +
+      ",\"source_records\":" +
+      src_records.to_string() +
+      ",\"spot_read\":" +
+      (if spot_ok { "true" } else { "false" }) +
+      "},\"config\":\"" +
+      config_status +
+      "\",\"audit\":{\"files\":" +
+      audit_files.to_string() +
+      ",\"bytes\":" +
+      audit_bytes.to_string() +
+      ",\"status\":\"" +
+      audit_status +
+      "\",\"chain\":\"" +
+      (if audit_chain_ok { "ok" } else { "broken" }) +
+      "\"},\"idempotency\":{\"batches\":\"" +
+      batches_status +
+      "\"},\"index\":{\"files\":" +
+      src_index_files.to_string() +
+      ",\"bytes\":" +
+      src_index_bytes.to_string() +
+      ",\"restored_files\":" +
+      rst_index_files.to_string() +
+      ",\"restored_bytes\":" +
+      rst_index_bytes.to_string() +
+      ",\"status\":\"" +
+      (if index_ok { "ok" } else { "mismatch" }) +
+      "\"},\"cleanup\":\"" +
+      (if keep { "kept" } else { "removed" }) +
+      "\"}",
+    )
+    return
+  }
   println("DRILL status=" + status)
   println("backup: files=" + backup_files.to_string() + " path=" + bak)
   println("restore: segments=" + restored_segs.to_string() + " path=" + rst)
@@ -14579,13 +14684,29 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
-      cmd_backup(args[2], args[3])
+      let mut json = false
+      for j in 4..<args.length() {
+        if args[j] == "--json" {
+          json = true
+        } else {
+          raise @io.IoError::Invalid("unknown backup option: " + args[j])
+        }
+      }
+      cmd_backup(args[2], args[3], json)
     }
   } else if cmd == "restore" {
     if args.length() < 4 {
       println(USAGE)
     } else {
-      cmd_restore(args[2], args[3])
+      let mut json = false
+      for j in 4..<args.length() {
+        if args[j] == "--json" {
+          json = true
+        } else {
+          raise @io.IoError::Invalid("unknown restore option: " + args[j])
+        }
+      }
+      cmd_restore(args[2], args[3], json)
     }
   } else if cmd == "follow" {
     let mut start = "0"
@@ -16397,8 +16518,18 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     }
     cmd_quota(args[2], recalc, json)
   } else if cmd == "drill" {
-    let keep = args.length() > 3 && args[3] == "--keep"
-    cmd_drill(args[2], keep)
+    let mut keep = false
+    let mut json = false
+    for j in 3..<args.length() {
+      if args[j] == "--keep" {
+        keep = true
+      } else if args[j] == "--json" {
+        json = true
+      } else {
+        raise @io.IoError::Invalid("unknown drill option: " + args[j])
+      }
+    }
+    cmd_drill(args[2], keep, json)
   } else if cmd == "selfmon" {
     let mut json = false
     let mut exit_code = false
