@@ -16274,8 +16274,25 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     let keep = args.length() > 3 && args[3] == "--keep"
     cmd_drill(args[2], keep)
   } else if cmd == "selfmon" {
-    let json = args.length() > 3 && args[3] == "--json"
-    cmd_selfmon(args[2], json)
+    let mut json = false
+    let mut exit_code = false
+    let mut bad = ""
+    let mut i = 3
+    while i < args.length() {
+      if args[i] == "--json" {
+        json = true
+      } else if args[i] == "--exit-code" {
+        exit_code = true
+      } else if bad == "" {
+        bad = args[i]
+      }
+      i = i + 1
+    }
+    if bad != "" {
+      eprintln("error: unknown selfmon option: " + bad)
+      @backend_native.exit_process(1)
+    }
+    cmd_selfmon(args[2], json, exit_code)
   } else {
     println(USAGE)
   }
@@ -16436,12 +16453,13 @@ fn selfmon_error_stats(dir : String, since : Int64) -> (Int32, String, Int32) {
   let data = @backend_native.read_file(dir + "/SELFMON_ERRORS")
   let counts : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([])
   let mut fails = 0
-  let mut start = 0
-  let mut i = 0
-  while i <= data.length() {
-    if i == data.length() || data.at(i).to_int() == 10 {
-      let line = @core.slice(data, start, i)
-      if line.length() > 0 {
+  let n = data.length()
+  let mut start = selfmon_window_boundary(data, since)
+  let mut i = start
+  while i <= n {
+    if i == n || data.at(i).to_int() == 10 {
+      if i > start {
+        let line = @core.slice(data, start, i)
         match selfmon_json_fields(line) {
           Some(fields) =>
             if selfmon_field_int64(fields, b"ts") >= since {
@@ -16474,21 +16492,169 @@ fn selfmon_error_stats(dir : String, since : Int64) -> (Int32, String, Int32) {
 }
 
 ///|
-/// Window count of allowed audit events across the live trail and its
-/// rotations (M172) — the failure-rate denominator. Zero when auditing is not
-/// in force.
-fn selfmon_audit_allows(dir : String, since : Int64) -> Int32 {
-  let (lines, _) = audit_read_lines(dir, true)
-  let mut allowed = 0
-  for line in lines {
-    match audit_parse(line) {
-      Some((ts, _, action, decision, _)) =>
-        if decision == "allow" && ts >= since && selfmon_is_query_cmd(action) {
-          allowed = allowed + 1
-        }
-      None => ()
+/// Fast window prefilter for machine-written JSONL rows: rows produced by
+/// this binary start with `{"ts":<digits>,`, so the leading timestamp can be
+/// read without a JSON parse. Returns -1 when the fast path does not apply
+/// (foreign or hand-edited rows) — the caller then falls back to a full
+/// parse, so the prefilter only skips rows, it never misclassifies them.
+fn selfmon_line_ts(line : Bytes) -> Int64 {
+  if line.length() < 7 {
+    return -1
+  }
+  let p0 = line.at(0).to_int()
+  let p1 = line.at(1).to_int()
+  let p2 = line.at(2).to_int()
+  let p3 = line.at(3).to_int()
+  let p4 = line.at(4).to_int()
+  let p5 = line.at(5).to_int()
+  // {"ts":
+  if p0 != 123 || p1 != 34 || p2 != 116 || p3 != 115 || p4 != 34 || p5 != 58 {
+    return -1
+  }
+  let n = line.length()
+  let mut j = 6
+  let mut v : Int64 = 0L
+  while j < n {
+    let c = line.at(j).to_int()
+    if c >= 48 && c <= 57 {
+      v = v * 10L + (c - 48).to_int64()
+      j = j + 1
+    } else {
+      break
     }
   }
+  if j == 6 {
+    return -1
+  }
+  v
+}
+
+///|
+/// Locate the byte offset where the in-window tail begins. Both JSONL feeds
+/// the selfmon gauges read (AUDIT, SELFMON_ERRORS) are written in append
+/// order — ts non-decreasing — so the rows inside a trailing window cluster
+/// at the end of the file. Scans backwards row by row until a row's leading
+/// `{"ts":<digits>` falls below `since` and returns that row's start offset;
+/// the caller then parses only the tail. Returns 0 when the fast path
+/// cannot apply (foreign rows, non-monotonic history) so the caller scans
+/// the whole file — the backward pass only skips rows, it never skips a
+/// row the forward parse would have counted.
+fn selfmon_window_boundary(data : Bytes, since : Int64) -> Int32 {
+  let n = data.length()
+  // Whole-file fast path: rows are appended in ts order, so a first row
+  // already at or after `since` means every row is in-window — skip the
+  // backward pass entirely (a freshly rotated trail is wholly in-window,
+  // and the backward scan would otherwise re-walk the entire file for
+  // nothing). A foreign first row takes the conservative full scan.
+  let head = selfmon_line_ts(@core.slice(data, 0, if n < 64 { n } else { 64 }))
+  if head >= 0 {
+    if head >= since {
+      return 0
+    }
+  } else {
+    return 0
+  }
+  let mut end = n
+  while end > 0 && data.at(end - 1).to_int() == 10 {
+    end = end - 1
+  }
+  let mut boundary = 0
+  let mut scanning = true
+  while scanning && end > 0 {
+    let mut j = end - 1
+    while j >= 0 && data.at(j).to_int() != 10 {
+      j = j - 1
+    }
+    let p = j + 1
+    let ts = selfmon_line_ts(@core.slice(data, p, end))
+    if ts < 0 {
+      scanning = false
+      boundary = 0
+    } else if ts < since {
+      // This row is outside the window: the in-window tail starts after
+      // this row's trailing newline, i.e. at `end + 1` (`end` points at
+      // that newline; when the file has no trailing newline this row is
+      // the last one, so nothing after it is in-window and the boundary
+      // is the file end).
+      scanning = false
+      boundary = if end < n { end + 1 } else { n }
+    } else {
+      end = j
+    }
+  }
+  boundary
+}
+
+///|
+/// Window count of allowed audit events in one audit file. The backward
+/// window-boundary pass skips out-of-window rows without a per-byte row
+/// loop; in-window rows pay a JSON parse so counting semantics match
+/// `audit_parse` for machine-written rows, and foreign rows take the same
+/// parse path.
+fn selfmon_count_window_allows(path : String, since : Int64) -> Int32 {
+  let data = @backend_native.read_file(path)
+  let n = data.length()
+  let mut start = selfmon_window_boundary(data, since)
+  let mut allowed = 0
+  let mut i = start
+  while i <= n {
+    if i == n || data.at(i).to_int() == 10 {
+      if i > start {
+        let line = @core.slice(data, start, i)
+        match selfmon_json_fields(line) {
+          Some(fields) => {
+            let mut row_ts = -1L
+            let mut allow = false
+            let mut action = ""
+            for pair in fields {
+              if pair.0 == b"ts" {
+                row_ts = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+                  _ => -1L
+                }
+              } else if pair.0 == b"decision" {
+                allow = pair.1 == b"allow"
+              } else if pair.0 == b"action" {
+                action = @utf8.decode_lossy(pair.1)
+              }
+            }
+            if allow && row_ts >= since && selfmon_is_query_cmd(action) {
+              allowed = allowed + 1
+            }
+          }
+          None => ()
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  allowed
+}
+
+///|
+/// Window count of allowed audit events across the live trail and its
+/// rotations (M172) — the failure-rate denominator. Zero when auditing is not
+/// in force. Reads the raw files with the ts prefilter instead of
+/// materialising every row as a parsed String: after the 64 MiB auto-rotate
+/// threshold (6.3) a long-lived directory must not make the periodic sweep
+/// cost O(entire history) parses.
+fn selfmon_audit_allows(dir : String, since : Int64) -> Int32 {
+  let mut allowed = 0
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let rotated : Array[(Int32, String)] = []
+  for n in names {
+    if n.has_prefix("AUDIT.") {
+      let s = @string.parse_int(n[6:n.length()].to_owned()) catch { _ => -1 }
+      if s > 0 {
+        rotated.push((s, n))
+      }
+    }
+  }
+  rotated.sort_by(fn(a, b) { b.0.compare(a.0) })
+  for item in rotated {
+    allowed = allowed + selfmon_count_window_allows(dir + "/" + item.1, since)
+  }
+  allowed = allowed + selfmon_count_window_allows(dir + "/AUDIT", since)
   allowed
 }
 
@@ -16541,12 +16707,16 @@ fn selfmon_event_lag_ms(dir : String) -> Int64? {
     dir,
     log => {
       let mut lag : Int64 = -1
-      if log.segments.length() > 0 {
-        let seg = log.segments[log.segments.length() - 1]
+      // Walk backwards from the newest segment: a freshly rolled empty tail
+      // segment must not mask the age of the data in the previous one.
+      let mut idx = log.segments.length() - 1
+      while idx >= 0 && lag < 0 {
+        let seg = log.segments[idx]
         if seg.record_count > 0 && seg.max_ts > (0 : Int64) {
           let age = now_ms() - seg.max_ts
           lag = if age >= 0 { age } else { 0 }
         }
+        idx = idx - 1
       }
       Some(lag)
     },
@@ -16591,13 +16761,67 @@ fn selfmon_latest_snapshot(
 }
 
 ///|
+/// Best-effort trim of `<dir>/SELFMON_ERRORS` (6.4 third pass): the error
+/// feed only serves the windowed failure-rate numerator, so out-of-window
+/// rows are dead weight — and a sustained failure storm grows the file
+/// without bound exactly when the sweep must stay fast. When the file
+/// reaches the cap the sweeper rewrites it to the in-window rows under a
+/// non-blocking exclusive lock; a busy lock (a writer mid-append) skips the
+/// trim until the next sweep. O_APPEND appends racing a trim land after the
+/// rewritten content, so no event is lost. `SELFMON_ERRORS_MAX_BYTES` (or
+/// the SELFMON/thresholds key) overrides the 16 MiB cap; 0 disables.
+fn selfmon_trim_errors(dir : String, cutoff : Int64, cap : Int64) -> Unit {
+  if cap <= 0L {
+    return
+  }
+  let path = dir + "/SELFMON_ERRORS"
+  let sz = @backend_native.file_size(path)
+  if sz < cap {
+    return
+  }
+  let lock = Some(@backend_native.DirLock::acquire_timeout(dir, true, 0)) catch {
+    _ => None
+  }
+  match lock {
+    Some(l) => {
+      let data = @backend_native.read_file(path)
+      let n = data.length()
+      let out = @buffer.Buffer::Buffer()
+      let mut start = 0
+      let mut i = 0
+      while i <= n {
+        if i == n || data.at(i).to_int() == 10 {
+          if i > start {
+            let line = @core.slice(data, start, i)
+            if selfmon_line_ts(line) >= cutoff {
+              out.write_bytes(line)
+              out.write_bytes(b"\n")
+            }
+          }
+          start = i + 1
+        }
+        i = i + 1
+      }
+      ignore(@backend_native.write_file(path, out.to_bytes()) catch { _ => () })
+      l.release()
+    }
+    None => ()
+  }
+}
+
+///|
 /// Self-monitoring (6.4): one independent health sweep over `dir` — disk
 /// watermark, writer backlog snapshot, ingest staleness, command failure
 /// rate and basic segment/manifest sanity — so the log system's own
 /// failures surface before user commands break. Prints `STATUS=ok|warn|crit`
 /// first (greppable by cron-style schedulers); `--json` emits the same
-/// result structured. Deep on-disk verification stays with `fsck`.
-fn cmd_selfmon(dir : String, json : Bool) -> Unit {
+/// result structured, per-dimension status and thresholds included.
+/// `--exit-code` maps ok/warn/crit to 0/1/2 so schedulers can judge the
+/// sweep without parsing output. Deep on-disk verification stays with
+/// `fsck`. A sweep of a missing directory is a warning, not a clean bill:
+/// monitoring a deleted or mistyped path silently reporting ok would defeat
+/// the whole dimension.
+fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   let now = now_ms()
   let cfg = selfmon_load_thresholds(dir)
   let disk_warn = selfmon_threshold_cfg(cfg, "DISK_WARN_PCT", 80)
@@ -16697,6 +16921,9 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
   }
 
   // --- segment/manifest sanity ---
+  // A sweep of a missing directory (deleted store, mistyped path) must not
+  // report a clean bill — every other gauge reads as "no data" there.
+  let dir_present = @backend_native.file_exists(dir)
   let manifest_present = @backend_native.file_exists(dir + "/MANIFEST")
   let dir_names = @backend_native.list_dir(dir) catch { _ => [] }
   let mut segs = 0
@@ -16706,7 +16933,9 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
     }
   }
   let mut segments_status = "ok"
-  if !manifest_present && segs > 0 {
+  if !dir_present {
+    segments_status = "warn"
+  } else if !manifest_present && segs > 0 {
     segments_status = "warn"
   }
 
@@ -16734,7 +16963,13 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       avail.to_string() +
       ",\"dir_bytes\":" +
       dir_bytes.to_string() +
-      "},\"backlog\":{\"writer\":\"" +
+      ",\"warn_pct\":" +
+      disk_warn.to_string() +
+      ",\"crit_pct\":" +
+      disk_crit.to_string() +
+      ",\"status\":\"" +
+      disk_status +
+      "\"},\"backlog\":{\"writer\":\"" +
       writer +
       "\",\"writer_active\":" +
       (if writer_active { "true" } else { "false" }) +
@@ -16748,29 +16983,53 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       snapshot_age.to_string() +
       ",\"writer_stale\":" +
       (if writer_stale { "true" } else { "false" }) +
-      "},\"ingest\":{\"event_lag_ms\":" +
+      ",\"pending_warn\":" +
+      backlog_warn.to_string() +
+      ",\"lag_warn_ms\":" +
+      lag_warn.to_string() +
+      ",\"status\":\"" +
+      backlog_status +
+      "\"},\"ingest\":{\"event_lag_ms\":" +
       event_lag.to_string() +
+      ",\"threshold_ms\":" +
+      event_lag_warn.to_string() +
       ",\"status\":\"" +
       ingest_status +
       "\",\"degraded\":" +
       (if event_lag_degraded { "true" } else { "false" }) +
       "},\"stale\":{\"last_data_age_ms\":" +
       seg_age.to_string() +
-      "},\"failures\":{\"window_failures\":" +
+      ",\"threshold_ms\":" +
+      stale_warn.to_string() +
+      ",\"writer_active\":" +
+      (if writer_active { "true" } else { "false" }) +
+      ",\"status\":\"" +
+      stale_status +
+      "\"},\"failures\":{\"window_failures\":" +
       fails.to_string() +
       ",\"window_attempts\":" +
       attempts.to_string() +
       ",\"fail_rate_pct\":" +
       fail_rate.to_string() +
+      ",\"fails_warn\":" +
+      fails_warn.to_string() +
+      ",\"rate_warn_pct\":" +
+      fail_rate_warn.to_string() +
       ",\"top_error_cmd\":\"" +
       json_escape_str(top_error_cmd) +
       "\",\"top_error_count\":" +
       top_error_count.to_string() +
-      "},\"segments\":{\"manifest\":" +
+      ",\"status\":\"" +
+      failures_status +
+      "\"},\"segments\":{\"manifest\":" +
       (if manifest_present { "true" } else { "false" }) +
+      ",\"dir_present\":" +
+      (if dir_present { "true" } else { "false" }) +
       ",\"count\":" +
       segs.to_string() +
-      "}}",
+      ",\"status\":\"" +
+      segments_status +
+      "\"}}",
     )
   } else {
     println("STATUS=" + status)
@@ -16840,7 +17099,9 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       "]",
     )
     println(
-      "segments: manifest=" +
+      "segments: dir=" +
+      (if dir_present { "present" } else { "missing" }) +
+      " manifest=" +
       (if manifest_present { "present" } else { "missing" }) +
       " count=" +
       segs.to_string() +
@@ -16848,6 +17109,17 @@ fn cmd_selfmon(dir : String, json : Bool) -> Unit {
       segments_status +
       "]",
     )
+  }
+  // Best-effort SELFMON_ERRORS trim: a failure storm grows the error feed
+  // without bound exactly when the sweep must stay fast; the cap keeps the
+  // file near the window it actually serves.
+  let errors_cap = selfmon_threshold_cfg(
+    cfg, "SELFMON_ERRORS_MAX_BYTES", 16777216L,
+  )
+  selfmon_trim_errors(dir, since, errors_cap)
+  if exit_code {
+    let code = if status == "ok" { 0 } else if status == "warn" { 1 } else { 2 }
+    @backend_native.exit_process(code)
   }
 }
 
