@@ -1361,7 +1361,9 @@ fn cmd_scan(
   timeout : String?,
 ) -> Unit raise @io.IoError {
   let scope = active_scope(dir)
-  let (lo_ts, hi_ts) = scan_time_bounds("scan", since, until, require_time)
+  let (lo_ts, hi_ts) = scan_time_bounds(
+    "scan", since, until, require_time, false,
+  )
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
   run_read_snapshot(dir, log => {
@@ -1425,7 +1427,7 @@ fn cmd_scan_prefix(
   timeout : String?,
 ) -> Unit raise @io.IoError {
   let (lo_ts, hi_ts) = scan_time_bounds(
-    "scan-prefix", since, until, require_time,
+    "scan-prefix", since, until, require_time, false,
   )
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
@@ -1469,7 +1471,7 @@ fn cmd_scan_range(
     None => (b"" : Bytes)
   }
   let (lo_ts, hi_ts) = scan_time_bounds(
-    "scan-range", since, until, require_time,
+    "scan-range", since, until, require_time, false,
   )
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
@@ -2369,21 +2371,11 @@ fn cmd_ttl_audit(
   verify : Bool,
 ) -> Unit raise @io.IoError {
   let since_ms : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => None
   }
   let until_ms : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   let limit_n : Int32 = match limit {
@@ -3632,6 +3624,7 @@ fn cmd_export_jsonl(
   host : String?,
   trace : String?,
   timeout : String?,
+  json : Bool,
 ) -> Unit raise @io.IoError {
   if mode != "text" && mode != "base64" {
     raise @io.IoError::Invalid("invalid mode: " + mode + " (text|base64)")
@@ -3671,7 +3664,7 @@ fn cmd_export_jsonl(
   // default window (last 24h); `--from 0` is an explicit full-history
   // export; `--require-time` rejects the unbounded form.
   let (lo_ts, hi_ts) = scan_time_bounds(
-    "export-jsonl", from_ts, until_ts, require_time,
+    "export-jsonl", from_ts, until_ts, require_time, json,
   )
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
@@ -3738,7 +3731,27 @@ fn cmd_export_jsonl(
     })
     sg.raise_if_aborted()
     @backend_native.write_file(file, buf.to_bytes())
-    println("exported " + count.to_string() + " records")
+    if json {
+      // Machine-readable export report (M216): the verification facts a
+      // consumer needs to assert on — how many records the file holds, the
+      // resolved epoch-ms window, and the mode — so the parseability of the
+      // produced file can be checked programmatically.
+      println(
+        "{\"exported\":" +
+        count.to_string() +
+        ",\"file\":\"" +
+        json_escape_str(file) +
+        "\",\"mode\":\"" +
+        mode +
+        "\",\"window_from\":" +
+        lo_ts.to_string() +
+        ",\"window_until\":" +
+        hi_ts.to_string() +
+        "}",
+      )
+    } else {
+      println("exported " + count.to_string() + " records")
+    }
   })
 }
 
@@ -7053,21 +7066,11 @@ fn cmd_search(
   // to the default window unless --since 0 is given; --require-time rejects
   // unbounded scans outright. `--from/--to` remain offset bounds.
   let mut since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => None
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   match since_ts {
@@ -7599,6 +7602,25 @@ fn query_window_ms() -> Int64 {
 const TS_MAX : Int64 = 9223372036854775807L
 
 ///|
+/// Parse a command-line timestamp argument (M216): a plain integer is epoch
+/// milliseconds (the historical format), anything else falls back to the
+/// 2.3 ISO-8601 parser (`2026-11-12T08:02:00Z`, bare dates, offsets, comma
+/// fractions) so a time window can be given in the same format the records
+/// display. `word` names the option in the error ("since"/"until").
+fn parse_ts_arg(word : String, s : String) -> Int64 raise @io.IoError {
+  let n = @string.parse_int64(s) catch { _ => -1L }
+  if n >= 0 {
+    n
+  } else {
+    let ms = @core.parse_iso8601_ms(@utf8.encode(s), -1L)
+    if ms < 0 {
+      raise @io.IoError::Invalid("invalid " + word + ": " + s)
+    }
+    ms
+  }
+}
+
+///|
 /// Whether a record timestamp passes the half-open `[lo, hi)` epoch-ms bounds
 /// of the 4.3 forced time range. `lo <= 0` and `hi >= TS_MAX` mean unbounded.
 fn scan_ts_allows(rec_ts : Int64, lo_ts : Int64, hi_ts : Int64) -> Bool {
@@ -7612,17 +7634,17 @@ fn scan_ts_allows(rec_ts : Int64, lo_ts : Int64, hi_ts : Int64) -> Bool {
 /// unbounded; with `--require-time` such a scan is rejected outright;
 /// `--since 0` is an explicit full-history scan and bypasses both. Returns
 /// the half-open `[lo, hi)` epoch-ms bounds (`lo=0`/`hi=TS_MAX` = unbounded).
+/// With `json` the default-window INFO note is suppressed so a machine
+/// readable stdout stays clean.
 fn scan_time_bounds(
   cmd : String,
   since : String?,
   until : String?,
   require_time : Bool,
+  json : Bool,
 ) -> (Int64, Int64) raise @io.IoError {
   let lo : Int64 = match since {
-    Some(s) =>
-      @string.parse_int64(s) catch {
-        _ => raise @io.IoError::Invalid("invalid since: " + s)
-      }
+    Some(s) => parse_ts_arg("since", s)
     None => {
       if require_time {
         raise @io.IoError::Invalid(
@@ -7631,21 +7653,20 @@ fn scan_time_bounds(
         )
       }
       let win = query_window_ms()
-      println(
-        "INFO " +
-        cmd +
-        " scoped to the last " +
-        (win / (1000 : Int64)).to_string() +
-        "s (default window; pass --since to override, --since 0 for everything)",
-      )
+      if !json {
+        println(
+          "INFO " +
+          cmd +
+          " scoped to the last " +
+          (win / (1000 : Int64)).to_string() +
+          "s (default window; pass --since to override, --since 0 for everything)",
+        )
+      }
       now_ms() - win
     }
   }
   let hi : Int64 = match until {
-    Some(s) =>
-      @string.parse_int64(s) catch {
-        _ => raise @io.IoError::Invalid("invalid until: " + s)
-      }
+    Some(s) => parse_ts_arg("until", s)
     None => TS_MAX
   }
   (lo, hi)
@@ -7733,12 +7754,7 @@ fn cmd_query(
   // the query degrades to the default window, or (with `--require-time`) is
   // rejected. `--since 0` is explicit and scans everything.
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None =>
       if require_time {
         raise @io.IoError::Invalid(
@@ -7775,12 +7791,7 @@ fn cmd_query(
     segs: 0,
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   let min_rank : Int32? = match level_min {
@@ -8749,12 +8760,7 @@ fn cmd_aggregate(
   // pushed down to segment min_ts/max_ts. `--since 0` is an explicit
   // full-history aggregation; otherwise the default window applies.
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => {
       let win = query_window_ms()
       if !json {
@@ -8768,12 +8774,7 @@ fn cmd_aggregate(
     }
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   // 5.1 production guards: share the 4.6 query slot/guard and scan outside
@@ -9141,21 +9142,11 @@ fn cmd_dashboard(
     raise @io.IoError::Invalid("last must be positive")
   }
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => None
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   match (since_ts, until_ts) {
@@ -10003,21 +9994,11 @@ fn cmd_anomalies(
     None => 3.0
   }
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => None
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   let now = now_ms()
@@ -10707,12 +10688,7 @@ fn cmd_cluster(
   // Time scoping + guards (5.2): same window/pushdown/slot/guard template
   // as query/search/aggregate; clustering scans outside the writer lock.
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => {
       let win = query_window_ms()
       if !json {
@@ -10726,12 +10702,7 @@ fn cmd_cluster(
     }
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   acquire_query_slot(dir)
@@ -11050,12 +11021,7 @@ fn cmd_trend(
   // default window as query/search and pushed down to segment min_ts/max_ts;
   // it also shares the 4.6 slot/guard and scans outside the writer lock.
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => {
       let win = query_window_ms()
       if !json {
@@ -11069,12 +11035,7 @@ fn cmd_trend(
     }
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   acquire_query_slot(dir)
@@ -13621,21 +13582,11 @@ fn cmd_audit(
     None => 200
   }
   let since_ts : Int64? = match since {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid since: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("since", s))
     None => None
   }
   let until_ts : Int64? = match until {
-    Some(s) =>
-      Some(
-        @string.parse_int64(s) catch {
-          _ => raise @io.IoError::Invalid("invalid until: " + s)
-        },
-      )
+    Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
   let (raw_lines, files) = audit_read_lines(dir, all)
@@ -16420,6 +16371,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut mode = "text"
+      let mut json = false
       let mut prefix : String? = (None : String?)
       let mut match_text : String? = (None : String?)
       let mut from_ts : String? = (None : String?)
@@ -16462,6 +16414,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--timeout" && i + 1 < args.length() {
           timeout = Some(args[i + 1])
           i = i + 1
+        } else if a == "--json" {
+          json = true
         } else if a == "text" || a == "base64" {
           mode = a
         } else {
@@ -16483,6 +16437,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         host,
         trace,
         timeout,
+        json,
       )
     }
   } else if cmd == "purge" {

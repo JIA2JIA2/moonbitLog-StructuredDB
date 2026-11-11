@@ -241,3 +241,19 @@ test "tier policy roundtrips an explicit warm 0 (M214)" {
   remove_tree(dir)
   remove_tree(cold)
 }
+
+///|
+test "parse_ts_arg accepts epoch ms and ISO-8601 (M216)" {
+  // Plain integers stay epoch milliseconds (historical format).
+  assert_eq(parse_ts_arg("since", "0"), 0L)
+  assert_eq(parse_ts_arg("since", "1794458520000"), 1794458520000L)
+  // ISO-8601 date-time with Z; bare dates are midnight UTC (2.3).
+  assert_eq(parse_ts_arg("since", "2026-11-12T08:02:00Z"), 1794470520000L)
+  assert_eq(parse_ts_arg("until", "2026-11-12"), 1794441600000L)
+  // Junk still fails with the option-naming error.
+  let mut raised = false
+  ignore(parse_ts_arg("since", "not-a-time")) catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+}
