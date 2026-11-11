@@ -59,6 +59,8 @@ pub fn parse_quota_usage(Bytes) -> QuotaUsage?
 
 pub fn parse_rbac_line(Bytes) -> RbacRole?
 
+pub fn parse_rfc2822_ms(Bytes, Int64) -> Int64
+
 pub fn parse_ttl_policy(Bytes) -> TtlPolicy?
 
 pub fn quota_for_role(Array[QuotaRule], Bytes) -> QuotaRule?

@@ -4282,6 +4282,7 @@ fn cmd_ingest(
   let mut total = 0
   let mut duplicates = 0
   let mut sampled_out = 0
+  let mut ts_fallback = 0
   let mut go = true
   while go {
     let size = @backend_native.file_size(file)
@@ -4291,9 +4292,12 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let (written, sampled, dup) = ingest_lines(dir, lines, opts, dedup, false)
+      let (written, sampled, dup, fb) = ingest_lines(
+        dir, lines, opts, dedup, false,
+      )
       duplicates = duplicates + dup
       sampled_out = sampled_out + sampled
+      ts_fallback = ts_fallback + fb
       total = total + written
       pos = pos + consumed
       @backend_native.save_named_cursor(
@@ -4318,12 +4322,20 @@ fn cmd_ingest(
   } else {
     ""
   }
+  let ts_note = if ts_fallback > 0 {
+    " (" +
+    ts_fallback.to_string() +
+    " ts values unparsable, fell back to ingest time)"
+  } else {
+    ""
+  }
   println(
     "ingested " +
     total.to_string() +
     " records" +
     dup_note +
     sampled_note +
+    ts_note +
     " (position " +
     pos.to_string() +
     ", cursor " +
@@ -4335,13 +4347,18 @@ fn cmd_ingest(
 ///|
 /// Record timestamp for a parsed field set: the `--ts-field` value when
 /// present and parsable — through `normalize_ts`, so any numeric precision
-/// (s/ms/µs/ns) or ISO-8601 zone offset is accepted — else the fallback
-/// (arrival order based).
+/// (s/ms/µs/ns), epoch seconds with a fraction, RFC 2822, a bare date or any
+/// ISO-8601 zone offset is accepted — else the fallback (arrival order
+/// based). Returns `(ts, from_source)`: a record counts as a fallback only
+/// when `--ts-field` is configured but the value cannot be parsed — that is
+/// the silent failure mode which quietly breaks event-time ordering across
+/// time zones. No `--ts-field` at all is a configuration choice, not a
+/// parse failure, so those records do not count.
 fn ingest_timestamp(
   fields : Array[(Bytes, Bytes)],
   opts : IngestOptions,
   fallback : Int64,
-) -> Int64 {
+) -> (Int64, Bool) {
   match opts.ts_field_bytes {
     Some(fb) => {
       let mut found : Int64? = None
@@ -4351,11 +4368,11 @@ fn ingest_timestamp(
         }
       }
       match found {
-        Some(t) => t
-        None => fallback
+        Some(t) => (t, t != fallback)
+        None => (fallback, false)
       }
     }
-    None => fallback
+    None => (fallback, true)
   }
 }
 
@@ -4412,8 +4429,9 @@ fn schema_transform(
 /// matches the key's latest live record is recognized as a duplicate delivery
 /// and skipped. With a sampling config, lines are filtered at the source
 /// (severity, include/exclude rules, deterministic rate). Returns `(written,
-/// sampled_out)` — the number of records actually appended and how many the
-/// sampler dropped.
+/// sampled_out, duplicates, ts_fallback)` — records actually appended, lines
+/// the sampler dropped, duplicate deliveries skipped, and records whose
+/// source timestamp was unparsable so the arrival time was used instead.
 
 ///|
 /// Sidecar cache of unique record IDs seen by the dedup path. The log remains
@@ -4642,11 +4660,16 @@ fn ingest_lines(
   opts : IngestOptions,
   dedup : @hashmap.HashMap[Bytes, Bool]?,
   skip_sampling : Bool,
-) -> (Int32, Int32, Int32) raise @io.IoError {
+) -> (Int32, Int32, Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
   let mut sampled_out = 0
   let mut duplicates = 0
+  // 2.3 observability: records whose timestamp could not be parsed from the
+  // source fell back to the arrival-order time — the silent failure mode
+  // that breaks cross-timezone event-time ordering, so it is counted and
+  // surfaced by every ingest entry point.
+  let mut ts_fallback = 0
   let scope = active_scope(dir)
   let mut i = 0
   // One lock hold and one metadata write per window of up to 16 batches:
@@ -4669,6 +4692,7 @@ fn ingest_lines(
     let mut window_written = 0
     let mut window_sampled = 0
     let mut window_duplicates = 0
+    let mut window_ts_fallback = 0
     let mut window_bytes : Int64 = 0
     let window_dedup : Array[(UInt64, Bytes)] = []
     run_locked(dir, true, () => {
@@ -4766,8 +4790,8 @@ fn ingest_lines(
               Some(u) => dedup_attach_uid(v, u)
               None => v
             }
-            let raw_ts = match schema_ts {
-              Some(t) => t
+            let (raw_ts, ts_from_source) = match schema_ts {
+              Some(t) => (t, true)
               None => ingest_timestamp(fields, opts, ts_base + j.to_int64())
             }
             // 2.3 clock-skew correction: a fixed offset (ms) applied to every
@@ -4791,6 +4815,9 @@ fn ingest_lines(
             }
             if wrote {
               window_written = window_written + 1
+              if !ts_from_source {
+                window_ts_fallback = window_ts_fallback + 1
+              }
               window_bytes = window_bytes + (k.length() + v.length()).to_int64()
               match (dedup, uid) {
                 (Some(seen), Some(u)) => {
@@ -4813,9 +4840,10 @@ fn ingest_lines(
     written = written + window_written
     sampled_out = sampled_out + window_sampled
     duplicates = duplicates + window_duplicates
+    ts_fallback = ts_fallback + window_ts_fallback
     i = window_end
   }
-  (written, sampled_out, duplicates)
+  (written, sampled_out, duplicates, ts_fallback)
 }
 
 ///|
@@ -4999,6 +5027,7 @@ fn cmd_ingest_fifo(
   let mut total = 0
   let mut sampled = 0
   let mut duplicates = 0
+  let mut ts_fallback = 0
   while !@backend_native.shutdown_requested() {
     let fd = @backend_native.open_read_blocking(path)
     if fd < 0 {
@@ -5020,12 +5049,13 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, dropped, dup) = ingest_lines(
+          let (written, dropped, dup, fb) = ingest_lines(
             dir, lines, opts, dedup, false,
           )
           total = total + written
           sampled = sampled + dropped
           duplicates = duplicates + dup
+          ts_fallback = ts_fallback + fb
         }
       }
     }
@@ -5044,7 +5074,9 @@ fn cmd_ingest_fifo(
     actual_sample_rate_pct(total.to_int64(), sampled.to_int64()).to_string() +
     "%) / " +
     duplicates.to_string() +
-    " duplicates, " +
+    " duplicates / " +
+    ts_fallback.to_string() +
+    " ts fallback, " +
     path +
     ")",
   )
@@ -5136,6 +5168,10 @@ struct HttpQueue {
   mut written : Int64
   mut sampled : Int64
   mut duplicates : Int64
+  // 2.3 observability: drained records whose source timestamp was unparsable
+  // and fell back to the drain time (surfaced via /stats and the final
+  // summary, so cross-timezone ordering breakage is visible).
+  mut ts_fallback : Int64
   // Unique-ID dedup set (built once at startup when --dedup-field is set);
   // the drain skips records whose ID was already written.
   dedup : @hashmap.HashMap[Bytes, Bool]?
@@ -5306,7 +5342,7 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   q.head = q.head + take
   q.pending = q.pending - take
   q.pending_bytes = q.pending_bytes - freed_bytes
-  let (batch_written, _, batch_dup) = ingest_lines(
+  let (batch_written, _, batch_dup, batch_ts_fb) = ingest_lines(
     dir,
     chunk,
     q.opts,
@@ -5315,6 +5351,7 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
   )
   q.written = q.written + batch_written.to_int64()
   q.duplicates = q.duplicates + batch_dup.to_int64()
+  q.ts_fallback = q.ts_fallback + batch_ts_fb.to_int64()
   if q.head > 4096 && q.head * 2 > q.lines.length() {
     let rest : Array[Bytes] = []
     let mut j = q.head
@@ -5448,6 +5485,8 @@ fn handle_http_connection(
         sampling_stats_json(q.opts.sampling, q.written, q.sampled) +
         ",\"duplicates\":" +
         q.duplicates.to_string() +
+        ",\"ts_fallback\":" +
+        q.ts_fallback.to_string() +
         ",\"backlog_alerts\":" +
         q.alerts.to_string() +
         ",\"pending_peak\":" +
@@ -5752,6 +5791,7 @@ fn cmd_http(
     accepted: 0,
     written: 0,
     sampled: 0,
+    ts_fallback: 0,
     duplicates: 0,
     dedup,
     opts,
