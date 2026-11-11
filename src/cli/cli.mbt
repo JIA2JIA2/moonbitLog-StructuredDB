@@ -192,7 +192,8 @@
 ///                                    (--limit -1 removes the cap)
 ///   context <dir> <offset> [--before N] [--after N]
 ///                           [--trace-id <id|auto>] [--thread-id <id|auto>]
-///                           [--service <svc>] [--sort-by-time]
+///                           [--service <svc>] [--sort-by-time] [--json]
+///                           [--timeout ms]
 ///                                    print the records around one offset; with
 ///                                    correlation options only records sharing
 ///                                    the trace/thread (auto = extracted from
@@ -7900,6 +7901,8 @@ fn cmd_context(
   service : String?,
   thread_id : String?,
   sort_by_time : Bool,
+  json : Bool,
+  timeout : String?,
 ) -> Unit raise @io.IoError {
   let scope = active_scope(dir)
   let target = parse_offset(offset)
@@ -7917,8 +7920,29 @@ fn cmd_context(
       }
     None => 3
   }
-  run_locked(dir, false, () => {
-    let log = open_log(dir)
+  // 4.6 query protection covers context too: the anchor scan reads from the
+  // start of the log up to the anchor, so it takes the same concurrency slot,
+  // tenant quota, timeout and scan budget as every other reader. The scan
+  // runs on a snapshot (4.6) — the directory lock is only held while the
+  // segments are opened, so ingestion keeps flowing during a deep context
+  // lookup.
+  acquire_query_slot(dir)
+  acquire_tenant_query_quota(dir)
+  let timeout_val : Int64 = match timeout {
+    Some(t) =>
+      @string.parse_int64(t) catch {
+        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
+      }
+    None => query_timeout_ms()
+  }
+  let qg : QueryGuard = {
+    t0: now_ms(),
+    timeout: timeout_val,
+    budget: max_scan_bytes(),
+    scanned: 0,
+    segs: 0,
+  }
+  run_read_snapshot(dir, log => {
     if target >= log.next_offset() {
       raise @io.IoError::Invalid("offset out of range: " + offset)
     }
@@ -7991,7 +8015,26 @@ fn cmd_context(
     let ring : Array[@core.Record] = []
     let mut out_after = 0
     let window : Array[@core.Record] = []
+    // Scan budget: a context lookup near the tail of a large log walks every
+    // segment, so account the whole scan set up front like search does.
+    for seg in log.segments {
+      qg.check(seg.size)
+    }
+    let mut seen = 0
+    let mut abort_msg : String? = None
     log.for_each_while((0 : UInt64), log.next_offset(), rec => {
+      seen = seen + 1
+      // Record-granularity timeout sampling (4.6): segment-level checks alone
+      // miss a runaway scan inside one huge segment.
+      if seen % 512 == 0 {
+        match qg.check_soft(0) {
+          Some(m) => abort_msg = Some(m)
+          None => ()
+        }
+      }
+      if abort_msg is Some(_) {
+        return false
+      }
       if !scope_allows_key(scope, rec.key) {
         return true
       }
@@ -8060,6 +8103,10 @@ fn cmd_context(
       }
       true
     })
+    match abort_msg {
+      Some(m) => raise @io.IoError::Invalid(m)
+      None => ()
+    }
     // Event-time order (4.4) for out-of-order delivery; ties keep offset order.
     if sort_by_time {
       window
@@ -8079,10 +8126,15 @@ fn cmd_context(
       })
     }
     for r in window {
-      print_record(r)
+      if json {
+        print_json_record(r)
+      } else {
+        print_record(r)
+      }
     }
-    println("(" + window.length().to_string() + " records)")
-    close_log(log)
+    if !json {
+      println("(" + window.length().to_string() + " records)")
+    }
   })
 }
 
@@ -13650,6 +13702,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut service : String? = (None : String?)
       let mut thread_id : String? = (None : String?)
       let mut sort_by_time = false
+      let mut json = false
+      let mut timeout : String? = (None : String?)
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -13670,6 +13724,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--sort-by-time" {
           sort_by_time = true
+        } else if a == "--json" {
+          json = true
+        } else if a == "--timeout" && i + 1 < args.length() {
+          timeout = Some(args[i + 1])
+          i = i + 1
+        } else {
+          raise @io.IoError::Invalid("unknown context option: " + a)
         }
         i = i + 1
       }
@@ -13682,6 +13743,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         service,
         thread_id,
         sort_by_time,
+        json,
+        timeout,
       )
     }
   } else if cmd == "aggregate" {
