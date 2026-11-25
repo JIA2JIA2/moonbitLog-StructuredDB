@@ -11,6 +11,10 @@ pub(all) struct HttpRequest {
   // confirmed batch id is replayed as a no-op so client retries never
   // duplicate data.
   batch_id : Bytes
+  // `Transfer-Encoding: chunked`: the body has no Content-Length and must be
+  // de-framed before it is parsed as log lines. Treating the chunk framing as
+  // payload used to land garbage records in the store with a 202 response.
+  chunked : Bool
 }
 
 ///|
@@ -31,6 +35,7 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
   let mut content_length = 0
   let mut authorization : Bytes = b""
   let mut batch_id : Bytes = b""
+  let mut chunked = false
   let mut pos = first_end + 1
   while pos < head.length() {
     let end = find_byte_http(head, 10, pos)
@@ -67,6 +72,14 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
         v = v + 1
       }
       batch_id = slice(line, v, line.length())
+    } else if has_ci_prefix_http(line, b"transfer-encoding:") {
+      let mut v = 18
+      while v < line.length() && line.at(v).to_int() == 32 {
+        v = v + 1
+      }
+      if has_ci_token_http(line, v, b"chunked") {
+        chunked = true
+      }
     }
     pos = end + 1
   }
@@ -76,7 +89,112 @@ pub fn parse_http_request(head : Bytes) -> HttpRequest? {
     content_length,
     authorization,
     batch_id,
+    chunked,
   })
+}
+
+///|
+/// Result of de-framing a chunked body. `NeedMore` means the buffer does not
+/// yet hold a whole body (read another chunk); `Malformed` is a framing error
+/// and must be rejected instead of being parsed as data.
+pub(all) enum ChunkedBody {
+  Complete(Bytes)
+  NeedMore
+  Malformed
+}
+
+///|
+/// Decode an HTTP/1.1 chunked body: `<hex-size>[;ext]\r\n<data>\r\n` repeated,
+/// terminated by a zero-size chunk. Chunk extensions and trailer headers are
+/// ignored; the returned payload carries no framing bytes.
+pub fn decode_chunked_body(data : Bytes) -> ChunkedBody {
+  let out = @buffer.Buffer::Buffer()
+  let mut pos = 0
+  let mut total = 0
+  while true {
+    let size_end = find_crlf_http(data, pos)
+    if size_end < 0 {
+      // A size line longer than this cannot be a valid hex chunk size; fail
+      // fast instead of buffering an unbounded "line".
+      if data.length() - pos > 64 {
+        return Malformed
+      }
+      return NeedMore
+    }
+    let mut size = 0
+    let mut saw_digit = false
+    let mut i = pos
+    while i < size_end {
+      let c = data.at(i).to_int()
+      if c == 59 {
+        // ';' starts a chunk extension: the rest of the size line is metadata.
+        i = size_end
+      } else {
+        let d = hex_value_http(c)
+        if d < 0 {
+          // Tolerate surrounding spaces (some clients pad), nothing else.
+          if c != 32 {
+            return Malformed
+          }
+          i = i + 1
+        } else {
+          saw_digit = true
+          size = size * 16 + d
+          if size > 1_048_576 {
+            return Malformed
+          }
+          i = i + 1
+        }
+      }
+    }
+    if !saw_digit {
+      return Malformed
+    }
+    if size == 0 {
+      // Zero chunk: the payload is complete (trailers are not needed).
+      return Complete(out.to_bytes())
+    }
+    let data_start = size_end + 2
+    if data_start + size + 2 > data.length() {
+      return NeedMore
+    }
+    if data.at(data_start + size).to_int() != 13 ||
+      data.at(data_start + size + 1).to_int() != 10 {
+      return Malformed
+    }
+    out.write_bytes(slice(data, data_start, data_start + size))
+    total = total + size
+    if total > 1_048_576 {
+      return Malformed
+    }
+    pos = data_start + size + 2
+  }
+  Complete(out.to_bytes())
+}
+
+///|
+fn hex_value_http(c : Int32) -> Int32 {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 97 + 10
+  } else if c >= 65 && c <= 70 {
+    c - 65 + 10
+  } else {
+    -1
+  }
+}
+
+///|
+fn find_crlf_http(data : Bytes, from : Int32) -> Int32 {
+  let mut i = from
+  while i + 1 < data.length() {
+    if data.at(i).to_int() == 13 && data.at(i + 1).to_int() == 10 {
+      return i
+    }
+    i = i + 1
+  }
+  -1
 }
 
 ///|
@@ -131,4 +249,25 @@ fn has_ci_prefix_http(data : Bytes, prefix : Bytes) -> Bool {
     i = i + 1
   }
   true
+}
+
+///|
+fn has_ci_token_http(data : Bytes, from : Int32, needle : Bytes) -> Bool {
+  let mut i = from
+  while i + needle.length() <= data.length() {
+    let mut j = 0
+    let mut ok = true
+    while j < needle.length() && ok {
+      if lower_ascii(data.at(i + j).to_int()) !=
+        lower_ascii(needle.at(j).to_int()) {
+        ok = false
+      }
+      j = j + 1
+    }
+    if ok {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }

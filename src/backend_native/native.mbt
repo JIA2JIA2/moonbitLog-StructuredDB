@@ -68,6 +68,14 @@ extern "C" fn moonlog_closedir(handle : Int64) -> Int32 = "moonlog_closedir"
 extern "C" fn moonlog_mtime_ns(path : Bytes) -> Int64 = "moonlog_mtime_ns"
 
 ///|
+#borrow(path)
+extern "C" fn moonlog_file_identity(path : Bytes) -> Int64 = "moonlog_file_identity"
+
+///|
+#borrow(path)
+extern "C" fn moonlog_is_dir(path : Bytes) -> Int32 = "moonlog_is_dir"
+
+///|
 #borrow(target, link_path)
 extern "C" fn moonlog_symlink(target : Bytes, link_path : Bytes) -> Int32 = "moonlog_symlink"
 
@@ -1294,6 +1302,41 @@ pub fn list_cursor_positions(
 }
 
 ///|
+/// Read a named consumer position plus the source-tail signature stored after
+/// the cursor blob. The signature lets ingest detect a rotated/replaced source
+/// even when the filesystem reuses the inode number (overlayfs does when a
+/// file is removed and recreated immediately) and the new file is larger than
+/// the committed position. Empty when the cursor carries no signature.
+pub fn load_named_cursor_tail(dir : String, name : String) -> (UInt64, Bytes) {
+  let data = read_file(named_cursor_path(dir, name))
+  if data.length() < 16 {
+    return ((0 : UInt64), b"")
+  }
+  let position = @log.decode_cursor(data) catch {
+    _ => return ((0 : UInt64), b"")
+  }
+  (position, @core.slice(data, 16, data.length()))
+}
+
+///|
+/// Persist a named consumer position together with a signature of the
+/// consumed source bytes (atomic replace). The cursor blob keeps its usual
+/// 16-byte layout, so `cursor-load`/`cursor-list` and lag reporting are
+/// unaffected; the signature is an inert suffix only ingest reads.
+pub fn save_named_cursor_tail(
+  dir : String,
+  name : String,
+  position : UInt64,
+  tail : Bytes,
+) -> Unit raise @io.IoError {
+  write_file_atomic(
+    dir,
+    named_cursor_name(name),
+    @log.encode_cursor(position) + tail,
+  )
+}
+
+///|
 /// Delete a named consumer cursor's position file.
 pub fn remove_named_cursor(dir : String, name : String) -> Unit {
   ignore(remove_file(named_cursor_path(dir, name)))
@@ -1431,6 +1474,22 @@ fn count_segment_files(dir : String) -> Int32 raise @io.IoError {
     }
   }
   n
+}
+
+///|
+/// Identity of the file at `path` (device + inode), or -1 when it is missing.
+/// A changed identity at the same path means the file was rotated/replaced:
+/// ingest must restart from byte zero even if the new file is larger than the
+/// committed position.
+pub fn file_identity(path : String) -> Int64 {
+  moonlog_file_identity(@utf8.encode(path))
+}
+
+///|
+/// Whether `path` names a directory (used to reject a directory passed as an
+/// ingest source with a clear error instead of reading zero records).
+pub fn path_is_dir(path : String) -> Bool {
+  moonlog_is_dir(@utf8.encode(path)) == 1
 }
 
 ///|

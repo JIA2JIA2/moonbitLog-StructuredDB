@@ -5281,6 +5281,42 @@ fn split_complete_lines(
 }
 
 ///|
+/// Number of source bytes kept as the rotation signature: enough that a
+/// rotated file is very unlikely to repeat the same tail by chance, small
+/// enough that saving it with every cursor update stays negligible.
+const INGEST_TAIL_LEN : Int32 = 64
+
+///|
+/// Read the last `INGEST_TAIL_LEN` bytes before `pos` — the signature of what
+/// this ingest pipeline has already consumed. Empty when the position is zero
+/// or the file cannot be read.
+fn ingest_read_tail(file : String, pos : Int64) -> Bytes {
+  if pos <= (0 : Int64) {
+    return b""
+  }
+  let want = if pos < INGEST_TAIL_LEN.to_int64() {
+    pos.to_int()
+  } else {
+    INGEST_TAIL_LEN
+  }
+  let f = @backend_native.NativeFileLog::open_readonly(file) catch {
+    _ => return b""
+  }
+  let data = f.read_at(pos - want.to_int64(), want) catch { _ => b"" }
+  f.close()
+  data
+}
+
+///|
+/// Whether the bytes ending at the committed position are still the ones that
+/// were consumed. False means the source was rotated or rewritten under the
+/// position (even when the new file is larger), so ingest must restart at 0.
+fn ingest_tail_matches(file : String, pos : Int64, tail : Bytes) -> Bool {
+  let current = ingest_read_tail(file, pos)
+  current.length() == tail.length() && current == tail
+}
+
+///|
 /// Parse one raw line into `name=value` field pairs according to the format:
 /// - `kv`: space-separated `name=value` pairs (as-is).
 /// - `json`: top-level JSON object fields (numbers/booleans render as text;
@@ -5397,6 +5433,14 @@ fn cmd_ingest(
     cmd_ingest_fifo(dir, file, opts)
     return
   }
+  // Agent collection runs for the lifetime of a deployment: handle
+  // SIGTERM/SIGINT cooperatively so a stop request flushes the final batch,
+  // persists the cursor and prints the terminal summary instead of killing
+  // the process by the default signal disposition (exit 143, no summary).
+  @backend_native.install_shutdown_handler()
+  if @backend_native.path_is_dir(file) {
+    raise @io.IoError::Invalid("source is a directory: " + file)
+  }
   let dedup = match opts.dedup_field_bytes {
     Some(_) => Some(load_dedup(dir))
     None => None
@@ -5419,20 +5463,77 @@ fn cmd_ingest(
       }
     }
   }
-  let mut pos : Int64 = match opts.from_bytes {
-    Some(b) => b
-    None =>
-      @backend_native.load_named_cursor(dir, cursor_name).reinterpret_as_int64()
+  // A missing source in one-shot mode is an operator error, not "0 records":
+  // the old silent success made a mistyped path indistinguishable from an
+  // empty file. Follow mode instead waits for the file to appear.
+  if !follow && @backend_native.file_size(file) < (0 : Int64) {
+    raise @io.IoError::Invalid("source file not found: " + file)
+  }
+  // Rotation identity: `--from` starts a fresh explicit position on whatever
+  // file is there now; otherwise the cursor's saved tail signature lets a
+  // restart notice that the path was rotated while the agent was down.
+  let mut last_identity : Int64 = @backend_native.file_identity(file)
+  let mut missing_noted = false
+  let mut pos : Int64 = (0 : Int64)
+  let mut tail : Bytes = b""
+  match opts.from_bytes {
+    Some(b) => pos = b
+    None => {
+      let (saved, saved_tail) = @backend_native.load_named_cursor_tail(
+        dir, cursor_name,
+      )
+      pos = saved.reinterpret_as_int64()
+      tail = saved_tail
+    }
   }
   let mut total = 0
   let mut duplicates = 0
   let mut sampled_out = 0
   let mut ts_fallback = 0
   let mut go = true
-  while go {
+  while go && !@backend_native.shutdown_requested() {
     let size = @backend_native.file_size(file)
-    if size >= (0 : Int64) && size < pos {
-      pos = 0
+    if size < (0 : Int64) && follow && !missing_noted {
+      println("waiting for source file: " + file)
+      missing_noted = true
+    }
+    if size >= (0 : Int64) {
+      missing_noted = false
+      // Two independent rotation signals. Size alone is not enough: a rotated
+      // file whose new content is already larger than the committed position
+      // looks like a plain append, so the old code resumed at the old offset
+      // and silently skipped the new file's head. The inode/device identity
+      // catches it on ordinary filesystems, but overlayfs reuses the inode
+      // when a file is removed and recreated immediately, so the committed
+      // position is also verified against the signature of the bytes consumed
+      // at that position (saved with the cursor, so it survives a restart).
+      let identity = @backend_native.file_identity(file)
+      let rotated_by_identity = identity >= (0 : Int64) &&
+        last_identity >= (0 : Int64) &&
+        identity != last_identity
+      let rotated_by_content = pos > (0 : Int64) &&
+        tail.length() > 0 &&
+        !ingest_tail_matches(file, pos, tail)
+      if rotated_by_identity || rotated_by_content {
+        if pos > 0 {
+          println(
+            "source rotated or rewritten: " +
+            file +
+            " (restarting from 0, was " +
+            pos.to_string() +
+            ")",
+          )
+        }
+        pos = 0
+        tail = b""
+      }
+      if identity >= (0 : Int64) {
+        last_identity = identity
+      }
+      if size < pos {
+        pos = 0
+        tail = b""
+      }
     }
     if size > pos {
       let data = read_from(file, pos)
@@ -5445,10 +5546,12 @@ fn cmd_ingest(
       ts_fallback = ts_fallback + fb
       total = total + written
       pos = pos + consumed
-      @backend_native.save_named_cursor(
+      tail = ingest_read_tail(file, pos)
+      @backend_native.save_named_cursor_tail(
         dir,
         cursor_name,
         pos.reinterpret_as_uint64(),
+        tail,
       )
     }
     if follow {
@@ -6207,6 +6310,24 @@ fn cmd_ingest_fifo(
         }
       }
     }
+    // A writer that closes without a trailing newline still sent one final
+    // record. The tail used to be held for "the next chunk" and then dropped
+    // when the writer closed (or concatenated with the next writer's first
+    // line). Flush it as its own record on EOF instead.
+    if leftover.length() > 0 && !@backend_native.shutdown_requested() {
+      let (written, dropped, dup, fb) = ingest_lines(
+        dir,
+        [leftover],
+        opts,
+        dedup,
+        false,
+      )
+      total = total + written
+      sampled = sampled + dropped
+      duplicates = duplicates + dup
+      ts_fallback = ts_fallback + fb
+      leftover = b""
+    }
     @backend_native.close_fd(fd)
     if @backend_native.shutdown_requested() {
       break
@@ -6256,10 +6377,20 @@ fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
     "Accepted"
   } else if status == 400 {
     "Bad Request"
+  } else if status == 401 {
+    "Unauthorized"
+  } else if status == 403 {
+    "Forbidden"
   } else if status == 404 {
     "Not Found"
+  } else if status == 411 {
+    "Length Required"
+  } else if status == 413 {
+    "Payload Too Large"
   } else if status == 429 {
     "Too Many Requests"
+  } else if status == 500 {
+    "Internal Server Error"
   } else {
     "Error"
   }
@@ -6562,23 +6693,69 @@ fn handle_http_connection(
     }
   }
   let mut body = @core.slice(head, header_end, head.length())
-  while body.length() < request.content_length &&
-        body.length() < 1_048_576 &&
-        now_ms() < deadline {
-    // Keep writing buffered lines while the body streams in, so a large
-    // upload does not starve the disk writer.
-    http_queue_drain(q, dir)
-    let chunk = @backend_native.conn_read(conn, 4096)
-    if chunk.length() == 0 {
-      break
+  if request.chunked {
+    // A chunked upload carries no Content-Length: read until the terminating
+    // zero-size chunk arrives, then use the de-framed payload. The chunk
+    // framing itself is never parsed as log text — that used to land garbage
+    // records (chunk sizes, CRLFs) in the store with a 202 response.
+    let mut finished = false
+    let mut decoded = b""
+    while !finished {
+      match @core.decode_chunked_body(body) {
+        @core.ChunkedBody::Complete(d) => {
+          decoded = d
+          finished = true
+        }
+        @core.ChunkedBody::Malformed => {
+          http_respond(conn, 400, "{\"error\":\"malformed chunked body\"}")
+          return
+        }
+        @core.ChunkedBody::NeedMore => {
+          if now_ms() >= deadline || body.length() >= 1_048_576 {
+            http_respond(
+              conn, 400, "{\"error\":\"incomplete or oversized chunked body\"}",
+            )
+            return
+          }
+          http_queue_drain(q, dir)
+          let chunk = @backend_native.conn_read(conn, 4096)
+          if chunk.length() == 0 {
+            http_respond(conn, 400, "{\"error\":\"incomplete chunked body\"}")
+            return
+          }
+          body = body + chunk
+        }
+      }
     }
-    body = body + chunk
-  }
-  // A short body means the client stalled (recv timeout) or disconnected:
-  // reject instead of persisting a truncated line.
-  if body.length() < request.content_length {
-    http_respond(conn, 400, "{\"error\":\"truncated or oversized body\"}")
-    return
+    body = decoded
+  } else {
+    while body.length() < request.content_length &&
+          body.length() < 1_048_576 &&
+          now_ms() < deadline {
+      // Keep writing buffered lines while the body streams in, so a large
+      // upload does not starve the disk writer.
+      http_queue_drain(q, dir)
+      let chunk = @backend_native.conn_read(conn, 4096)
+      if chunk.length() == 0 {
+        break
+      }
+      body = body + chunk
+    }
+    // A short body means the client stalled (recv timeout) or disconnected:
+    // reject instead of persisting a truncated line.
+    if body.length() < request.content_length {
+      http_respond(conn, 400, "{\"error\":\"truncated or oversized body\"}")
+      return
+    }
+    if request.content_length == 0 && body.length() > 0 {
+      // An HTTP/1.0-style upload without Content-Length: its body cannot be
+      // framed, and silently treating it as empty dropped every line.
+      http_respond(conn, 411, "{\"error\":\"length required\"}")
+      return
+    }
+    // Drop bytes read past Content-Length (a pipelined next request); they
+    // used to be ingested as part of this body.
+    body = @core.slice(body, 0, request.content_length)
   }
   let is_get = request.verb == b"GET"
   let is_post = request.verb == b"POST"
@@ -6686,6 +6863,12 @@ fn handle_http_connection(
       None => b""
     }
     let (lines, _) = split_complete_lines(body, true)
+    if lines.length() == 0 {
+      // An empty (or blank-only) push is a client bug; answering 202 with
+      // accepted=0 used to make a dropped payload look successful.
+      http_respond(conn, 400, "{\"error\":\"empty body\"}")
+      return
+    }
     if lines.length() > 10000 {
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
@@ -6805,6 +6988,12 @@ fn handle_http_connection(
       }
     } else {
       q.sampled = q.sampled + sampled_out.to_int64()
+      // The batch is fully resolved even when the sampler dropped every line:
+      // record the id so a retry is a no-op instead of re-sampling (and
+      // re-counting) the same payload.
+      if batch_id_req.length() > 0 {
+        record_batch_id(dir, q.batch_ids, batch_id_req)
+      }
       http_respond(
         conn,
         202,
@@ -14834,23 +15023,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--partition" && i + 1 < args.length() {
           partition_str = Some(args[i + 1])
           i = i + 1
-        } else if a == "--clock-skew" && i + 1 < args.length() {
-          clock_skew = Some(args[i + 1])
-          i = i + 1
         } else if a == "--clock-skew-field" && i + 1 < args.length() {
           clock_skew_field = Some(args[i + 1])
           i = i + 1
-        } else if a == "--mask" {
-          mask = true
         } else if a == "--mask-fields" && i + 1 < args.length() {
           mask_fields = Some(args[i + 1])
           i = i + 1
-        } else if a == "--meta" && i + 1 < args.length() {
-          meta_str = Some(args[i + 1])
-          i = i + 1
-        } else if a == "--partition" && i + 1 < args.length() {
-          partition_str = Some(args[i + 1])
-          i = i + 1
+        } else if a.length() >= 2 && a[0].to_int() == 45 && a[1].to_int() == 45 {
+          raise @io.IoError::Invalid("unknown ingest option: " + a)
+        } else {
+          raise @io.IoError::Invalid("unexpected ingest argument: " + a)
         }
         i = i + 1
       }
@@ -15037,23 +15219,16 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--partition" && i + 1 < args.length() {
           partition_str = Some(args[i + 1])
           i = i + 1
-        } else if a == "--clock-skew" && i + 1 < args.length() {
-          clock_skew = Some(args[i + 1])
-          i = i + 1
         } else if a == "--clock-skew-field" && i + 1 < args.length() {
           clock_skew_field = Some(args[i + 1])
           i = i + 1
-        } else if a == "--mask" {
-          mask = true
         } else if a == "--mask-fields" && i + 1 < args.length() {
           mask_fields = Some(args[i + 1])
           i = i + 1
-        } else if a == "--meta" && i + 1 < args.length() {
-          meta_str = Some(args[i + 1])
-          i = i + 1
-        } else if a == "--partition" && i + 1 < args.length() {
-          partition_str = Some(args[i + 1])
-          i = i + 1
+        } else if a.length() >= 2 && a[0].to_int() == 45 && a[1].to_int() == 45 {
+          raise @io.IoError::Invalid("unknown http option: " + a)
+        } else {
+          raise @io.IoError::Invalid("unexpected http argument: " + a)
         }
         i = i + 1
       }

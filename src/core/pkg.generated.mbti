@@ -21,6 +21,8 @@ pub fn crc32(Bytes) -> UInt32
 
 pub fn crc32_range(Bytes, Int32, Int32) -> UInt32
 
+pub fn decode_chunked_body(Bytes) -> ChunkedBody
+
 pub fn decode_record(Bytes, Int32) -> (Record, Int32) raise DecodeError
 
 pub fn encode_quota_usage(QuotaUsage) -> Bytes
@@ -115,12 +117,19 @@ pub(all) suberror MetaError {
 }
 
 // Types and methods
+pub(all) enum ChunkedBody {
+  Complete(Bytes)
+  NeedMore
+  Malformed
+}
+
 pub(all) struct HttpRequest {
   verb : Bytes
   path : Bytes
   content_length : Int32
   authorization : Bytes
   batch_id : Bytes
+  chunked : Bool
 }
 
 pub(all) struct QuotaRule {

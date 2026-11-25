@@ -273,6 +273,40 @@ int64_t moonlog_mtime_ns(moonbit_bytes_t path) {
   return (int64_t)st.st_mtim.tv_sec * 1000000000 + (int64_t)st.st_mtim.tv_nsec;
 }
 
+/*
+ * Identity of the file currently reachable at `path`: device and inode packed
+ * into one value, or -1 when it does not exist. Ingest rotation detection
+ * compares this between polls; a *different* file at the same path must be
+ * read from zero even when it is already larger than the committed byte
+ * position (size-only detection silently skipped the new file's head).
+ */
+MOONBIT_FFI_EXPORT
+int64_t moonlog_file_identity(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return -1;
+  }
+  struct stat st;
+  if (stat(p, &st) != 0) {
+    free(p);
+    return -1;
+  }
+  free(p);
+  return ((int64_t)st.st_dev << 32) ^ (int64_t)st.st_ino;
+}
+
+MOONBIT_FFI_EXPORT
+int32_t moonlog_is_dir(moonbit_bytes_t path) {
+  char *p = moonlog_c_path(path);
+  if (p == NULL) {
+    return 0;
+  }
+  struct stat st;
+  int r = stat(p, &st);
+  free(p);
+  return (r == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
+
 MOONBIT_FFI_EXPORT
 int32_t moonlog_write_file(moonbit_bytes_t path, moonbit_bytes_t data) {
   char *p = moonlog_c_path(path);
