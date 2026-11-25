@@ -3811,6 +3811,12 @@ fn cmd_tier(
       }
     None => 1
   }
+  // A negative count sweeps the cut past the active segment: the engine
+  // rejects it too, but refusing here keeps --dry-run honest and fails
+  // before any lock or copy work happens.
+  if warm_n < 0 {
+    raise @io.IoError::Invalid("warm count must be >= 0: " + warm_n.to_string())
+  }
   if dry {
     run_locked(dir, false, () => {
       let log = open_log(dir)

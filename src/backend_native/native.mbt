@@ -1148,6 +1148,17 @@ pub fn compress_rolled_segments(
   while i < n {
     if i < n - 1 {
       let seg = log.segments[i]
+      // A cold segment's data lives behind the symlink in the cold tier:
+      // recompressing it would either pull it back into the hot directory
+      // (write_file_atomic replaces the symlink with a local file, and the
+      // cold copy lingers as an orphan) or burn a full read of the cold copy
+      // plus the compression CPU on output that the packed >= raw guard
+      // then discards every maintenance pass. Cold data is immutable under
+      // the single-writer discipline, so skip it entirely.
+      if is_symlink(dir + "/" + @segment.segment_file_name(seg.base_offset)) {
+        i = i + 1
+        continue
+      }
       if !seg.is_compressed() {
         let raw_size = seg.byte_size()
         let raw = seg.reader.read_at((0 : Int64), raw_size.to_int())
@@ -1708,6 +1719,18 @@ pub fn tier_log_dir(
   roll_size : Int64,
   warm_segments : Int32,
 ) -> Int32 raise @io.IoError {
+  // A negative warm count would make the cut sweep past the active segment
+  // (cut = n - 1 - warm >= n), symlink-replacing the segment that is still
+  // being appended to: its writer fd then points at the orphaned inode the
+  // rename just unlinked, and every subsequent append vanishes silently
+  // (measured: put returns an offset, the record is gone, the cold copy
+  // never grows). There is no legitimate negative reading of "how many
+  // newest rolled segments stay hot", so reject it outright.
+  if warm_segments < 0 {
+    raise @io.IoError::Invalid(
+      "warm count must be >= 0: " + warm_segments.to_string(),
+    )
+  }
   // Refuse relative cold paths: the per-segment symlink resolves relative to
   // the main directory, so a relative target would silently dangle and make
   // migrated segments unreadable.
