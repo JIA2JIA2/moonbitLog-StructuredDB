@@ -189,3 +189,65 @@ test "epoch seconds with a fractional part keep milliseconds" {
   assert_eq(@core.normalize_ts(b"1794391200.51.2", (7 : Int64)), (7 : Int64))
   assert_eq(@core.normalize_ts(b"1794391200.512abc", (7 : Int64)), (7 : Int64))
 }
+
+///|
+test "RFC 3164 yearless syslog headers infer the year from the fallback" {
+  // The ingest path passes the arrival-time base; `Nov 25 10:00:00` with a
+  // 2026-11-25T09:00Z anchor lands on the same year. `inner` mirrors the
+  // normalize chain: it must still be the fallback (nothing claimed the
+  // value yet) for the header to be considered.
+  assert_eq(
+    @core.parse_rfc3164_ms(b"Nov 25 10:00:00", 1795597200000L, 1795597200000L),
+    1795600800000L,
+  )
+  // The normalize chain resolves the syslog header end-to-end.
+  assert_eq(
+    @core.normalize_ts(b"Nov 25 10:00:00", 1795597200000L),
+    1795600800000L,
+  )
+  // Seconds are optional and single-digit days are space-padded.
+  assert_eq(
+    @core.parse_rfc3164_ms(b"Nov  5 08:30", 1795597200000L, 1795597200000L),
+    1793867400000L,
+  )
+  // The Dec 31 → Jan 1 wrap steps back a year when the inferred date would
+  // land more than a day ahead of the anchor.
+  assert_eq(
+    @core.parse_rfc3164_ms(b"Dec 31 23:00", 1798884000000L, 1798884000000L),
+    1798758000000L,
+  )
+  // A yearless header cannot be anchored without a base.
+  assert_eq(@core.parse_rfc3164_ms(b"Nov 25 10:00:00", 0L, 0L), 0L)
+  // Non-syslog shapes fail fast; a value an earlier parser claimed is
+  // passed through untouched.
+  assert_eq(
+    @core.parse_rfc3164_ms(
+      b"2026-11-25T10:00:00Z", 1795600800000L, 1795597200000L,
+    ),
+    1795600800000L,
+  )
+}
+
+///|
+test "ISO-8601 tolerates CRI-style trailing text only after an explicit zone" {
+  // `...Z stdout F {...}` — the container-log shape.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-25T10:00:00.123456789Z stdout F", 0L),
+    1795600800123L,
+  )
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-25T10:00:00Z stdout F {...}", 0L),
+    1795600800000L,
+  )
+  // Offset zones tolerate trailing text too.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-25 18:00:00 +08:00 stdout", 0L),
+    1795600800000L,
+  )
+  // Without an explicit zone a trailing token stays rejected — it may be a
+  // mistyped zone tag.
+  assert_eq(
+    @core.parse_iso8601_ms(b"2026-11-25T10:00:00 stdout F", (7 : Int64)),
+    (7 : Int64),
+  )
+}

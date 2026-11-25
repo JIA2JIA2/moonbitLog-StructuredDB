@@ -1540,11 +1540,27 @@ fn cmd_scan_time(
   hi : String,
   timeout : String?,
 ) -> Unit raise @io.IoError {
+  // Plain integers stay epoch milliseconds (the historical form, negative
+  // values included); anything else falls back to the 2.3 ISO-8601 parser so
+  // a window can be given in the same shape the records display — including
+  // zone offsets (`2026-11-25T17:00:00+08:00`).
   let lo_ts = @string.parse_int64(lo) catch {
-    _ => raise @io.IoError::Invalid("invalid timestamp: " + lo)
+    _ => {
+      let ms = @core.parse_iso8601_ms(@utf8.encode(lo), -1L)
+      if ms < 0 {
+        raise @io.IoError::Invalid("invalid timestamp: " + lo)
+      }
+      ms
+    }
   }
   let hi_ts = @string.parse_int64(hi) catch {
-    _ => raise @io.IoError::Invalid("invalid timestamp: " + hi)
+    _ => {
+      let ms = @core.parse_iso8601_ms(@utf8.encode(hi), -1L)
+      if ms < 0 {
+        raise @io.IoError::Invalid("invalid timestamp: " + hi)
+      }
+      ms
+    }
   }
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
@@ -1939,8 +1955,12 @@ fn cmd_parse_check(
     } else if format == "lines" {
       // lines stays parse-ok for plain text, but kv-shaped lines (journald
       // records, `level=... message=...`) still expose their fields so
-      // --schema can report the canonical six for them.
+      // --schema can report the canonical six for them; a leading timestamp
+      // token (RFC 3164 / CRI) fills in when the kv pairs carry no ts.
       fields = @core.parse_kv_pairs(line)
+      if schema {
+        push_line_head_ts(line, fields)
+      }
     }
     if ok {
       parsed = parsed + 1
@@ -1948,7 +1968,9 @@ fn cmd_parse_check(
       failed = failed + 1
     }
     if schema {
-      let sf = @core.schema_from_fields(fields, (0 : Int64))
+      // The fallback anchors yearless timestamps (RFC 3164 `Nov 25 10:00:00`
+      // infers the year from it), so a real now beats the placeholder zero.
+      let sf = @core.schema_from_fields(fields, now_ms())
       let norm : Array[(Bytes, Bytes)] = []
       match sf.ts {
         Some(t) => norm.push((b"ts", @utf8.encode(t.to_string())))
@@ -5486,6 +5508,61 @@ fn ingest_tail_matches(file : String, pos : Int64, tail : Bytes) -> Bool {
 ///   do not match fall back to the whole line as the value.
 /// - `lines`: no fields (the whole line is the value; key is the constant).
 /// Returns `(key, value, fields)` where key/value are chosen per the options.
+
+///|
+/// Lines without kv fields still carry a timestamp in their leading tokens —
+/// RFC 3164 (`Nov 25 10:00:00 node-1 sshd[123]: ...`), RFC 5424 / CRI
+/// (`2026-11-25T10:00:00.123456789Z stdout F ...`). When a --schema ingest
+/// finds no ts field among the kv pairs, growing prefixes of the first four
+/// space-separated tokens go through the normalize chain anchored at now
+/// (so the yearless RFC 3164 header can infer its year); the first prefix
+/// that resolves to something other than the anchor becomes the ts field.
+/// KV ts fields always win.
+fn push_line_head_ts(line : Bytes, pairs : Array[(Bytes, Bytes)]) -> Unit {
+  for pair in pairs {
+    if @core.canonical_field(pair.0) == 0 {
+      return
+    }
+  }
+  let len = line.length()
+  let mut i : Int32 = 0
+  while i < len && line.at(i).to_int() == 32 {
+    i = i + 1
+  }
+  let bounds : Array[(Int32, Int32)] = []
+  let mut count = 0
+  while i < len && count < 4 {
+    let start = i
+    while i < len && line.at(i).to_int() != 32 {
+      i = i + 1
+    }
+    bounds.push((start, i))
+    count = count + 1
+    while i < len && line.at(i).to_int() == 32 {
+      i = i + 1
+    }
+  }
+  if bounds.length() == 0 {
+    return
+  }
+  let start0 = bounds[0].0
+  let now = now_ms()
+  let mut n = 1
+  while n <= bounds.length() {
+    let end = bounds[n - 1].1
+    if end - start0 > 64 {
+      break
+    }
+    let prefix = @core.slice(line, start0, end)
+    if @core.normalize_ts(prefix, now) != now {
+      pairs.push((b"ts", prefix))
+      return
+    }
+    n = n + 1
+  }
+}
+
+///|
 fn parse_ingest_line(
   line : Bytes,
   opts : IngestOptions,
@@ -5530,6 +5607,7 @@ fn parse_ingest_line(
   // sources get the same normalization as JSON/kv formats.
   if opts.schema {
     let pairs = @core.parse_kv_pairs(line)
+    push_line_head_ts(line, pairs)
     return (opts.key_bytes, line, pairs)
   }
   (opts.key_bytes, line, [])
@@ -8315,6 +8393,65 @@ fn parse_ts_arg(word : String, s : String) -> Int64 raise @io.IoError {
       raise @io.IoError::Invalid("invalid " + word + ": " + s)
     }
     ms
+  }
+}
+
+///|
+/// Parse a `--clock-skew` argument: a plain integer is milliseconds (the
+/// historical form), otherwise `±N<unit>` with a lowercase unit of `ms` /
+/// `s` / `m` / `h` — `-5s`, `+500ms`, `2m`, `-1h`. A skew is a correction
+/// span, not a point in time, so ISO-8601 does not apply; uppercase `M` is
+/// deliberately not a unit (month confusion), and a magnitude past ten
+/// digits cannot be a clock offset.
+fn parse_skew_ms(s : String) -> Int64 raise @io.IoError {
+  let b = @utf8.encode(s)
+  let len = b.length()
+  if len > 0 {
+    let last = b.at(len - 1).to_int()
+    let is_letter = (last >= 65 && last <= 90) || (last >= 97 && last <= 122)
+    if is_letter {
+      let mut i = 0
+      let sign : Int64 = if b.at(0).to_int() == 45 {
+        i = 1
+        -1L
+      } else if b.at(0).to_int() == 43 {
+        i = 1
+        1L
+      } else {
+        1L
+      }
+      let mut value : Int64 = 0
+      let mut digits = 0
+      while i < len && b.at(i).to_int() >= 48 && b.at(i).to_int() <= 57 {
+        value = value * 10L + (b.at(i).to_int() - 48).to_int64()
+        i = i + 1
+        digits = digits + 1
+        if digits > 10 {
+          raise @io.IoError::Invalid("invalid clock skew: " + s)
+        }
+      }
+      if digits == 0 {
+        raise @io.IoError::Invalid("invalid clock skew: " + s)
+      }
+      let mult : Int64 = if i + 2 == len &&
+        b.at(i).to_int() == 109 &&
+        b.at(i + 1).to_int() == 115 {
+        1L
+      } else if i + 1 == len {
+        match b.at(i).to_int() {
+          109 => 60000L
+          115 => 1000L
+          104 => 3600000L
+          _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
+        }
+      } else {
+        raise @io.IoError::Invalid("invalid clock skew: " + s)
+      }
+      return sign * value * mult
+    }
+  }
+  @string.parse_int64(s) catch {
+    _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
   }
 }
 
@@ -15565,10 +15702,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         None => None
       }
       let skew_ms : Int64 = match clock_skew {
-        Some(s) =>
-          @string.parse_int64(s) catch {
-            _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
-          }
+        Some(s) => parse_skew_ms(s)
         None => 0
       }
       let opts : IngestOptions = {
@@ -15753,10 +15887,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         None => 256
       }
       let skew_ms : Int64 = match clock_skew {
-        Some(s) =>
-          @string.parse_int64(s) catch {
-            _ => raise @io.IoError::Invalid("invalid clock skew: " + s)
-          }
+        Some(s) => parse_skew_ms(s)
         None => 0
       }
       let opts : IngestOptions = {

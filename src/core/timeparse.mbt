@@ -208,15 +208,21 @@ pub fn parse_iso8601_ms(b : Bytes, fallback : Int64) -> Int64 {
     }
   }
   let mut offset_min : Int64 = 0
+  // Whether an explicit zone designator (Z / ±HH[:MM] / UTC tag) was
+  // consumed. Only then is trailing text tolerated at the end check — that
+  // is the CRI/container-log shape (`...Z stdout F {...}`).
+  let mut zone_done = false
   if i < len {
     let c = b.at(i).to_int()
     if c == 90 || c == 122 {
       i = i + 1
+      zone_done = true
     } else if c == 43 || c == 45 {
       match read_zone_offset(b, i) {
         Some(v) => {
           offset_min = v.0
           i = v.1
+          zone_done = true
         }
         None => return fallback
       }
@@ -234,12 +240,16 @@ pub fn parse_iso8601_ms(b : Bytes, fallback : Int64) -> Int64 {
             Some(v) => {
               offset_min = v.0
               i = v.1
+              zone_done = true
             }
             None => return fallback
           }
         } else if i + 3 <= len && tag_utc_gmt(slice(b, i, i + 3)) {
           i = i + 3
+          zone_done = true
         } else {
+          // No zone and the token after the space is not a zone tag — it may
+          // be a mistyped tag (`12:00:00 XYZ`), so the value stays rejected.
           return fallback
         }
       } else {
@@ -249,7 +259,7 @@ pub fn parse_iso8601_ms(b : Bytes, fallback : Int64) -> Int64 {
       return fallback
     }
   }
-  if i != len {
+  if i != len && !(zone_done && b.at(i).to_int() == 32) {
     return fallback
   }
   let days = days_from_civil(year, month, day)
@@ -522,6 +532,110 @@ pub fn normalize_ts(b : Bytes, fallback : Int64) -> Int64 {
         return v * (1000 : Int64) + frac_ms
       }
     }
-    parse_rfc2822_ms(b, parse_iso8601_ms(b, fallback))
+    // RFC 2822 (letter-led, `Tue, 11 Nov 2026 ...`), then ISO-8601, then
+    // RFC 3164 (`Nov 25 10:00:00` — the yearless syslog header) last: its
+    // month-name gate fails fast for every other shape.
+    parse_rfc3164_ms(
+      b,
+      parse_rfc2822_ms(b, parse_iso8601_ms(b, fallback)),
+      fallback,
+    )
   }
+}
+
+///|
+/// Civil year for a day count since 1970-01-01 (the year part of
+/// days-to-civil, paired with `days_from_civil`): the March-based year
+/// needs the month mapping to land on January/February.
+fn civil_year_of(days : Int64) -> Int64 {
+  let z = days + (719468 : Int64)
+  let era = (if z >= 0 { z } else { z - 146096 }) / 146097
+  let doe = z - era * (146097 : Int64)
+  let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+  let y = yoe + era * (400 : Int64)
+  let doy = doe - ((365 : Int64) * yoe + yoe / 4 - yoe / 100)
+  let mp = ((5 : Int64) * doy + 2) / 153
+  y + (if mp <= 9 { 0 } else { 1 })
+}
+
+///|
+/// Parse an RFC 3164 / syslog header (`Nov 25 10:00:00`, seconds optional,
+/// single-digit days space-padded) into epoch milliseconds. The year is
+/// absent by design, so it is inferred from `fallback` — the ingest-time
+/// base passed by `normalize_ts`: use its year and step back one when the
+/// result would land more than a day ahead of it (the Dec 31 → Jan 1 wrap).
+/// With no usable base (`fallback <= 0`) a yearless time cannot be anchored,
+/// so `fallback` is returned. The leading month name fails fast for every
+/// other shape, so this stays last in the normalize chain.
+pub fn parse_rfc3164_ms(b : Bytes, inner : Int64, fallback : Int64) -> Int64 {
+  if fallback <= 0 || inner != fallback {
+    // No anchoring base, or an earlier parser already claimed the value.
+    return inner
+  }
+  let len = b.length()
+  let month = match month_from_name(b, 0) {
+    Some(m) => m
+    None => return fallback
+  }
+  let mut i : Int32 = 3
+  while i < len && b.at(i).to_int() == 32 {
+    i = i + 1
+  }
+  let day = match read_digits(b, i, 1) {
+    Some(v) => {
+      i = v.1
+      let mut d = v.0
+      if i < len {
+        match ascii_digit(b.at(i).to_int()) {
+          Some(d2) => {
+            d = d * (10 : Int64) + d2
+            i = i + 1
+          }
+          None => ()
+        }
+      }
+      d
+    }
+    None => return fallback
+  }
+  if day < 1 || day > 31 {
+    return fallback
+  }
+  while i < len && b.at(i).to_int() == 32 {
+    i = i + 1
+  }
+  if i + 5 > len || b.at(i + 2).to_int() != 58 {
+    return fallback
+  }
+  let hour = match read_digits(b, i, 2) {
+    Some(v) => v.0
+    None => return fallback
+  }
+  let minute = match read_digits(b, i + 3, 2) {
+    Some(v) => v.0
+    None => return fallback
+  }
+  let mut second : Int64 = 0
+  i = i + 5
+  if i < len && b.at(i).to_int() == 58 {
+    match read_digits(b, i + 1, 2) {
+      Some(v) => {
+        second = v.0
+        i = v.1
+      }
+      None => return fallback
+    }
+  }
+  if hour > 23 || minute > 59 || second > 60 {
+    return fallback
+  }
+  let year = civil_year_of(fallback / (86400000 : Int64))
+  let hm = hour * (3600000 : Int64) +
+    minute * (60000 : Int64) +
+    second * (1000 : Int64)
+  let mut ts = days_from_civil(year, month, day) * (86400000 : Int64) + hm
+  if ts > fallback + (86400000 : Int64) {
+    ts = days_from_civil(year - 1, month, day) * (86400000 : Int64) + hm
+  }
+  ts
 }
