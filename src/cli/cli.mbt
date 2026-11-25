@@ -8475,13 +8475,7 @@ fn cmd_search(
   // this, a large `search` (linear or inverted) bypasses every guard.
   acquire_query_slot(dir)
   acquire_tenant_query_quota(dir)
-  let timeout_val : Int64 = match timeout {
-    Some(t) =>
-      @string.parse_int64(t) catch {
-        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
-      }
-    None => query_timeout_ms()
-  }
+  let timeout_val : Int64 = parse_timeout_ms(timeout)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: timeout_val,
@@ -8726,16 +8720,16 @@ fn cmd_search(
         None => ()
       }
       if hit && in_time {
+        if max_hits >= 0 && hits >= max_hits {
+          truncated = true
+          return false
+        }
         if json {
           print_json_record(rec)
         } else {
           print_record(rec)
         }
         hits = hits + 1
-        if max_hits >= 0 && hits >= max_hits {
-          truncated = true
-          return false
-        }
       }
       true
     })
@@ -8755,10 +8749,47 @@ fn cmd_search(
 /// Query timeout (4.6): a query whose per-segment guard notices the elapsed
 /// time over this bound aborts with a diagnostic. Default 30s, 0 disables;
 /// override with `MOONLOG_QUERY_TIMEOUT_MS` or per-query `--timeout`.
-fn query_timeout_ms() -> Int64 {
+fn query_timeout_ms() -> Int64 raise @io.IoError {
   match @env.get_env_var("MOONLOG_QUERY_TIMEOUT_MS") {
-    Some(v) => @string.parse_int64(v) catch { _ => 30_000_000L / 1000L }
+    Some(v) => {
+      let w : Int64 = @string.parse_int64(v) catch { _ => 30_000L }
+      if w >= 0 {
+        w
+      } else {
+        // A negative timeout used to be "disabled for free" — an operator
+        // typo silently removed the circuit breaker from every entry, which
+        // is the exact opposite of the env's purpose. Fail loudly; 0 keeps
+        // its documented "disabled" meaning.
+        raise @io.IoError::Invalid(
+          "query timeout must be >= 0ms: " +
+          w.to_string() +
+          " (check MOONLOG_QUERY_TIMEOUT_MS)",
+        )
+      }
+    }
     None => 30000L
+  }
+}
+
+///|
+/// Parse an explicit `--timeout` override shared by every guarded entry
+/// (query/search/scan family/context): non-numeric fails as before, and a
+/// negative value now fails too — it used to silently disable the breaker
+/// (M130's "negative means disabled" was an accident of the comparison, not
+/// a contract). 0 keeps its documented "disabled" meaning.
+fn parse_timeout_ms(t : String?) -> Int64 raise @io.IoError {
+  match t {
+    Some(s) => {
+      let v : Int64 = @string.parse_int64(s) catch {
+        _ => raise @io.IoError::Invalid("invalid timeout: " + s)
+      }
+      if v >= 0 {
+        v
+      } else {
+        raise @io.IoError::Invalid("timeout must be >= 0ms: " + v.to_string())
+      }
+    }
+    None => query_timeout_ms()
   }
 }
 
@@ -8766,9 +8797,24 @@ fn query_timeout_ms() -> Int64 {
 /// Max concurrent queries per directory (4.6): enforced with flock slots on
 /// `<dir>/QLOCK.<i>`; a query that cannot get a slot within the lock timeout
 /// is rejected. Default 4; override with `MOONLOG_MAX_CONCURRENT_QUERIES`.
-fn max_concurrent_queries() -> Int32 {
+fn max_concurrent_queries() -> Int32 raise @io.IoError {
   match @env.get_env_var("MOONLOG_MAX_CONCURRENT_QUERIES") {
-    Some(v) => @string.parse_int(v) catch { _ => 4 }
+    Some(v) => {
+      let w : Int32 = @string.parse_int(v) catch { _ => 4 }
+      if w >= 0 {
+        w
+      } else {
+        // A negative slot count turned acquire_query_slot into a 5s wait
+        // that always ended in the absurd "too many concurrent queries
+        // (limit -2)". Fail loudly; 0 keeps its meaning as "no query may
+        // run" (immediate rejection).
+        raise @io.IoError::Invalid(
+          "max concurrent queries must be >= 0: " +
+          w.to_string() +
+          " (check MOONLOG_MAX_CONCURRENT_QUERIES)",
+        )
+      }
+    }
     None => 4
   }
 }
@@ -8777,9 +8823,23 @@ fn max_concurrent_queries() -> Int32 {
 /// Scan budget (4.6): a query whose pushed-down scan set exceeds this many
 /// bytes aborts before doing the work. Default 512MB, 0 disables; override
 /// with `MOONLOG_MAX_SCAN_BYTES`.
-fn max_scan_bytes() -> Int64 {
+fn max_scan_bytes() -> Int64 raise @io.IoError {
   match @env.get_env_var("MOONLOG_MAX_SCAN_BYTES") {
-    Some(v) => @string.parse_int64(v) catch { _ => 536870912 }
+    Some(v) => {
+      let w : Int64 = @string.parse_int64(v) catch { _ => 536870912 }
+      if w >= 0 {
+        w
+      } else {
+        // A negative budget made the guard skip every check instead of
+        // tripping it — the breaker silently disappeared. Fail loudly; 0
+        // keeps its documented "disabled" meaning.
+        raise @io.IoError::Invalid(
+          "scan budget must be >= 0 bytes: " +
+          w.to_string() +
+          " (check MOONLOG_MAX_SCAN_BYTES)",
+        )
+      }
+    }
     None => 536870912
   }
 }
@@ -8915,13 +8975,7 @@ fn scan_query_guard(
 ) -> QueryGuard raise @io.IoError {
   acquire_query_slot(dir)
   acquire_tenant_query_quota(dir)
-  let timeout_val : Int64 = match timeout {
-    Some(t) =>
-      @string.parse_int64(t) catch {
-        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
-      }
-    None => query_timeout_ms()
-  }
+  let timeout_val : Int64 = parse_timeout_ms(timeout)
   {
     t0: now_ms(),
     timeout: timeout_val,
@@ -9255,13 +9309,7 @@ fn cmd_query(
   acquire_query_slot(dir)
   // 6.2 tenant concurrency quota, shared with every analysis entry point.
   acquire_tenant_query_quota(dir)
-  let timeout_val : Int64 = match timeout {
-    Some(t) =>
-      @string.parse_int64(t) catch {
-        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
-      }
-    None => query_timeout_ms()
-  }
+  let timeout_val : Int64 = parse_timeout_ms(timeout)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: timeout_val,
@@ -9813,6 +9861,16 @@ fn cmd_query(
           }
         }
         if hit {
+          // The limit check sits BEFORE the print/push and RETURNS on the
+          // tripping record: --limit 0 must yield zero records, and the old
+          // post-print placement leaked one row past the cap while a bare
+          // stop flag still let the tripping record through (4.6 fourth
+          // round). Later records short-circuit on stop at the loop head.
+          if max_hits >= 0 && hits >= max_hits {
+            truncated = true
+            stop = true
+            return
+          }
           if sort_by_time {
             collected.push(rec)
           } else if json {
@@ -9821,10 +9879,6 @@ fn cmd_query(
             print_record(rec)
           }
           hits = hits + 1
-          if max_hits >= 0 && hits >= max_hits {
-            truncated = true
-            stop = true
-          }
         }
       })
     }
@@ -9908,13 +9962,7 @@ fn cmd_context(
   // lookup.
   acquire_query_slot(dir)
   acquire_tenant_query_quota(dir)
-  let timeout_val : Int64 = match timeout {
-    Some(t) =>
-      @string.parse_int64(t) catch {
-        _ => raise @io.IoError::Invalid("invalid timeout: " + t)
-      }
-    None => query_timeout_ms()
-  }
+  let timeout_val : Int64 = parse_timeout_ms(timeout)
   let qg : QueryGuard = {
     t0: now_ms(),
     timeout: timeout_val,
