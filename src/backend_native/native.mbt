@@ -1454,6 +1454,8 @@ fn is_backup_file(name : String) -> Bool {
   name == "PARTITION" ||
   name == "TIER" ||
   name == "SCHEMA" ||
+  name == "MASK" ||
+  name == "META" ||
   // The operation-audit trail travels with the backup (6.6 "deletion is
   // verifiable" relies on it surviving a disaster recovery); the live AUDIT
   // file and its rotated AUDIT.N siblings are copied as-is, so a restored

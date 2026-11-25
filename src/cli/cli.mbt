@@ -360,6 +360,21 @@
 ///                                    six canonical fields automatically
 ///                                    (--schema overrides, --no-schema opts out)
 ///
+///   mask-policy <dir> [on|off] [--fields <csv>] [--json]
+///                                    show or persist the directory-level
+///                                    masking policy (2.4): ingest/fifo/http
+///                                    mask through the built-in word list plus
+///                                    the custom field names even when the
+///                                    agent forgets --mask (--mask forces it
+///                                    on regardless, --mask-fields merges)
+///
+///   meta-policy <dir> k=v,...|off [--json]
+///                                    show or persist the directory-level
+///                                    enrichment metadata (2.4): every
+///                                    ingested value gets the pairs appended
+///                                    (environment/version/region) unless the
+///                                    run passes an explicit --meta
+///
 /// Writers take an exclusive directory lock; readers take a shared one, so a
 /// CLI invocation never observes a half-written directory.
 type CliLog = @log.Log[
@@ -418,7 +433,7 @@ const ROLL_SIZE : Int64 = 1_048_576
 const MOONLOG_VERSION : String = "0.1.5"
 
 ///|
-const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|ttl-audit|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|tier-policy|backup|restore> <dir> [args]"
+const USAGE : String = "usage: moonlog <put|put-if|put-batch|delete|get|getkey|get-many|getkey-live|has-key|scan|scan-prefix|scan-range|scan-time|tail|follow|ingest|http|parse-check|bench-write|search|query|context|aggregate|cluster|trend|alert|baseline|rbac|quota|drill|selfmon|recover|prune|prune-bytes|prune-before|prune-expired|prune-superseded|merge|maintain|serve|ttl-expire|ttl-audit|replicate|ha-failover|ha-status|ha-rebalance|ha-watch|archive|cursor|cursor-commit|cursor-lag|cursor-save|cursor-load|cursor-list|cursor-drop|export|export-jsonl|purge|import|compact|compact-expired|compress|tier|fsck|stats|partitions|partition-policy|schema-policy|tier-policy|mask-policy|meta-policy|backup|restore> <dir> [args]"
 
 ///|
 fn now_ms() -> Int64 {
@@ -660,6 +675,133 @@ fn save_schema_policy(dir : String, on : Bool) -> Unit raise @io.IoError {
 }
 
 ///|
+/// Directory-level masking policy `<dir>/MASK` (2.4 fourth round): line 1 is
+/// `on`/`off`, an optional second line `fields <csv>` adds custom sensitive
+/// field names to the built-in word list. Persisting it turns masking on for
+/// every ingestion path (ingest/fifo/http) without repeating `--mask` — the
+/// no-plaintext agreement lives in the directory, not in each agent's command
+/// line, so an agent that forgets the flag still cannot leak. An explicit
+/// `--mask` forces it on regardless; a missing or malformed file means off
+/// (safe fallback).
+const MASK_FILE : String = "MASK"
+
+///|
+fn load_mask_policy(dir : String) -> (Bool, Array[Bytes]) {
+  let path = dir + "/" + MASK_FILE
+  if !@backend_native.file_exists(path) {
+    return (false, [])
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  let mut on = false
+  let fields : Array[Bytes] = []
+  for line in lines {
+    let s = @utf8.decode_lossy(line).trim().to_owned()
+    if s == "on" {
+      on = true
+    } else if s.has_prefix("fields ") {
+      for b in csv_to_bytes_list(s[7:].to_owned()) {
+        if b.length() > 0 {
+          fields.push(b)
+        }
+      }
+    }
+  }
+  (on, fields)
+}
+
+///|
+fn save_mask_policy(
+  dir : String,
+  on : Bool,
+  fields_csv : String,
+) -> Unit raise @io.IoError {
+  ignore(@backend_native.ensure_dir(dir))
+  let buf = StringBuilder()
+  buf.write_string(if on { "on\n" } else { "off\n" })
+  if fields_csv.length() > 0 {
+    let parts = split_comma(fields_csv)
+    for p in parts {
+      if @utf8.encode(p).length() == 0 {
+        raise @io.IoError::Invalid("empty mask field name")
+      }
+    }
+    buf.write_string("fields " + fields_csv + "\n")
+  }
+  @backend_native.write_file(
+    dir + "/" + MASK_FILE,
+    @utf8.encode(buf.to_string()),
+  )
+}
+
+///|
+/// Directory-level enrichment policy `<dir>/META` (2.4 fourth round): each
+/// line (or comma-separated run) is a `k=v` pair appended to every ingested
+/// value, like `--meta env=prod,version=1.2.0,region=cn-north` — the
+/// environment/version/region metadata lives in the directory, not in each
+/// agent's command line. An explicit `--meta` on the command line overrides
+/// it for that run; a missing or malformed file means no metadata (safe
+/// fallback).
+const META_FILE : String = "META"
+
+///|
+fn load_meta_policy(dir : String) -> Bytes? {
+  let path = dir + "/" + META_FILE
+  if !@backend_native.file_exists(path) {
+    return None
+  }
+  let data = @backend_native.read_file(path)
+  let (lines, _) = split_complete_lines(data, true)
+  let csv = StringBuilder()
+  let mut first = true
+  for line in lines {
+    let s = @utf8.decode_lossy(line).trim().to_owned()
+    if s == "" || s == "off" {
+      continue
+    }
+    if !first {
+      csv.write_string(",")
+    }
+    first = false
+    csv.write_string(s)
+  }
+  if csv.to_string().length() == 0 {
+    return None
+  }
+  Some(parse_meta_pairs(csv.to_string())) catch {
+    _ => None
+  }
+}
+
+///|
+fn save_meta_policy(dir : String, s : String) -> Unit raise @io.IoError {
+  // Validate through the ingest parser first (k missing `=` must fail here,
+  // not silently skip enrichment at ingest time).
+  let pairs = parse_meta_pairs(s)
+  ignore(@backend_native.ensure_dir(dir))
+  let buf = StringBuilder()
+  let mut first = true
+  for part in split_comma(s) {
+    if part.length() == 0 {
+      continue
+    }
+    if !first {
+      buf.write_string("\n")
+    }
+    first = false
+    buf.write_string(part)
+  }
+  if first {
+    // Every part was empty; keep the pair validation result referenced.
+    ignore(pairs)
+  }
+  @backend_native.write_file(
+    dir + "/" + META_FILE,
+    @utf8.encode(buf.to_string()),
+  )
+}
+
+///|
 /// Directory-level tiering policy `<dir>/TIER` (3.6 third round): line 1 is
 /// the absolute cold-dir, line 2 (optional) `warm <N>`. Persisting it lets
 /// `maintain`/`serve` move rolled segments to the cold tier automatically —
@@ -826,6 +968,121 @@ fn cmd_schema_policy(
     println("{\"schema\":\"" + (if on { "on" } else { "off" }) + "\"}")
   } else {
     println("schema: " + (if on { "on" } else { "off" }) + " (dir " + dir + ")")
+  }
+}
+
+///|
+/// `mask-policy <dir> [on|off] [--fields csv] [--json]` (2.4 fourth round):
+/// show or persist the directory masking policy. With it on, every
+/// ingestion path masks through the built-in word list plus the optional
+/// custom fields, whether or not the agent passed `--mask`.
+fn cmd_mask_policy(
+  dir : String,
+  mode : String?,
+  fields_csv : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  let mut on : Bool? = None
+  match mode {
+    Some(m) => {
+      if m != "on" && m != "off" {
+        raise @io.IoError::Invalid("invalid mask policy: " + m + " (on|off)")
+      }
+      on = Some(m == "on")
+    }
+    None => ()
+  }
+  let (cur_on, cur_fields) = load_mask_policy(dir)
+  let cur_csv = StringBuilder()
+  let mut first = true
+  for b in cur_fields {
+    if !first {
+      cur_csv.write_string(",")
+    }
+    first = false
+    cur_csv.write_string(@utf8.decode(b) catch { _ => "" })
+  }
+  // An explicit --fields applies together with a mode (or alone, showing the
+  // policy keeps working).
+  let final_on = match on {
+    Some(v) => v
+    None => cur_on
+  }
+  let final_csv = match fields_csv {
+    Some(v) => v
+    None => cur_csv.to_string()
+  }
+  if on is Some(_) || fields_csv is Some(_) {
+    save_mask_policy(dir, final_on, final_csv)
+  }
+  let (saved_on, saved_fields) = load_mask_policy(dir)
+  let saved_csv = StringBuilder()
+  let mut first2 = true
+  for b in saved_fields {
+    if !first2 {
+      saved_csv.write_string(",")
+    }
+    first2 = false
+    saved_csv.write_string(@utf8.decode(b) catch { _ => "" })
+  }
+  if json {
+    println(
+      "{\"mask\":\"" +
+      (if saved_on { "on" } else { "off" }) +
+      "\",\"fields\":\"" +
+      saved_csv.to_string() +
+      "\"}",
+    )
+  } else {
+    println(
+      "mask: " +
+      (if saved_on { "on" } else { "off" }) +
+      " fields: [" +
+      saved_csv.to_string() +
+      "] (dir " +
+      dir +
+      ")",
+    )
+  }
+}
+
+///|
+/// `meta-policy <dir> k=v,...|off [--json]` (2.4 fourth round): show or
+/// persist the directory enrichment metadata. Every ingestion path appends
+/// the pairs to each ingested value unless the run passes an explicit
+/// `--meta`; `off` clears the policy.
+fn cmd_meta_policy(
+  dir : String,
+  content : String?,
+  json : Bool,
+) -> Unit raise @io.IoError {
+  match content {
+    Some(s) =>
+      if s == "off" {
+        @backend_native.write_file(dir + "/" + META_FILE, b"")
+        ignore(@backend_native.ensure_dir(dir))
+      } else {
+        save_meta_policy(dir, s)
+      }
+    None => ()
+  }
+  let meta = load_meta_policy(dir)
+  if json {
+    match meta {
+      Some(m) => {
+        let text = @utf8.decode(m) catch { _ => "" }
+        println("{\"meta\":\"" + text + "\"}")
+      }
+      None => println("{\"meta\":null}")
+    }
+  } else {
+    match meta {
+      Some(m) => {
+        let text = @utf8.decode(m) catch { _ => "" }
+        println("meta: " + text + " (dir " + dir + ")")
+      }
+      None => println("meta: off (dir " + dir + ")")
+    }
   }
 }
 
@@ -1070,6 +1327,70 @@ fn ctx_name_eq(a : Bytes, b : Bytes) -> Bool {
 /// anything else uses the kv parser. A JSON value wrapped by a container
 /// prefix (`2026-... stdout F {...}`) is still recognized — `json_object_fields`
 /// locates the first balanced object — and falls back to kv if that fails.
+
+///|
+/// Merge the trailing kv pairs of a JSON record into the parsed field set.
+/// The `--meta` enrichment appends ` env=prod ...` after the JSON object, and
+/// without this merge the metadata is stored but unqueryable — the JSON
+/// flattening drops everything after the closing brace. A kv pair whose name
+/// is already a JSON field (or is not a plain kv key shape) is skipped, so
+/// keys quoted inside the JSON body cannot leak as fake fields.
+fn merge_json_trailing_kv(
+  fields : Array[(Bytes, Bytes)],
+  value : Bytes,
+) -> Unit {
+  let known : Array[Bytes] = []
+  for f in fields {
+    known.push(f.0)
+  }
+  for pair in @core.parse_kv_pairs(value) {
+    let mut skip = false
+    for k in known {
+      if k == pair.0 {
+        skip = true
+        break
+      }
+    }
+    if skip || !plain_kv_key(pair.0) {
+      continue
+    }
+    fields.push(pair)
+    known.push(pair.0)
+  }
+}
+
+///|
+/// Whether the bytes look like a plain kv key: ASCII letter or underscore
+/// first, then letters/digits/underscore/dot/dash. Anything else (a quoted
+/// fragment of the JSON body, a brace) is not a real field name.
+fn plain_kv_key(name : Bytes) -> Bool {
+  let len = name.length()
+  if len == 0 || len > 64 {
+    return false
+  }
+  let first = name.at(0).to_int()
+  if !((first >= 65 && first <= 90) ||
+    (first >= 97 && first <= 122) ||
+    first == 95) {
+    return false
+  }
+  let mut i = 1
+  while i < len {
+    let c = name.at(i).to_int()
+    if !((c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c == 95 ||
+      c == 46 ||
+      c == 45) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
   if value.length() > 0 {
     let mut i = 0
@@ -1078,11 +1399,14 @@ fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
       i = i + 1
     }
     if i < value.length() && value.at(i).to_int() == 123 {
-      return @core.json_object_fields(value) catch { _ => [] }
+      let fields = @core.json_object_fields(value) catch { _ => [] }
+      merge_json_trailing_kv(fields, value)
+      return fields
     }
     if @core.bytes_contains(value, b"{") {
       let fields = @core.json_object_fields(value) catch { _ => [] }
       if fields.length() > 0 {
+        merge_json_trailing_kv(fields, value)
         return fields
       }
     }
@@ -3510,6 +3834,8 @@ fn archive_file_names(dir : String) -> Array[String] raise @io.IoError {
       name == "PARTITION" ||
       name == "TIER" ||
       name == "SCHEMA" ||
+      name == "MASK" ||
+      name == "META" ||
       name == "AUDIT" ||
       name == "TTL_AUDIT" {
       out.push(name)
@@ -4393,7 +4719,7 @@ fn drill_batches_check(bak : String, rst : String) -> String {
 ///|
 fn drill_config_check(dir : String, rst : String) -> String {
   let files = [
-    "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "TIER", "SELFMON/thresholds",
+    "RBAC", "TTL", "QUOTA", "PARTITION", "SCHEMA", "TIER", "MASK", "META", "SELFMON/thresholds",
   ]
   let mut result = "absent"
   for f in files {
@@ -13347,9 +13673,9 @@ fn global_only_cmd(cmd : String) -> Bool {
     "tier", "import", "maintain", "ttl-expire", "fsck", "selfmon", "serve", "rbac",
     "quota",
     // Directory-level configuration commands (6.1 third pass): they rewrite
-    // PARTITION/SCHEMA/TIER, which governs every tenant's write path — a
-    // scoped role must not reconfigure the whole directory.
-     "partition-policy", "schema-policy", "tier-policy",
+    // PARTITION/SCHEMA/TIER/MASK/META, which governs every tenant's write
+    // path — a scoped role must not reconfigure the whole directory.
+     "partition-policy", "schema-policy", "tier-policy", "mask-policy", "meta-policy",
     // Whole-store audit trail queries: the JSONL files mix every role's
     // events, so a scoped role would read cross-tenant operation history.
      "audit", "ttl-audit",
@@ -13419,7 +13745,8 @@ let audit_cmds : Array[String] = [
   "drill", "purge", "delete", "prune", "prune-bytes", "prune-before", "prune-expired",
   "prune-superseded", "merge", "compact", "compact-expired", "compress", "tier",
   "ttl-expire", "restore", "recover", "maintain", "rbac", "partition-policy", "schema-policy",
-  "ha-failover", "ha-rebalance", "ha-status", "quota", "audit",
+  "tier-policy", "mask-policy", "meta-policy", "ha-failover", "ha-rebalance", "ha-status",
+  "quota", "audit",
   // 6.1/6.3 third pass: configuration commands and HA state changes added
   // after M172 were leaving no trail.
    "tier-policy", "ttl-audit", "ha-watch",
@@ -15423,6 +15750,46 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       }
       cmd_schema_policy(args[2], mode, json)
     }
+  } else if cmd == "mask-policy" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut mode : String? = (None : String?)
+      let mut fields : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else if a == "--fields" && i + 1 < args.length() {
+          fields = Some(args[i + 1])
+          i = i + 1
+        } else {
+          mode = Some(a)
+        }
+        i = i + 1
+      }
+      cmd_mask_policy(args[2], mode, fields, json)
+    }
+  } else if cmd == "meta-policy" {
+    if args.length() < 3 {
+      println(USAGE)
+    } else {
+      let mut content : String? = (None : String?)
+      let mut json = false
+      let mut i = 3
+      while i < args.length() {
+        let a = args[i]
+        if a == "--json" {
+          json = true
+        } else {
+          content = Some(a)
+        }
+        i = i + 1
+      }
+      cmd_meta_policy(args[2], content, json)
+    }
   } else if cmd == "tier-policy" {
     if args.length() < 3 {
       println(USAGE)
@@ -15705,6 +16072,26 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         Some(s) => parse_skew_ms(s)
         None => 0
       }
+      // 2.4 fourth round: the directory MASK/META policies turn masking and
+      // enrichment on for this run even when the agent forgets the flags;
+      // an explicit --meta overrides the policy (SCHEMA parity), and custom
+      // --mask-fields merge with the policy's field list.
+      let (pol_mask_on, pol_mask_fields) = load_mask_policy(args[2])
+      let mask_on = mask || pol_mask_on
+      let mask_fields_final = match mask_fields {
+        Some(s) => {
+          let merged = csv_to_bytes_list(s)
+          for b in pol_mask_fields {
+            merged.push(b)
+          }
+          merged
+        }
+        None => pol_mask_fields
+      }
+      let meta_final = match meta_str {
+        Some(s) => Some(parse_meta_pairs(s))
+        None => load_meta_policy(args[2])
+      }
       let opts : IngestOptions = {
         format,
         key_bytes: @utf8.encode(key),
@@ -15735,15 +16122,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           Some(s) => Some(@utf8.encode(s))
           None => None
         },
-        mask,
-        mask_extra: match mask_fields {
-          Some(s) => csv_to_bytes_list(s)
-          None => []
-        },
-        meta_bytes: match meta_str {
-          Some(s) => Some(parse_meta_pairs(s))
-          None => None
-        },
+        mask: mask_on,
+        mask_extra: mask_fields_final,
+        meta_bytes: meta_final,
         partition_ms: match partition_str {
           Some(s) => parse_partition(s)
           None => load_partition_policy(args[2])
@@ -15890,6 +16271,26 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         Some(s) => parse_skew_ms(s)
         None => 0
       }
+      // 2.4 fourth round: the directory MASK/META policies turn masking and
+      // enrichment on for this run even when the agent forgets the flags;
+      // an explicit --meta overrides the policy (SCHEMA parity), and custom
+      // --mask-fields merge with the policy's field list.
+      let (pol_mask_on, pol_mask_fields) = load_mask_policy(args[2])
+      let mask_on = mask || pol_mask_on
+      let mask_fields_final = match mask_fields {
+        Some(s) => {
+          let merged = csv_to_bytes_list(s)
+          for b in pol_mask_fields {
+            merged.push(b)
+          }
+          merged
+        }
+        None => pol_mask_fields
+      }
+      let meta_final = match meta_str {
+        Some(s) => Some(parse_meta_pairs(s))
+        None => load_meta_policy(args[2])
+      }
       let opts : IngestOptions = {
         format,
         key_bytes: @utf8.encode(key),
@@ -15919,15 +16320,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           Some(s) => Some(@utf8.encode(s))
           None => None
         },
-        mask,
-        mask_extra: match mask_fields {
-          Some(s) => csv_to_bytes_list(s)
-          None => []
-        },
-        meta_bytes: match meta_str {
-          Some(s) => Some(parse_meta_pairs(s))
-          None => None
-        },
+        mask: mask_on,
+        mask_extra: mask_fields_final,
+        meta_bytes: meta_final,
         partition_ms: match partition_str {
           Some(s) => parse_partition(s)
           None => load_partition_policy(args[2])
