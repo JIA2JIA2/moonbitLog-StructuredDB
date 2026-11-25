@@ -1067,10 +1067,25 @@ fn ctx_name_eq(a : Bytes, b : Bytes) -> Bool {
 
 ///|
 /// Parse a record value into field pairs: JSON objects are flattened (2.1),
-/// anything else uses the kv parser.
+/// anything else uses the kv parser. A JSON value wrapped by a container
+/// prefix (`2026-... stdout F {...}`) is still recognized — `json_object_fields`
+/// locates the first balanced object — and falls back to kv if that fails.
 fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
-  if value.length() > 0 && value.at(0).to_int() == 123 {
-    return @core.json_object_fields(value) catch { _ => [] }
+  if value.length() > 0 {
+    let mut i = 0
+    while i < value.length() &&
+          (value.at(i).to_int() == 32 || value.at(i).to_int() == 9) {
+      i = i + 1
+    }
+    if i < value.length() && value.at(i).to_int() == 123 {
+      return @core.json_object_fields(value) catch { _ => [] }
+    }
+    if @core.bytes_contains(value, b"{") {
+      let fields = @core.json_object_fields(value) catch { _ => [] }
+      if fields.length() > 0 {
+        return fields
+      }
+    }
   }
   @core.parse_kv_pairs(value)
 }
@@ -1846,6 +1861,7 @@ fn cmd_parse_check(
   sample_n : Int32,
   as_json : Bool,
   schema : Bool,
+  expects : Array[String],
 ) -> Unit raise @io.IoError {
   if format != "lines" &&
     format != "kv" &&
@@ -1854,6 +1870,28 @@ fn cmd_parse_check(
     raise @io.IoError::Invalid(
       "invalid format: " + format + " (lines|kv|json|template)",
     )
+  }
+  // Compile `--expect name[=value]` specs into byte pairs.
+  let expect_names : Array[Bytes] = []
+  let expect_vals : Array[Bytes?] = []
+  for spec in expects {
+    let b = @utf8.encode(spec)
+    let mut eq = -1
+    let mut j = 0
+    while j < b.length() {
+      if b.at(j).to_int() == 61 {
+        eq = j
+        break
+      }
+      j = j + 1
+    }
+    if eq < 0 {
+      expect_names.push(b)
+      expect_vals.push(None)
+    } else {
+      expect_names.push(@core.slice(b, 0, eq))
+      expect_vals.push(Some(@core.slice(b, eq + 1, b.length())))
+    }
   }
   let tpl = match template {
     Some(s) => @utf8.encode(s)
@@ -1872,6 +1910,10 @@ fn cmd_parse_check(
   let mut fields_total = 0
   let mut empty_fields = 0
   let mut schema_present = 0
+  let mut expect_total = 0
+  let mut expect_ok = 0
+  let mismatch_samples : Array[String] = []
+  let mismatch_json : Array[String] = []
   let samples : Array[String] = []
   let json_samples : Array[String] = []
   let mut i = 0
@@ -1930,6 +1972,59 @@ fn cmd_parse_check(
       fields = norm
       schema_present = schema_present + norm.length()
     }
+    // Per-value accuracy (--expect): parsed/field-count alone cannot catch a
+    // template that splits the line at the wrong place.
+    let mut k = 0
+    while k < expect_names.length() {
+      expect_total = expect_total + 1
+      let name = expect_names[k]
+      let want = expect_vals[k]
+      let mut actual : Bytes? = None
+      for pair in fields {
+        if pair.0 == name {
+          actual = Some(pair.1)
+        }
+      }
+      let pass = match (actual, want) {
+        (Some(a), Some(w)) => a == w
+        (Some(a), None) => a.length() > 0
+        (None, _) => false
+      }
+      if pass {
+        expect_ok = expect_ok + 1
+      } else if mismatch_samples.length() < 5 {
+        let a_text = match actual {
+          Some(a) => @utf8.decode(a) catch { _ => "" }
+          None => "<missing>"
+        }
+        let w_text = match want {
+          Some(w) => @utf8.decode(w) catch { _ => "" }
+          None => "<non-empty>"
+        }
+        mismatch_samples.push(
+          "line " +
+          (i + 1).to_string() +
+          ": " +
+          (@utf8.decode(name) catch { _ => "" }) +
+          " expected " +
+          w_text +
+          " got " +
+          a_text,
+        )
+        mismatch_json.push(
+          "{\"line\":" +
+          (i + 1).to_string() +
+          ",\"field\":\"" +
+          json_escape_str(@utf8.decode(name) catch { _ => "" }) +
+          "\",\"expected\":\"" +
+          json_escape_str(w_text) +
+          "\",\"actual\":\"" +
+          json_escape_str(a_text) +
+          "\"}",
+        )
+      }
+      k = k + 1
+    }
     fields_total = fields_total + fields.length()
     for pair in fields {
       if pair.1.length() == 0 {
@@ -1980,6 +2075,32 @@ fn cmd_parse_check(
     i = i + 1
   }
   let pct = if rows.length() == 0 { 100 } else { parsed * 100 / rows.length() }
+  let expect_pct = if expect_total == 0 {
+    100
+  } else {
+    expect_ok * 100 / expect_total
+  }
+  let mut expect_json = ""
+  if expect_names.length() > 0 {
+    let mut mj = ""
+    let mut mfirst = true
+    for m in mismatch_json {
+      if !mfirst {
+        mj = mj + ","
+      }
+      mfirst = false
+      mj = mj + m
+    }
+    expect_json = ",\"expect_total\":" +
+      expect_total.to_string() +
+      ",\"expect_ok\":" +
+      expect_ok.to_string() +
+      ",\"expect_accuracy_pct\":" +
+      expect_pct.to_string() +
+      ",\"mismatches\":[" +
+      mj +
+      "]"
+  }
   if as_json {
     let mut out = "{\"lines\":" +
       rows.length().to_string() +
@@ -1998,6 +2119,7 @@ fn cmd_parse_check(
       } else {
         ""
       }) +
+      expect_json +
       ",\"samples\":["
     let mut first = true
     for s in json_samples {
@@ -2030,6 +2152,20 @@ fn cmd_parse_check(
         ""
       }),
     )
+    if expect_names.length() > 0 {
+      println(
+        "expect: " +
+        expect_ok.to_string() +
+        "/" +
+        expect_total.to_string() +
+        " (" +
+        expect_pct.to_string() +
+        "%)",
+      )
+      for m in mismatch_samples {
+        println("  " + m)
+      }
+    }
     for s in samples {
       println(s)
     }
@@ -15678,6 +15814,11 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut sample_n = 5
       let mut as_json = false
       let mut schema = false
+      // Expected field values (`--expect name=value`, or `name` for a
+      // non-empty check): turns "extraction accuracy" from a field-count into
+      // a per-value verdict, so a template that splits a line at the wrong
+      // place stops reporting 100%.
+      let expects : Array[String] = []
       let mut i = 3
       while i < args.length() {
         let a = args[i]
@@ -15696,10 +15837,21 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           as_json = true
         } else if a == "--schema" {
           schema = true
+        } else if a == "--expect" && i + 1 < args.length() {
+          expects.push(args[i + 1])
+          i = i + 1
         }
         i = i + 1
       }
-      cmd_parse_check(args[2], format, template, sample_n, as_json, schema)
+      cmd_parse_check(
+        args[2],
+        format,
+        template,
+        sample_n,
+        as_json,
+        schema,
+        expects,
+      )
     }
   } else if cmd == "bench-write" {
     if args.length() < 4 {

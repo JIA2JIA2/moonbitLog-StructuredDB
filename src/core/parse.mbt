@@ -622,22 +622,147 @@ pub fn sampling_allows(
 }
 
 ///|
-/// A compiled template placeholder. `<name>` captures up to the next literal
-/// (the original M115 behavior). `<name:pattern>` adds a restricted
-/// Grok-style field pattern: one character class plus an optional quantifier,
-/// e.g. `<status:\d+>`, `<msg:[^"]+>`, `<ws:\s*>`, `<path:\S+?>`.
-priv struct TemplateField {
-  name : Bytes
-  class : Bytes
-  min_len : Int32
-  max_len : Int32
-  greedy : Bool
+/// One token of a placeholder pattern: a literal byte run, or a character
+/// class with a quantifier. Compiling a pattern into tokens lets the matcher
+/// handle multi-token Grok-style patterns (`\d+\.\d+\.\d+\.\d+`,
+/// `\d+-\d+-\d+ \d+:\d+:\d+,\d+`) instead of silently falling back to a greedy
+/// default capture — which parsed the line "successfully" while putting the
+/// wrong bytes in the field (an accuracy report then looks green while every
+/// value is wrong).
+priv enum PatTok {
+  Lit(Bytes)
+  Class(Bytes, Int32, Int32, Bool)
 }
 
 ///|
-/// Split a placeholder body into name and a parsed field pattern. A pattern
-/// with more than one token falls back to the default capture so the parser
-/// stays linear and predictable (no backtracking engine).
+/// A compiled template placeholder. `<name>` captures up to the next literal
+/// (the original M115 behavior). `<name:pattern>` compiles a restricted
+/// Grok-style pattern into tokens: literal runs, `\d`/`\w`/`\s`/`\S`/`.`,
+/// `[a-z]`/`[^...]` classes, and `?`/`*`/`+` (a trailing `?` makes it
+/// non-greedy).
+priv struct TemplateField {
+  name : Bytes
+  toks : Array[PatTok]
+}
+
+///|
+/// Parse the quantifier that follows a class token: `?`, `*`, `+` (default one)
+/// plus an optional `?` for non-greedy. Returns `(min, max, greedy, next)`.
+fn pattern_quantifier(pat : Bytes, j : Int32) -> (Int32, Int32, Bool, Int32) {
+  let mut min_len = 1
+  let mut max_len = 1
+  let mut greedy = true
+  let mut k = j
+  if k < pat.length() {
+    let q = pat.at(k).to_int()
+    if q == 63 {
+      min_len = 0
+      k = k + 1
+    } else if q == 42 {
+      min_len = 0
+      max_len = -1
+      k = k + 1
+    } else if q == 43 {
+      max_len = -1
+      k = k + 1
+    }
+  }
+  if k < pat.length() && pat.at(k).to_int() == 63 {
+    greedy = false
+    k = k + 1
+  }
+  (min_len, max_len, greedy, k)
+}
+
+///|
+/// Compile a placeholder pattern into tokens. Returns None for a malformed
+/// pattern (unterminated class, trailing backslash, or an unreasonable number
+/// of tokens/quantifiers) so the caller falls back to the default capture
+/// instead of guessing.
+fn parse_pattern(pat : Bytes) -> Array[PatTok]? {
+  let toks : Array[PatTok] = []
+  let mut lit = @buffer.Buffer::Buffer()
+  let mut i = 0
+  let mut quantifiers = 0
+  while i < pat.length() {
+    let c = pat.at(i).to_int()
+    if c == 91 {
+      // `[...]` character class (escaped bytes inside do not close it).
+      if lit.length() > 0 {
+        toks.push(Lit(lit.to_bytes()))
+        lit = @buffer.Buffer::Buffer()
+      }
+      let mut k = i + 1
+      let mut closed = false
+      while k < pat.length() {
+        if pat.at(k).to_int() == 92 && k + 1 < pat.length() {
+          k = k + 2
+        } else if pat.at(k).to_int() == 93 {
+          closed = true
+          break
+        } else {
+          k = k + 1
+        }
+      }
+      if !closed {
+        return None
+      }
+      let (mn, mx, gr, next) = pattern_quantifier(pat, k + 1)
+      toks.push(Class(slice(pat, i, k + 1), mn, mx, gr))
+      if mn != 1 || mx != 1 {
+        quantifiers = quantifiers + 1
+      }
+      i = next
+    } else if c == 92 {
+      if i + 1 >= pat.length() {
+        return None
+      }
+      let k = pat.at(i + 1).to_int()
+      if k == 100 || k == 119 || k == 115 || k == 83 {
+        if lit.length() > 0 {
+          toks.push(Lit(lit.to_bytes()))
+          lit = @buffer.Buffer::Buffer()
+        }
+        let (mn, mx, gr, next) = pattern_quantifier(pat, i + 2)
+        toks.push(Class(slice(pat, i, i + 2), mn, mx, gr))
+        if mn != 1 || mx != 1 {
+          quantifiers = quantifiers + 1
+        }
+        i = next
+      } else {
+        lit.write_byte(pat.at(i + 1))
+        i = i + 2
+      }
+    } else if c == 46 {
+      // `.` matches any byte; a literal dot must be escaped (`\.`).
+      if lit.length() > 0 {
+        toks.push(Lit(lit.to_bytes()))
+        lit = @buffer.Buffer::Buffer()
+      }
+      let (mn, mx, gr, next) = pattern_quantifier(pat, i + 1)
+      toks.push(Class(b".", mn, mx, gr))
+      if mn != 1 || mx != 1 {
+        quantifiers = quantifiers + 1
+      }
+      i = next
+    } else {
+      lit.write_byte(pat.at(i))
+      i = i + 1
+    }
+    if toks.length() > 32 || quantifiers > 8 {
+      // Keep backtracking bounded and predictable.
+      return None
+    }
+  }
+  if lit.length() > 0 {
+    toks.push(Lit(lit.to_bytes()))
+  }
+  Some(toks)
+}
+
+///|
+/// Split a placeholder body into name and compiled pattern tokens. An empty
+/// token list means "default capture" (up to the next literal).
 fn template_field(body : Bytes) -> TemplateField {
   let mut colon = -1
   let mut i = 0
@@ -649,61 +774,17 @@ fn template_field(body : Bytes) -> TemplateField {
     i = i + 1
   }
   if colon < 0 {
-    return { name: body, class: b"", min_len: 0, max_len: -1, greedy: false, }
+    return { name: body, toks: [], }
   }
   let name = slice(body, 0, colon)
   let pat = slice(body, colon + 1, body.length())
-  let mut cls : Bytes = b""
-  let mut j = 0
   if pat.length() == 0 {
-    ()
-  } else if pat.at(0).to_int() == 91 {
-    let mut k = 1
-    while k < pat.length() && pat.at(k).to_int() != 93 {
-      k = k + 1
-    }
-    if k < pat.length() {
-      cls = slice(pat, 0, k + 1)
-      j = k + 1
-    } else {
-      return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
-    }
-  } else if pat.at(0).to_int() == 92 {
-    if pat.length() < 2 {
-      return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
-    }
-    cls = slice(pat, 0, 2)
-    j = 2
-  } else {
-    cls = slice(pat, 0, 1)
-    j = 1
+    return { name, toks: [], }
   }
-  let mut min_len = 1
-  let mut max_len = 1
-  let mut greedy = true
-  if j < pat.length() {
-    let q = pat.at(j).to_int()
-    if q == 63 {
-      min_len = 0
-      j = j + 1
-    } else if q == 42 {
-      min_len = 0
-      max_len = -1
-      j = j + 1
-    } else if q == 43 {
-      max_len = -1
-      j = j + 1
-    }
-    if j < pat.length() && pat.at(j).to_int() == 63 {
-      greedy = false
-      j = j + 1
-    }
+  match parse_pattern(pat) {
+    Some(toks) => { name, toks, }
+    None => { name, toks: [], }
   }
-  if j < pat.length() {
-    // Multi-token pattern: fall back to the default capture.
-    return { name, class: b"", min_len: 0, max_len: -1, greedy: false, }
-  }
-  { name, class: cls, min_len, max_len, greedy, }
 }
 
 ///|
@@ -791,6 +872,93 @@ fn template_class_matches(cls : Bytes, c : Int32) -> Bool {
 }
 
 ///|
+/// Greediness of a compiled pattern, taken from its last quantified class:
+/// `\S+?` is non-greedy, `\d+` is greedy (the default). Used to choose whether
+/// candidate capture windows are tried longest-first or shortest-first.
+fn pattern_greedy(toks : Array[PatTok]) -> Bool {
+  let mut i = toks.length() - 1
+  while i >= 0 {
+    match toks[i] {
+      Class(_, _, _, gr) => return gr
+      Lit(_) => i = i - 1
+    }
+  }
+  true
+}
+
+///|
+/// Match one placeholder at `pos`, given the literal that follows it (empty
+/// for a trailing placeholder). Returns the captured end position.
+fn lit_at(line : Bytes, pos : Int32, lit : Bytes) -> Bool {
+  if pos + lit.length() > line.length() {
+    return false
+  }
+  let mut j = 0
+  while j < lit.length() {
+    if line.at(pos + j).to_int() != lit.at(j).to_int() {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+///|
+/// Match compiled tokens exactly against `line[pos, end)`. Greedy classes
+/// consume as much as possible then backtrack; non-greedy the other way. The
+/// token/quantifier count is bounded by `parse_pattern`, so failure cannot
+/// explode exponentially on realistic templates.
+fn pat_match_exact(
+  line : Bytes,
+  pos : Int32,
+  end : Int32,
+  toks : Array[PatTok],
+  ti : Int32,
+) -> Bool {
+  if ti >= toks.length() {
+    return pos == end
+  }
+  match toks[ti] {
+    Lit(lit) =>
+      if pos + lit.length() <= end && lit_at(line, pos, lit) {
+        pat_match_exact(line, pos + lit.length(), end, toks, ti + 1)
+      } else {
+        false
+      }
+    Class(cls, mn, mx, gr) => {
+      let mut maxp = pos
+      while maxp < end &&
+            (mx < 0 || maxp - pos < mx) &&
+            template_class_matches(cls, line.at(maxp).to_int()) {
+        maxp = maxp + 1
+      }
+      if maxp - pos < mn {
+        return false
+      }
+      if gr {
+        let mut p = maxp
+        while p >= pos + mn {
+          if pat_match_exact(line, p, end, toks, ti + 1) {
+            return true
+          }
+          p = p - 1
+        }
+        false
+      } else {
+        let mut p = pos + mn
+        while p <= maxp {
+          if pat_match_exact(line, p, end, toks, ti + 1) {
+            return true
+          }
+          p = p + 1
+        }
+        false
+      }
+    }
+  }
+}
+
+///|
 /// Match one placeholder at `pos`, given the literal that follows it (empty
 /// for a trailing placeholder). Returns the captured end position.
 fn template_capture_end(
@@ -799,7 +967,7 @@ fn template_capture_end(
   field : TemplateField,
   next_literal : Bytes,
 ) -> Int32? {
-  if field.class.length() == 0 {
+  if field.toks.length() == 0 {
     // Default placeholder: capture up to the first occurrence of the next
     // literal, or to the end of the line when there is none.
     if next_literal.length() == 0 {
@@ -808,72 +976,62 @@ fn template_capture_end(
     let n = next_literal.length()
     let mut scan = pos
     while scan + n <= line.length() {
-      let mut j = 0
-      let mut ok = true
-      while j < n && ok {
-        if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
-          ok = false
-        }
-        j = j + 1
-      }
-      if ok {
+      if lit_at(line, scan, next_literal) {
         return Some(scan)
       }
       scan = scan + 1
     }
-    return None
-  }
-  // Pattern capture: consume the class greedily, then honour the quantifier
-  // and the following literal (greedy searches the literal right-to-left).
-  let mut e = pos
-  while e < line.length() &&
-        template_class_matches(field.class, line.at(e).to_int()) {
-    e = e + 1
-    if field.max_len >= 0 && e - pos >= field.max_len {
-      break
-    }
-  }
-  let min_end = pos + field.min_len
-  if e < min_end {
     return None
   }
   if next_literal.length() == 0 {
-    return Some(if field.greedy { e } else { min_end })
+    // A trailing pattern must consume the rest of the line.
+    if pat_match_exact(line, pos, line.length(), field.toks, 0) {
+      return Some(line.length())
+    }
+    // A lone `-` is the conventional missing value even at the end.
+    if pos + 1 == line.length() && line.at(pos).to_int() == 45 {
+      return Some(pos + 1)
+    }
+    return None
   }
+  // Candidate ends are every occurrence of the next literal. A greedy pattern
+  // tries the longest window first (a `\S+` capture stops at the last literal);
+  // a non-greedy one tries the shortest first (`\S+?` stops at the first). Both
+  // orders let a multi-token pattern span internal separators (a timestamp's
+  // space, a dotted IP) instead of being cut at the first one.
   let n = next_literal.length()
-  if field.greedy {
-    let mut scan = e
-    while scan >= min_end {
-      if scan + n <= line.length() {
-        let mut j = 0
-        let mut ok = true
-        while j < n && ok {
-          if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
-            ok = false
-          }
-          j = j + 1
-        }
-        if ok {
-          return Some(scan)
-        }
+  let ends : Array[Int32] = []
+  let mut scan = pos
+  while scan + n <= line.length() {
+    if lit_at(line, scan, next_literal) {
+      ends.push(scan)
+    }
+    scan = scan + 1
+  }
+  if pattern_greedy(field.toks) {
+    let mut k = ends.length() - 1
+    while k >= 0 {
+      let e = ends[k]
+      if pat_match_exact(line, pos, e, field.toks, 0) {
+        return Some(e)
       }
-      scan = scan - 1
+      k = k - 1
     }
   } else {
-    let mut scan = min_end
-    while scan <= e && scan + n <= line.length() {
-      let mut j = 0
-      let mut ok = true
-      while j < n && ok {
-        if line.at(scan + j).to_int() != next_literal.at(j).to_int() {
-          ok = false
-        }
-        j = j + 1
+    let mut k = 0
+    while k < ends.length() {
+      let e = ends[k]
+      if pat_match_exact(line, pos, e, field.toks, 0) {
+        return Some(e)
       }
-      if ok {
-        return Some(scan)
-      }
-      scan = scan + 1
+      k = k + 1
+    }
+  }
+  // Missing-value placeholder: nginx/apache write `-` where a numeric field has
+  // no value. Accept it as the field value instead of dropping the whole line.
+  if pos < line.length() && line.at(pos).to_int() == 45 {
+    if pos + 1 == line.length() || lit_at(line, pos + 1, next_literal) {
+      return Some(pos + 1)
     }
   }
   None
@@ -996,15 +1154,88 @@ fn flatten_json_value(
 /// array; malformed JSON raises ParseError (the caller decides whether to
 /// keep the raw line). String values are kept verbatim; numbers, booleans and
 /// null render as text.
+
+///|
+/// Locate the first balanced `{...}` object in a line, respecting JSON strings
+/// and escapes. Used only when the whole line is not valid JSON: container
+/// runtimes and syslog shippers wrap one JSON object in a timestamp/stream
+/// prefix (or append text), which used to yield zero fields.
+fn json_object_span(line : Bytes) -> (Int32, Int32)? {
+  let mut start = -1
+  let mut i = 0
+  while i < line.length() {
+    if line.at(i).to_int() == 123 {
+      start = i
+      break
+    }
+    i = i + 1
+  }
+  if start < 0 {
+    return None
+  }
+  let mut depth = 0
+  let mut in_str = false
+  let mut esc = false
+  let mut j = start
+  while j < line.length() {
+    let c = line.at(j).to_int()
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 123 {
+      depth = depth + 1
+    } else if c == 125 {
+      depth = depth - 1
+      if depth == 0 {
+        return Some((start, j + 1))
+      }
+    }
+    j = j + 1
+  }
+  None
+}
+
+///|
+/// Parse one JSON line into flattened `name=value` fields. Non-object JSON
+/// yields an empty array; malformed JSON raises ParseError (the caller decides
+/// whether to keep the raw line). A line that is not wholly JSON is retried on
+/// its first balanced object, so a wrapper prefix/suffix does not drop every
+/// field.
 pub fn json_object_fields(
   line : Bytes,
 ) -> Array[(Bytes, Bytes)] raise @json.ParseError {
-  let text = @utf8.decode_lossy(line)
-  let parsed = @json.parse(text)
   let out : Array[(Bytes, Bytes)] = []
-  match parsed {
-    Object(_) => flatten_json_value("", parsed, out)
-    _ => ()
+  let direct : Json? = Some(@json.parse(@utf8.decode_lossy(line))) catch {
+    _ => None
   }
-  out
+  match direct {
+    Some(parsed) => {
+      match parsed {
+        Object(_) => flatten_json_value("", parsed, out)
+        _ => ()
+      }
+      out
+    }
+    None =>
+      match json_object_span(line) {
+        Some((start, end)) => {
+          let parsed = @json.parse(@utf8.decode_lossy(slice(line, start, end))) catch {
+            _ => raise @json.ParseError::InvalidEof
+          }
+          match parsed {
+            Object(_) => flatten_json_value("", parsed, out)
+            _ => ()
+          }
+          out
+        }
+        None => raise @json.ParseError::InvalidEof
+      }
+  }
 }

@@ -29,7 +29,7 @@
 
 ### 解析与规范化（2.x）
 
-- **结构化解析**：`--format json` 递归展平嵌套对象为点号字段；`--template` 为受限 Grok 子集（零依赖、无回溯）；`parse-check` 离线校验并输出准确率。
+- **结构化解析**：`--format json` 递归展平嵌套对象为点号字段，并容忍容器/CRI 前缀或尾随文本（定位第一个平衡 `{...}`，查询侧同样生效）；`--template` 为受限 Grok 子集（零依赖、线性回溯）：`<name>`/`<name:pattern>`，pattern 支持多 token（`\d+\.\d+\.\d+\.\d+`、`\d+-\d+-\d+ \d+:\d+:\d+,\d+`）、字符类/量词/非贪婪，`-` 作为缺失值不再整行丢弃；`parse-check` 离线校验，`--expect name[=value]` 做逐值准确率（不再只看字段数）。JSON 记录的 value 在查询侧自动展平（含包装前缀）；模板字段要参与结构化查询需 `--schema` 或 `--value-field`。
 - **统一 Schema**：`--schema` 将字段归一到时间戳/级别/服务名/主机/trace_id/消息六类，服务名提升为记录键，字段名做大小写与分隔符归一。
 - **时间规范化**：数字按位数识别精度，ISO-8601 支持日期、`T`/空格、可选秒、`.`/`,` 小数秒、`Z`/`±HH:MM`/`±HHMM`/`UTC` 等时区；`--clock-skew`/`--clock-skew-field` 补偿采集端漂移；`query --sort-by-time` 按事件时间排序。
 - **脱敏与富化**：`--mask` 在写入前掩码敏感字段名与已知令牌（`sk-`/`AKIA`/`ghp_`/`xox?-`）、Bearer/JWT、手机号、证件号、卡号、长 hex；`--meta` 追加部署元数据。
@@ -128,7 +128,7 @@ ingest <dir> <file> [--format lines|kv|json|template] [--follow|--once|--fifo]
        [--include ...] [--exclude ...] [--mask] [--meta ...] [--dedup-field ...]
        [--cursor-name ...] [--from bytes] [--batch N] [--interval ms]
 http <dir> [--format ...] [--port N] [--batch N] [--queue N] [--queue-bytes N] [--backlog-alert N]
-parse-check <file> [--format ...] [--template ...] [--schema] [--json]
+parse-check <file> [--format ...] [--template ...] [--schema] [--expect name[=value]] [--json]
 bench-write <dir> <count> [--batch N] [--sync never|always|batch] [--warmup N]
 ```
 

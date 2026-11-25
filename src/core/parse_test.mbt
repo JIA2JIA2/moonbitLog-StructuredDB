@@ -412,3 +412,81 @@ test "sampling_reason separates level and rate drops" {
     _ => panic()
   }
 }
+
+///|
+fn field_of(fields : Array[(Bytes, Bytes)], name : Bytes) -> Bytes {
+  let mut out : Bytes = b"<missing>"
+  for pair in fields {
+    if pair.0 == name {
+      out = pair.1
+    }
+  }
+  out
+}
+
+///|
+test "parse_by_template supports multi-token Grok-style patterns" {
+  let tpl = b"<ts:\\d+-\\d+-\\d+ \\d+:\\d+:\\d+,\\d+> <level> [<thread>] <logger> - <msg>"
+  match
+    @core.parse_by_template(
+      b"2026-11-25 10:00:00,123 INFO [main] svc - ok", tpl,
+    ) {
+    Some(fields) => {
+      assert_eq(field_of(fields, b"ts"), b"2026-11-25 10:00:00,123")
+      assert_eq(field_of(fields, b"level"), b"INFO")
+      assert_eq(field_of(fields, b"thread"), b"main")
+      assert_eq(field_of(fields, b"logger"), b"svc")
+      assert_eq(field_of(fields, b"msg"), b"ok")
+    }
+    None => panic()
+  }
+  // A dotted IP is one multi-token pattern, not a stop at the first dot.
+  match
+    @core.parse_by_template(
+      b"10.0.0.2 200", b"<ip:\\d+\\.\\d+\\.\\d+\\.\\d+> <status:\\d+>",
+    ) {
+    Some(fields) => {
+      assert_eq(field_of(fields, b"ip"), b"10.0.0.2")
+      assert_eq(field_of(fields, b"status"), b"200")
+    }
+    None => panic()
+  }
+}
+
+///|
+test "parse_by_template accepts '-' as a missing field value" {
+  let tpl = b"<ip:\\d+\\.\\d+\\.\\d+\\.\\d+> <status:\\d+> <bytes:\\d+> <tail>"
+  match @core.parse_by_template(b"10.0.0.2 401 - tail", tpl) {
+    Some(fields) => assert_eq(field_of(fields, b"bytes"), b"-")
+    None => panic()
+  }
+  match @core.parse_by_template(b"200 -", b"<status:\\d+> <bytes:\\d+>") {
+    Some(fields) => assert_eq(field_of(fields, b"bytes"), b"-")
+    None => panic()
+  }
+}
+
+///|
+test "json_object_fields tolerates wrapper prefixes and suffixes" {
+  let f1 = @core.json_object_fields(
+    b"2026-11-25T10:00:00.123Z {\"level\":\"info\",\"msg\":\"x\"}",
+  )
+  assert_eq(f1.length(), 2)
+  assert_eq(field_of(f1, b"level"), b"info")
+  let f2 = @core.json_object_fields(b"{\"a\":1} trailing")
+  assert_eq(f2.length(), 1)
+  assert_eq(field_of(f2, b"a"), b"1")
+  // Braces inside strings must not end the object early.
+  let f3 = @core.json_object_fields(
+    b"prefix {\"msg\":\"a } b\",\"n\":2} suffix",
+  )
+  assert_eq(f3.length(), 2)
+  assert_eq(field_of(f3, b"msg"), b"a } b")
+  // Genuinely malformed input still reports a parse error.
+  let bad : Array[(Bytes, Bytes)]? = Some(
+    @core.json_object_fields(b"no json here"),
+  ) catch {
+    _ => None
+  }
+  assert_eq(bad is None, true)
+}
