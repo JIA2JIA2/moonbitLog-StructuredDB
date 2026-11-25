@@ -1424,8 +1424,16 @@ fn cmd_put(
 ) -> Unit raise @io.IoError {
   let timestamp = match ts {
     Some(s) =>
+      // Plain integers stay epoch milliseconds; ISO-8601 accepted too
+      // (3.1 fifth round — the scan family and prune-before already do).
       @string.parse_int64(s) catch {
-        _ => raise @io.IoError::Invalid("invalid timestamp: " + s)
+        _ => {
+          let ms = @core.parse_iso8601_ms(@utf8.encode(s), -1L)
+          if ms < 0 {
+            raise @io.IoError::Invalid("invalid timestamp: " + s)
+          }
+          ms
+        }
       }
     None => now_ms()
   }
@@ -2720,8 +2728,18 @@ fn cmd_prune_bytes(dir : String, max : String) -> Unit raise @io.IoError {
 ///|
 /// Drop segments whose last record predates `cutoff` (timestamp-based retention).
 fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
+  // Plain integers stay epoch milliseconds (the historical form); anything
+  // else falls back to the 2.3 ISO-8601 parser — M216 granted ISO windows to
+  // the scan family, but this retention sibling still rejected them
+  // (`invalid timestamp: 2026-11-24T00:00:00Z`).
   let cutoff = @string.parse_int64(ts) catch {
-    _ => raise @io.IoError::Invalid("invalid timestamp: " + ts)
+    _ => {
+      let ms = @core.parse_iso8601_ms(@utf8.encode(ts), -1L)
+      if ms < 0 {
+        raise @io.IoError::Invalid("invalid timestamp: " + ts)
+      }
+      ms
+    }
   }
   run_locked(dir, true, () => {
     let log = open_log(dir)
