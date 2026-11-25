@@ -153,7 +153,7 @@ pub fn Record::encode(self : Record) -> Bytes {
   arr.blit_from_bytes(29, self.key, 0, key_len)
   arr.blit_from_bytes(29 + key_len, self.value, 0, value_len)
   let out = arr.unsafe_reinterpret_as_bytes()
-  let crc = crc32_range(out, 4, 4 + body_len)
+  let crc = crc32_fixed_range(arr, 4, 4 + body_len)
   arr.unsafe_write_uint32_le(4 + body_len, crc)
   out
 }
