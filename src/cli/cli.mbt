@@ -1345,12 +1345,6 @@ fn ctx_name_eq(a : Bytes, b : Bytes) -> Bool {
 ///|
 /// Parse a record value into field pairs: JSON objects are flattened (2.1),
 /// anything else uses the kv parser. A JSON value wrapped by a container
-/// prefix (`2026-... stdout F {...}`) is still recognized — `json_object_fields`
-/// locates the first balanced object — and falls back to kv if that fails.
-
-///|
-/// Parse a record value into field pairs: JSON objects are flattened (2.1),
-/// anything else uses the kv parser. A JSON value wrapped by a container
 /// prefix (`2026-... stdout F {...}`) is still recognized, and trailing kv
 /// pairs from `--meta` enrichment are merged — the shared extraction contract
 /// lives in `@core.value_fields` so the `.inv` field columns (pre-filter)
@@ -1391,8 +1385,21 @@ fn ctx_field_from_pairs(
   names : Array[Bytes],
 ) -> Bytes? {
   for pair in fields {
+    let p_slot = @core.canonical_field(pair.0)
     for name in names {
-      if ctx_name_eq(pair.0, name) {
+      // The name matches through the canonical slot when both sides resolve
+      // to one (trace_id vs trace.id / error.trace_id / traceId — the
+      // container-prefixed OTel spelling used to miss: the literal squash
+      // compares "errortraceid" against "traceid"), and falls back to the
+      // case-insensitive literal squash for non-canonical names (thread_id
+      // is not a 2.2 slot).
+      let q_slot = @core.canonical_field(name)
+      let km = if q_slot >= 0 && p_slot >= 0 {
+        q_slot == p_slot
+      } else {
+        ctx_name_eq(pair.0, name)
+      }
+      if km {
         return Some(pair.1)
       }
     }
