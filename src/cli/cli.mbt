@@ -1440,6 +1440,14 @@ fn ctx_field_from_pairs(
   fields : Array[(Bytes, Bytes)],
   names : Array[Bytes],
 ) -> Bytes? {
+  // Two passes, exact spellings first: the tail-segment fallback (pass two)
+  // must never shadow a top-level field the exact layers (slot or literal
+  // squash, pass one) can name — with a single interleaved loop,
+  // {"error":{"latency":100},"latency":777} returned 100 (the tail match on
+  // the earlier flattened pair) while the reversed key order returned 777,
+  // purely from JSON key order. Pass one sweeps every pair for an exact
+  // spelling; pass two sweeps for the container-prefixed tail only when no
+  // exact spelling exists anywhere.
   for pair in fields {
     let p_slot = @core.canonical_field(pair.0)
     for name in names {
@@ -1458,9 +1466,18 @@ fn ctx_field_from_pairs(
       let km = if q_slot >= 0 && p_slot >= 0 {
         q_slot == p_slot
       } else {
-        ctx_name_eq(pair.0, name) || ctx_name_tail_eq(pair.0, name)
+        ctx_name_eq(pair.0, name)
       }
       if km {
+        return Some(pair.1)
+      }
+    }
+  }
+  for pair in fields {
+    let p_slot = @core.canonical_field(pair.0)
+    for name in names {
+      let q_slot = @core.canonical_field(name)
+      if !(q_slot >= 0 && p_slot >= 0) && ctx_name_tail_eq(pair.0, name) {
         return Some(pair.1)
       }
     }
