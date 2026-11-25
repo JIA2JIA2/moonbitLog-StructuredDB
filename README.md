@@ -25,7 +25,7 @@
 - **缓冲与背压**：HTTP 入站有界队列，入队返回 202、满返回 429 + Retry-After、单请求超队列容量返回 413（提示拆分）；积压告警 `WARN/RESOLVED`（阈值随队列容量缩放）；drain 失败的批次留在队头重试（已 202 的数据不丢），单次 `ERROR`/`RESOLVED` 与 `/stats` 的 `drain_errors` 可观测；单个请求失败回 500 不杀服务；SIGTERM 有界 drain（10s），仍有未落盘数据时打印 `UNPERSISTED` 并 exit 1。
 - **吞吐**：`append_batch` + `SyncPolicy::Batch` + `--batch` 分批；记录 CRC 改为 8 字节切片查表（批量写主热点，本机 never 约 1.8×、batch 约 1.35×）；`bench-write` 两阶段校验无丢失，QPS 只计写入路径、最终 flush 单列。
 - **幂等与重放**：`--idempotent` 内容等值去重；`--dedup-id`/`--dedup-field` 显式唯一 ID；`X-Batch-Id`/`--batch-id` 整批去重，批次按角色命名空间隔离，且只在整批数据真正落盘后确认（202 后崩溃/未 drain 的重放会重新入库而不是被误跳过；在途重复直接返回 duplicate，不重复入队）。状态存于 `DEDUP`/`BATCHES`，随备份迁移；删除 DEDUP 可从 value 内嵌的 `__uid=` 重建，BATCHES 无内嵌副本（删除即批次历史丢失）。
-- **源头采样**：`--min-level`、`--sample-rate`（FNV-1a 确定性）、`--include`/`--exclude`；采样在入站执行一次，`/stats` 的 `sampling` 块可对账。
+- **源头采样**：`--min-level`（级别词/字段名/值均大小写不敏感；自动识别 `level`/`severity`/`severity_text`/`lvl`/`loglevel` 与嵌套 `log.level`，纯文本识别行首 `ERROR`/`[WARN]`/`INFO:` 及时间戳后 token）、`--sample-rate`（FNV-1a 确定性）、`--include`/`--exclude`；采样在入站执行一次；`/stats` 的 `sampling` 块同时给出总保留率与 `--sample-rate` 的实际生效率（`rate_dropped`/`rate_keep_pct`）。
 
 ### 解析与规范化（2.x）
 

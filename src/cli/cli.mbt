@@ -5509,6 +5509,8 @@ fn cmd_ingest(
   let mut total = 0
   let mut duplicates = 0
   let mut sampled_out = 0
+  // Lines dropped specifically by --sample-rate (subset of sampled_out).
+  let mut sampled_rate = 0
   let mut ts_fallback = 0
   let mut go = true
   while go && !@backend_native.shutdown_requested() {
@@ -5558,11 +5560,12 @@ fn cmd_ingest(
     if size > pos {
       let data = read_from(file, pos)
       let (lines, consumed) = split_complete_lines(data, !follow)
-      let (written, sampled, dup, fb) = ingest_lines(
+      let (written, sampled, dup, fb, rate) = ingest_lines(
         dir, lines, opts, dedup, false,
       )
       duplicates = duplicates + dup
       sampled_out = sampled_out + sampled
+      sampled_rate = sampled_rate + rate
       ts_fallback = ts_fallback + fb
       total = total + written
       pos = pos + consumed
@@ -5586,7 +5589,14 @@ fn cmd_ingest(
     ""
   }
   let sampled_note = if sampled_out > 0 {
-    " (" + sampled_out.to_string() + " sampled out)"
+    " (" +
+    sampled_out.to_string() +
+    " sampled out, rate keep " +
+    actual_rate_keep_pct(
+      (total + duplicates).to_int64(),
+      sampled_rate.to_int64(),
+    ).to_string() +
+    "%)"
   } else {
     ""
   }
@@ -5964,10 +5974,14 @@ fn ingest_lines(
   opts : IngestOptions,
   dedup : @hashmap.HashMap[Bytes, Bool]?,
   skip_sampling : Bool,
-) -> (Int32, Int32, Int32, Int32) raise @io.IoError {
+) -> (Int32, Int32, Int32, Int32, Int32) raise @io.IoError {
   let ts_base = now_ms()
   let mut written = 0
   let mut sampled_out = 0
+  // Subset of `sampled_out` dropped by the proportional --sample-rate, so the
+  // observed rate keep percentage can be reported separately from level/rule
+  // filtering.
+  let mut sampled_rate = 0
   let mut duplicates = 0
   // 2.3 observability: records whose timestamp could not be parsed from the
   // source fell back to the arrival-order time — the silent failure mode
@@ -5995,6 +6009,7 @@ fn ingest_lines(
     }
     let mut window_written = 0
     let mut window_sampled = 0
+    let mut window_sampled_rate = 0
     let mut window_duplicates = 0
     let mut window_ts_fallback = 0
     let mut window_bytes : Int64 = 0
@@ -6062,7 +6077,15 @@ fn ingest_lines(
             true
           } else {
             match opts.sampling {
-              Some(cfg) => @core.sampling_allows(lines[j], fields, cfg)
+              Some(cfg) =>
+                match @core.sampling_reason(lines[j], fields, cfg) {
+                  None => true
+                  Some(@core.SampleDrop::Rate) => {
+                    window_sampled_rate = window_sampled_rate + 1
+                    false
+                  }
+                  Some(_) => false
+                }
               None => true
             }
           }
@@ -6146,11 +6169,12 @@ fn ingest_lines(
     })
     written = written + window_written
     sampled_out = sampled_out + window_sampled
+    sampled_rate = sampled_rate + window_sampled_rate
     duplicates = duplicates + window_duplicates
     ts_fallback = ts_fallback + window_ts_fallback
     i = window_end
   }
-  (written, sampled_out, duplicates, ts_fallback)
+  (written, sampled_out, duplicates, ts_fallback, sampled_rate)
 }
 
 ///|
@@ -6268,10 +6292,13 @@ fn parse_sampling_config(
     Some(s) => @utf8.encode(s)
     None => b""
   }
+  // Empty = auto-detect: `level`, `severity`, `severity_text`, `lvl`,
+  // `loglevel` and flattened `log.level`, all case-insensitive. An explicit
+  // `--level-field` narrows the lookup to that name.
   let level_field = @utf8.encode(
     match level_field_str {
       Some(f) => f
-      None => "level"
+      None => ""
     },
   )
   if min_level < 0 &&
@@ -6295,21 +6322,28 @@ fn parse_sampling_config(
 fn sampling_filter_lines(
   lines : Array[Bytes],
   opts : IngestOptions,
-) -> (Array[Bytes], Int32) {
+) -> (Array[Bytes], Int32, Int32) {
   match opts.sampling {
-    None => (lines, 0)
+    None => (lines, 0, 0)
     Some(cfg) => {
       let kept : Array[Bytes] = []
       let mut dropped = 0
+      // Dropped specifically by the proportional rate; the rest were filtered
+      // by level/include/exclude. Reported separately so "the configured rate
+      // actually applies" is observable.
+      let mut rate_dropped = 0
       for line in lines {
         let (_, _, fields) = parse_ingest_line(line, opts)
-        if @core.sampling_allows(line, fields, cfg) {
-          kept.push(line)
-        } else {
-          dropped = dropped + 1
+        match @core.sampling_reason(line, fields, cfg) {
+          None => kept.push(line)
+          Some(@core.SampleDrop::Rate) => {
+            dropped = dropped + 1
+            rate_dropped = rate_dropped + 1
+          }
+          Some(_) => dropped = dropped + 1
         }
       }
-      (kept, dropped)
+      (kept, dropped, rate_dropped)
     }
   }
 }
@@ -6333,6 +6367,8 @@ fn cmd_ingest_fifo(
   }
   let mut total = 0
   let mut sampled = 0
+  // Lines dropped specifically by --sample-rate (subset of sampled).
+  let mut sampled_rate = 0
   let mut duplicates = 0
   let mut ts_fallback = 0
   while !@backend_native.shutdown_requested() {
@@ -6356,11 +6392,12 @@ fn cmd_ingest_fifo(
         let (lines, consumed) = split_complete_lines(data, false)
         leftover = @core.slice(data, consumed.to_int(), data.length())
         if lines.length() > 0 {
-          let (written, dropped, dup, fb) = ingest_lines(
+          let (written, dropped, dup, fb, rate) = ingest_lines(
             dir, lines, opts, dedup, false,
           )
           total = total + written
           sampled = sampled + dropped
+          sampled_rate = sampled_rate + rate
           duplicates = duplicates + dup
           ts_fallback = ts_fallback + fb
         }
@@ -6371,7 +6408,7 @@ fn cmd_ingest_fifo(
     // when the writer closed (or concatenated with the next writer's first
     // line). Flush it as its own record on EOF instead.
     if leftover.length() > 0 && !@backend_native.shutdown_requested() {
-      let (written, dropped, dup, fb) = ingest_lines(
+      let (written, dropped, dup, fb, rate) = ingest_lines(
         dir,
         [leftover],
         opts,
@@ -6380,6 +6417,7 @@ fn cmd_ingest_fifo(
       )
       total = total + written
       sampled = sampled + dropped
+      sampled_rate = sampled_rate + rate
       duplicates = duplicates + dup
       ts_fallback = ts_fallback + fb
       leftover = b""
@@ -6397,6 +6435,11 @@ fn cmd_ingest_fifo(
     sampled.to_string() +
     " sampled out (keep " +
     actual_sample_rate_pct(total.to_int64(), sampled.to_int64()).to_string() +
+    "%, rate keep " +
+    actual_rate_keep_pct(
+      (total + duplicates).to_int64(),
+      sampled_rate.to_int64(),
+    ).to_string() +
     "%) / " +
     duplicates.to_string() +
     " duplicates / " +
@@ -6517,6 +6560,10 @@ struct HttpQueue {
   mut accepted : Int64
   mut written : Int64
   mut sampled : Int64
+  // Subset of `sampled` dropped by the proportional --sample-rate (the rest
+  // came from level/include/exclude), so /stats can report the rate's observed
+  // keep percentage independently.
+  mut sampled_rate : Int64
   mut duplicates : Int64
   // 2.3 observability: drained records whose source timestamp was unparsable
   // and fell back to the drain time (surfaced via /stats and the final
@@ -6664,13 +6711,32 @@ pub fn actual_sample_rate_pct(written : Int64, sampled : Int64) -> Int64 {
 }
 
 ///|
+/// Observed keep-rate of the proportional `--sample-rate` alone: lines that
+/// passed level/include/exclude and were then kept by the rate, over all lines
+/// that reached the rate decision. This is the number that must track the
+/// configured percentage; the combined `keep_rate_pct` cannot (it also folds
+/// in level and rule filtering).
+fn actual_rate_keep_pct(kept : Int64, rate_dropped : Int64) -> Int64 {
+  let total = kept + rate_dropped
+  if total <= (0 : Int64) {
+    (0 : Int64)
+  } else {
+    kept * (100 : Int64) / total
+  }
+}
+
+///|
 /// JSON object describing the sampling configuration in force plus the
-/// observed keep rate, so "the configured rate actually applies" is verifiable
-/// from /stats instead of being hand-computed from counters.
+/// observed keep rates, so "the configured rate actually applies" is
+/// verifiable from /stats instead of being hand-computed from counters.
+/// `rate_keep_pct` isolates the proportional sampler; `keep_rate_pct` remains
+/// the overall (level + rule + rate) retention.
 fn sampling_stats_json(
   cfg : @core.SamplingConfig?,
+  accepted : Int64,
   written : Int64,
   sampled : Int64,
+  rate_dropped : Int64,
 ) -> String {
   match cfg {
     Some(c) =>
@@ -6684,6 +6750,19 @@ fn sampling_stats_json(
       (if c.exclude_text.length() > 0 { "true" } else { "false" }) +
       ",\"keep_rate_pct\":" +
       actual_sample_rate_pct(written, sampled).to_string() +
+      ",\"level_or_rule_dropped\":" +
+      (if sampled > rate_dropped {
+        sampled - rate_dropped
+      } else {
+        (0 : Int64)
+      }).to_string() +
+      ",\"rate_dropped\":" +
+      rate_dropped.to_string() +
+      ",\"rate_keep_pct\":" +
+      // `accepted` is exactly what passed level/include/exclude and was then
+      // kept by the rate, so accepted/(accepted+rate_dropped) is the rate's
+      // observed keep percentage.
+      actual_rate_keep_pct(accepted, rate_dropped).to_string() +
       "}"
     None => "null"
   }
@@ -6728,7 +6807,7 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Bool {
     i = i + 1
   }
   let result = try {
-    let (batch_written, _, batch_dup, batch_ts_fb) = ingest_lines(
+    let (batch_written, _, batch_dup, batch_ts_fb, _) = ingest_lines(
       dir,
       payload,
       q.opts,
@@ -6990,7 +7069,13 @@ fn handle_http_connection(
         ",\"sampled_out\":" +
         q.sampled.to_string() +
         ",\"sampling\":" +
-        sampling_stats_json(q.opts.sampling, q.written, q.sampled) +
+        sampling_stats_json(
+          q.opts.sampling,
+          q.accepted,
+          q.written,
+          q.sampled,
+          q.sampled_rate,
+        ) +
         ",\"duplicates\":" +
         q.duplicates.to_string() +
         ",\"ts_fallback\":" +
@@ -7122,7 +7207,7 @@ fn handle_http_connection(
     }
     // Source-side sampling runs before the queue, so the capacity below counts
     // only lines that will actually be written.
-    let (kept, sampled_out) = sampling_filter_lines(lines, q.opts)
+    let (kept, sampled_out, sampled_rate) = sampling_filter_lines(lines, q.opts)
     // 1.3: admit-time validation for failures the drain would otherwise hit
     // only after the 202 was already returned. An embedded tab/newline in the
     // dedup id is rejected here (400) instead of poisoning the queue and
@@ -7193,6 +7278,7 @@ fn handle_http_connection(
         quota_charge_storage_keys(dir, charge)
         q.accepted = q.accepted + kept.length().to_int64()
         q.sampled = q.sampled + sampled_out.to_int64()
+        q.sampled_rate = q.sampled_rate + sampled_rate.to_int64()
         http_respond(
           conn,
           202,
@@ -7219,6 +7305,7 @@ fn handle_http_connection(
       }
     } else {
       q.sampled = q.sampled + sampled_out.to_int64()
+      q.sampled_rate = q.sampled_rate + sampled_rate.to_int64()
       // The batch is fully resolved even when the sampler dropped every line:
       // confirm the key immediately so a retry is a no-op instead of
       // re-sampling (and re-counting) the same payload.
@@ -7371,6 +7458,7 @@ fn cmd_http(
     accepted: 0,
     written: 0,
     sampled: 0,
+    sampled_rate: 0,
     ts_fallback: 0,
     duplicates: 0,
     dedup,
@@ -7444,6 +7532,8 @@ fn cmd_http(
     q.sampled.to_string() +
     " sampled out (keep " +
     actual_sample_rate_pct(q.written, q.sampled).to_string() +
+    "%, rate keep " +
+    actual_rate_keep_pct(q.accepted, q.sampled_rate).to_string() +
     "%) / " +
     q.duplicates.to_string() +
     " duplicates, peak " +

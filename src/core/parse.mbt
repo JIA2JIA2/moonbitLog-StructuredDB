@@ -192,23 +192,78 @@ pub fn shell_quote(s : String) -> String {
 /// 1-8 → debug(0), 9-12 → info(1), 13-16 → warn(2), 17-20 → error(3),
 /// 21-24 → fatal(4); 0 and out-of-range numbers stay unknown (-1).
 pub fn level_rank(level : Bytes) -> Int32 {
-  let n = level.length()
+  level_rank_span(level, 0, level.length())
+}
+
+///|
+/// Case-insensitive equality of `raw[start, end)` with `word`, without
+/// allocating a slice (this runs per record on bulk ingest).
+fn span_eq_ci(raw : Bytes, start : Int32, end : Int32, word : Bytes) -> Bool {
+  if end - start != word.length() {
+    return false
+  }
+  let mut k = 0
+  while k < word.length() {
+    if lower_ascii(raw.at(start + k).to_int()) !=
+      lower_ascii(word.at(k).to_int()) {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///|
+/// Named-level rank for a span of a raw line. Covers the common syslog
+/// severity words: `crit`/`critical`/`alert`/`emerg`/`panic` rank as fatal (4)
+/// — they used to return -1 and be treated as unknown by every
+/// `--level-min`/error-detection consumer. Comparisons are case-insensitive:
+/// SDKs emit `DEBUG`/`INFO`/`WARN`/`ERROR` far more often than lowercase, and a
+/// case-sensitive table silently made `--min-level` a no-op on those records.
+fn level_rank_word(raw : Bytes, start : Int32, end : Int32) -> Int32 {
+  if span_eq_ci(raw, start, end, b"debug") {
+    0
+  } else if span_eq_ci(raw, start, end, b"info") {
+    1
+  } else if span_eq_ci(raw, start, end, b"warn") ||
+    span_eq_ci(raw, start, end, b"warning") {
+    2
+  } else if span_eq_ci(raw, start, end, b"error") ||
+    span_eq_ci(raw, start, end, b"err") {
+    3
+  } else if span_eq_ci(raw, start, end, b"fatal") ||
+    span_eq_ci(raw, start, end, b"critical") ||
+    span_eq_ci(raw, start, end, b"crit") ||
+    span_eq_ci(raw, start, end, b"alert") ||
+    span_eq_ci(raw, start, end, b"emerg") ||
+    span_eq_ci(raw, start, end, b"panic") {
+    4
+  } else {
+    -1
+  }
+}
+
+///|
+/// Severity rank of `raw[start, end)` without slicing the line (the raw-line
+/// fallback and leading-token detector run once per record).
+fn level_rank_span(raw : Bytes, start : Int32, end : Int32) -> Int32 {
+  let n = end - start
   if n >= 1 && n <= 2 {
     let mut all_digits = true
-    let mut i = 0
-    while i < n {
-      let c = level.at(i).to_int()
+    let mut i = start
+    while i < end {
+      let c = raw.at(i).to_int()
       if c < 48 || c > 57 {
         all_digits = false
-        i = n
+        i = end
       }
       i = i + 1
     }
     if all_digits {
       let v = if n == 1 {
-        level.at(0).to_int() - 48
+        raw.at(start).to_int() - 48
       } else {
-        (level.at(0).to_int() - 48) * 10 + (level.at(1).to_int() - 48)
+        (raw.at(start).to_int() - 48) * 10 + (raw.at(end - 1).to_int() - 48)
       }
       if v >= 1 && v <= 24 {
         if v <= 8 {
@@ -226,58 +281,98 @@ pub fn level_rank(level : Bytes) -> Int32 {
         -1
       }
     } else {
-      level_rank_name(level)
+      level_rank_word(raw, start, end)
     }
   } else {
-    level_rank_name(level)
+    level_rank_word(raw, start, end)
   }
 }
 
 ///|
-/// Named-level rank used by `level_rank` for non-numeric values. Covers the
-/// common syslog severity words: `crit`/`critical`/`alert`/`emerg`/`panic`
-/// rank as fatal (4) — they used to return -1 and be treated as unknown by
-/// every `--level-min`/error-detection consumer.
-fn level_rank_name(level : Bytes) -> Int32 {
-  if level == b"debug" {
-    0
-  } else if level == b"info" {
-    1
-  } else if level == b"warn" || level == b"warning" {
-    2
-  } else if level == b"error" || level == b"err" {
-    3
-  } else if level == b"fatal" ||
-    level == b"critical" ||
-    level == b"crit" ||
-    level == b"alert" ||
-    level == b"emerg" ||
-    level == b"panic" {
-    4
+/// Number of level-field aliases consulted when `--level-field` is not given
+/// explicitly.
+const LEVEL_ALIAS_COUNT : Int32 = 6
+
+///|
+/// Level field spellings SDKs actually emit (OTel and common structured
+/// loggers); flattened JSON paths such as `log.level` match by their trailing
+/// segment too.
+fn level_field_alias(i : Int32) -> Bytes {
+  match i {
+    0 => b"level"
+    1 => b"lvl"
+    2 => b"severity"
+    3 => b"severity_text"
+    4 => b"loglevel"
+    5 => b"log.level"
+    _ => b""
+  }
+}
+
+///|
+/// Case-insensitive equality of `raw[i, i+len(field))` with `field`, without
+/// allocating a slice (this runs per byte over every line).
+fn field_eq_ci_at(raw : Bytes, i : Int32, field : Bytes) -> Bool {
+  let mut k = 0
+  while k < field.length() {
+    if lower_ascii(raw.at(i + k).to_int()) != lower_ascii(field.at(k).to_int()) {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///|
+/// Whether a parsed field name carries the level. An empty `configured` means
+/// auto-detect (aliases above); an explicit `--level-field` matches that name
+/// case-insensitively plus the trailing segment of a flattened JSON path
+/// (`log.<name>`), but not arbitrary lookalikes such as `mylevel`.
+fn level_field_matches(name : Bytes, configured : Bytes) -> Bool {
+  if configured.length() > 0 {
+    bytes_eq_ci(name, configured) ||
+    (
+      name.length() > configured.length() + 1 &&
+      name.at(name.length() - configured.length() - 1).to_int() == 46 &&
+      span_eq_ci(
+        name,
+        name.length() - configured.length(),
+        name.length(),
+        configured,
+      )
+    )
   } else {
-    -1
+    let mut i = 0
+    let mut hit = false
+    while i < LEVEL_ALIAS_COUNT && !hit {
+      let cand = level_field_alias(i)
+      if bytes_eq_ci(name, cand) ||
+        (
+          name.length() > cand.length() + 1 &&
+          name.at(name.length() - cand.length() - 1).to_int() == 46 &&
+          span_eq_ci(name, name.length() - cand.length(), name.length(), cand)
+        ) {
+        hit = true
+      }
+      i = i + 1
+    }
+    hit
   }
 }
 
 ///|
-/// Severity rank found directly in a raw line (`level=warn`, `level:"warn"`,
-/// `"level":"warn"`) for formats without parsed fields (e.g. `--format lines`).
-/// Returns -1 when absent or unknown.
-fn level_rank_in_line(raw_line : Bytes, level_field : Bytes) -> Int32 {
+/// Severity drawn from one `name=value` / `name:"value"` / `"name":"value"`
+/// occurrence of `field` inside a raw line. Case-insensitive on the field name
+/// (SDKs emit `Level=`/`LEVEL=`) and on the value (`level_rank`).
+fn level_rank_for_field(raw_line : Bytes, field : Bytes) -> Int32 {
   let n = raw_line.length()
-  let m = level_field.length()
+  let m = field.length()
+  if m == 0 {
+    return -1
+  }
   let mut i = 0
   while i + m < n {
-    let mut same = true
-    let mut k = 0
-    while k < m {
-      if raw_line.at(i + k) != level_field.at(k) {
-        same = false
-        break
-      }
-      k = k + 1
-    }
-    if same {
+    if field_eq_ci_at(raw_line, i, field) {
       let prev = if i == 0 { 0 } else { raw_line.at(i - 1).to_int() }
       let boundary = i == 0 ||
         prev == 32 ||
@@ -310,7 +405,7 @@ fn level_rank_in_line(raw_line : Bytes, level_field : Bytes) -> Int32 {
           e = e + 1
         }
         if e > s {
-          let rank = level_rank(slice(raw_line, s, e))
+          let rank = level_rank_span(raw_line, s, e)
           if rank >= 0 {
             return rank
           }
@@ -318,6 +413,88 @@ fn level_rank_in_line(raw_line : Bytes, level_field : Bytes) -> Int32 {
       }
     }
     i = i + 1
+  }
+  -1
+}
+
+///|
+/// Severity rank found directly in a raw line (`level=warn`, `level:"warn"`,
+/// `"level":"warn"`). With no explicit `--level-field` every alias is tried.
+/// Returns -1 when absent or unknown.
+fn level_rank_in_line(raw_line : Bytes, level_field : Bytes) -> Int32 {
+  // No `=`/`:` anywhere means no `name=value` or `"name":"value"` can exist:
+  // skip the alias scans entirely and let the leading-token fallback handle a
+  // plain `INFO message` line (six full scans per line is measurable on bulk
+  // plain-text ingest).
+  if !bytes_contains(raw_line, b"=") && !bytes_contains(raw_line, b":") {
+    return -1
+  }
+  if level_field.length() > 0 {
+    return level_rank_for_field(raw_line, level_field)
+  }
+  let mut i = 0
+  while i < LEVEL_ALIAS_COUNT {
+    let rank = level_rank_for_field(raw_line, level_field_alias(i))
+    if rank >= 0 {
+      return rank
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn wrap_char(c : Int32) -> Bool {
+  c == 91 || c == 93 || c == 40 || c == 41 || c == 58
+}
+
+///|
+/// Severity from a leading plain-text level token (`ERROR ...`, `[WARN] ...`,
+/// `INFO: ...`, after a timestamp). Only the first three whitespace-separated
+/// tokens that consist solely of ASCII letters (after trimming `[]() :`) are
+/// considered, so prose, numbers and timestamps are not mistaken for levels.
+fn level_rank_at_head(raw_line : Bytes) -> Int32 {
+  let n = raw_line.length()
+  let mut i = 0
+  let mut tokens = 0
+  while i < n && tokens < 3 {
+    while i < n &&
+          (raw_line.at(i).to_int() == 32 || raw_line.at(i).to_int() == 9) {
+      i = i + 1
+    }
+    let raw_start = i
+    while i < n && raw_line.at(i).to_int() != 32 && raw_line.at(i).to_int() != 9 {
+      i = i + 1
+    }
+    let mut start = raw_start
+    let mut end = i
+    while start < end && wrap_char(raw_line.at(start).to_int()) {
+      start = start + 1
+    }
+    while end > start && wrap_char(raw_line.at(end - 1).to_int()) {
+      end = end - 1
+    }
+    if end - start >= 3 && end - start <= 8 {
+      let mut letters = true
+      let mut k = start
+      while k < end {
+        let c = raw_line.at(k).to_int()
+        if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+          letters = false
+          k = end
+        }
+        k = k + 1
+      }
+      if letters {
+        let rank = level_rank_span(raw_line, start, end)
+        if rank >= 0 {
+          return rank
+        }
+      }
+    }
+    if end > start {
+      tokens = tokens + 1
+    }
   }
   -1
 }
@@ -364,45 +541,84 @@ pub(all) struct SamplingConfig {
 }
 
 ///|
+/// Why the sampling pipeline dropped a line. `Rate` is the only reason that
+/// depends on `--sample-rate`, so counting it separately lets callers report
+/// the rate's observed keep percentage (1.5 "采样率实际生效") instead of a
+/// combined figure that cannot distinguish level/rule filtering from sampling.
+pub(all) enum SampleDrop {
+  Include
+  Exclude
+  BelowLevel
+  Rate
+}
+
+///|
 /// Sampling decision for one line: it must pass the include rule (raw line
 /// contains), the exclude rule (raw line does not contain), the minimum
-/// severity (the `level_field` pair inside the parsed value, when that field
-/// is present — unknown levels are never filtered by severity), and the
-/// proportional sample rate.
+/// severity, and the proportional sample rate. Returns the reason it was
+/// dropped, or None when kept.
+///
+/// Severity lookup: parsed level fields are matched by name case-insensitively
+/// and by common aliases (`severity`, `severity_text`, `lvl`, `loglevel`, and
+/// the trailing segment of flattened JSON such as `log.level`) when
+/// `--level-field` is not explicit; unknown severity values are never filtered
+/// (a new level word must not silently drop data). Raw-line fallback handles
+/// `level=WARN` / `Level:"WARN"` (case-insensitive) and a leading plain-text
+/// token (`ERROR ...`, `[WARN] ...`).
+pub fn sampling_reason(
+  raw_line : Bytes,
+  fields : Array[(Bytes, Bytes)],
+  cfg : SamplingConfig,
+) -> SampleDrop? {
+  if cfg.include_text.length() > 0 &&
+    !bytes_contains_ci(raw_line, cfg.include_text) {
+    return Some(Include)
+  }
+  if cfg.exclude_text.length() > 0 &&
+    bytes_contains_ci(raw_line, cfg.exclude_text) {
+    return Some(Exclude)
+  }
+  if cfg.min_level >= 0 {
+    let mut matched = false
+    let mut field_rank = -1
+    for pair in fields {
+      if level_field_matches(pair.0, cfg.level_field) {
+        matched = true
+        let rank = level_rank(pair.1)
+        if rank >= 0 {
+          field_rank = rank
+          if rank < cfg.min_level {
+            return Some(BelowLevel)
+          }
+        }
+      }
+    }
+    // Fields without a usable level (or no parsed fields at all): look in the
+    // raw text, then at a leading plain-text level token.
+    if !matched || field_rank < 0 {
+      let mut rank = level_rank_in_line(raw_line, cfg.level_field)
+      if rank < 0 {
+        rank = level_rank_at_head(raw_line)
+      }
+      if rank >= 0 && rank < cfg.min_level {
+        return Some(BelowLevel)
+      }
+    }
+  }
+  if !sample_passes(raw_line, cfg.sample_rate) {
+    return Some(Rate)
+  }
+  None
+}
+
+///|
+/// Whether the line passes every sampling rule (see `sampling_reason`).
 pub fn sampling_allows(
   raw_line : Bytes,
   fields : Array[(Bytes, Bytes)],
   cfg : SamplingConfig,
 ) -> Bool {
-  if cfg.include_text.length() > 0 &&
-    !bytes_contains_ci(raw_line, cfg.include_text) {
-    return false
-  }
-  if cfg.exclude_text.length() > 0 &&
-    bytes_contains_ci(raw_line, cfg.exclude_text) {
-    return false
-  }
-  if cfg.min_level >= 0 {
-    let mut matched = false
-    for pair in fields {
-      if pair.0 == cfg.level_field {
-        matched = true
-        let rank = level_rank(pair.1)
-        if rank >= 0 && rank < cfg.min_level {
-          return false
-        }
-      }
-    }
-    // Formats without parsed fields (plain lines) still carry a level in the
-    // raw text: `level=warn`, `level:"warn"` or `"level":"warn"`.
-    if !matched {
-      let rank = level_rank_in_line(raw_line, cfg.level_field)
-      if rank >= 0 && rank < cfg.min_level {
-        return false
-      }
-    }
-  }
-  sample_passes(raw_line, cfg.sample_rate)
+  sampling_reason(raw_line, fields, cfg) is None
 }
 
 ///|

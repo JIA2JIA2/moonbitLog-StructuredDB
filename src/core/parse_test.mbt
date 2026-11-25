@@ -314,3 +314,101 @@ test "json_object_fields flattens nested objects with dotted names" {
   }
   assert_eq(found, 4)
 }
+
+///|
+test "level_rank is case-insensitive over words and numeric bands" {
+  assert_eq(@core.level_rank(b"DEBUG"), 0)
+  assert_eq(@core.level_rank(b"Info"), 1)
+  assert_eq(@core.level_rank(b"WARN"), 2)
+  assert_eq(@core.level_rank(b"Error"), 3)
+  assert_eq(@core.level_rank(b"FATAL"), 4)
+  assert_eq(@core.level_rank(b"CRIT"), 4)
+  assert_eq(@core.level_rank(b"17"), 3)
+  assert_eq(@core.level_rank(b"trace"), -1)
+}
+
+///|
+test "sampling_allows auto-detects level aliases, nested fields and heads" {
+  let cfg : @core.SamplingConfig = {
+    min_level: 2,
+    level_field: b"",
+    sample_rate: 100,
+    include_text: b"",
+    exclude_text: b"",
+  }
+  let no_fields : Array[(Bytes, Bytes)] = []
+  // Parsed field names: aliases and case-insensitive field/value.
+  for alias in [b"level", b"lvl", b"severity", b"severity_text", b"Level"] {
+    let debug_fields : Array[(Bytes, Bytes)] = [(alias, b"DEBUG")]
+    assert_true(!@core.sampling_allows(b"{}", debug_fields, cfg))
+  }
+  // Flattened JSON nest: `log.level`.
+  let nested_debug : Array[(Bytes, Bytes)] = [(b"log.level", b"DEBUG")]
+  assert_true(!@core.sampling_allows(b"{}", nested_debug, cfg))
+  let nested_warn : Array[(Bytes, Bytes)] = [(b"log.level", b"WARN")]
+  assert_true(@core.sampling_allows(b"{}", nested_warn, cfg))
+  // Leading plain-text token (bare, bracketed, after a timestamp, lowercase).
+  assert_true(!@core.sampling_allows(b"DEBUG app started", no_fields, cfg))
+  assert_true(!@core.sampling_allows(b"info ok", no_fields, cfg))
+  assert_true(@core.sampling_allows(b"[WARN] disk full", no_fields, cfg))
+  assert_true(@core.sampling_allows(b"INFO: ok", no_fields, cfg) == false)
+  assert_true(
+    @core.sampling_allows(b"2026-01-01T00:00:00Z ERROR boom", no_fields, cfg),
+  )
+  // Prose that merely starts with a level word is kept (never drop data on a
+  // guess above the threshold).
+  assert_true(@core.sampling_allows(b"Error rate is high", no_fields, cfg))
+}
+
+///|
+test "sampling_allows honours an explicit level field only" {
+  let cfg : @core.SamplingConfig = {
+    min_level: 2,
+    level_field: b"severity",
+    sample_rate: 100,
+    include_text: b"",
+    exclude_text: b"",
+  }
+  let debug : Array[(Bytes, Bytes)] = [(b"severity", b"DEBUG")]
+  let other : Array[(Bytes, Bytes)] = [(b"level", b"DEBUG")]
+  assert_true(!@core.sampling_allows(b"", debug, cfg))
+  // A different field must not be picked up when --level-field is explicit.
+  assert_true(@core.sampling_allows(b"", other, cfg))
+}
+
+///|
+test "sampling_reason separates level and rate drops" {
+  let level_cfg : @core.SamplingConfig = {
+    min_level: 2,
+    level_field: b"",
+    sample_rate: 100,
+    include_text: b"",
+    exclude_text: b"",
+  }
+  match @core.sampling_reason(b"level=DEBUG", [], level_cfg) {
+    Some(@core.SampleDrop::BelowLevel) => ()
+    _ => panic()
+  }
+  let rate_cfg : @core.SamplingConfig = {
+    min_level: 2,
+    level_field: b"",
+    sample_rate: 0,
+    include_text: b"",
+    exclude_text: b"",
+  }
+  match @core.sampling_reason(b"level=ERROR", [], rate_cfg) {
+    Some(@core.SampleDrop::Rate) => ()
+    _ => panic()
+  }
+  let rule_cfg : @core.SamplingConfig = {
+    min_level: -1,
+    level_field: b"",
+    sample_rate: 100,
+    include_text: b"health",
+    exclude_text: b"",
+  }
+  match @core.sampling_reason(b"user login", [], rule_cfg) {
+    Some(@core.SampleDrop::Include) => ()
+    _ => panic()
+  }
+}
