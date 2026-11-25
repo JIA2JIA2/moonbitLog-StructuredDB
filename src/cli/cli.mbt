@@ -13008,6 +13008,24 @@ fn notify_extra(
   json : Bool,
 ) -> Int32 raise @io.IoError {
   let mut failures : Int32 = 0
+  // Header-injection guard: the recipient lands verbatim in the `To:` mail
+  // header, so a value carrying CR/LF (`a@b.c\nBcc: evil@x`) would smuggle
+  // extra headers into the outgoing mail body. The curl --mail-rcpt uses the
+  // same string, so both must be a clean single-line address. URLs are
+  // shell-quoted and therefore not injectable, but a newline in one is still
+  // a mistake worth refusing loudly.
+  for (label, v) in [("email", email_to), ("smtp-url", smtp_url)] {
+    match v {
+      Some(t) =>
+        if @core.bytes_contains(@utf8.encode(t), b"\n") ||
+          @core.bytes_contains(@utf8.encode(t), b"\r") {
+          raise @io.IoError::Invalid(
+            label + " must not contain newlines (header injection)",
+          )
+        }
+      None => ()
+    }
+  }
   match dingtalk {
     Some(url) => {
       let payload = "{\"msgtype\":\"text\",\"text\":{\"content\":\"" +
@@ -13370,6 +13388,23 @@ fn cmd_watch(
     }
     None => None
   }
+  // Notify-parameter hygiene runs HERE, before the eval loop: a newline in
+  // the recipient or SMTP URL is a one-shot configuration error, and
+  // notify_extra's own check lives inside the loop where its raise would be
+  // swallowed by the per-notification failure counting on a long-running
+  // watch (the process would keep looping instead of exiting).
+  for (label, v) in [("email", email_to), ("smtp-url", smtp_url)] {
+    match v {
+      Some(t) =>
+        if @core.bytes_contains(@utf8.encode(t), b"\n") ||
+          @core.bytes_contains(@utf8.encode(t), b"\r") {
+          raise @io.IoError::Invalid(
+            label + " must not contain newlines (header injection)",
+          )
+        }
+      None => ()
+    }
+  }
   match (metric_b, metric_thr) {
     (Some(_), None) =>
       raise @io.IoError::Invalid("--metric requires --metric-threshold")
@@ -13415,11 +13450,22 @@ fn cmd_watch(
   let mut escalated = false
   let mut fired_at : Int64 = 0
   let esc_ms = match escalate_sec {
-    Some(sv) =>
-      (@string.parse_int64(sv) catch {
+    Some(sv) => {
+      let esc : Int64 = @string.parse_int64(sv) catch {
         _ => raise @io.IoError::Invalid("invalid escalate-sec: " + sv)
-      }) *
-      (1000 : Int64)
+      }
+      if esc < 0 {
+        // A negative escalate delay makes "elapsed >= esc_ms" never true,
+        // silently disabling escalation — the same quiet-off shape the
+        // other numeric guards refused (4.6/5.3 rounds). 0 also keeps
+        // escalation disabled (the esc_ms > 0 gate below) — an explicit
+        // "no escalation" setting, so only negatives fail.
+        raise @io.IoError::Invalid(
+          "escalate-sec must be >= 0: " + esc.to_string(),
+        )
+      }
+      esc * (1000 : Int64)
+    }
     None => 0
   }
   run_locked(dir, false, () => {
