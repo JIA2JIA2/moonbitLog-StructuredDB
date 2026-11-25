@@ -210,6 +210,14 @@ pub(all) struct NativeFileLog {
   mut pending_len : Int32
   mut closed : Bool
   mut raw : Bytes?
+  // Lazy decompression (3.3 fifth round): a compressed segment opens WITHOUT
+  // eagerly inflating its whole body — the compressed bytes ride along and
+  // the raw view is filled in on the first read_at. A CLI query is a fresh
+  // process that opens every segment; eager inflation paid the full
+  // decompression cost (tens of ms per store) even when the query touched a
+  // single bucket.
+  mut compressed : Bytes?
+  mut comp_algo : Int32
   // M181: after the first full fsync (which persists the file's directory
   // entry), appends only extend the file — later flushes can use fdatasync
   // and skip the inode metadata writeback per batch.
@@ -235,6 +243,8 @@ pub fn NativeFileLog::open(path : String) -> NativeFileLog raise @io.IoError {
     closed: false,
     data_synced: false,
     raw: None,
+    compressed: None,
+    comp_algo: 0,
   }
 }
 
@@ -259,6 +269,8 @@ pub fn NativeFileLog::open_readonly(
     closed: false,
     data_synced: false,
     raw: None,
+    compressed: None,
+    comp_algo: 0,
   }
 }
 
@@ -272,9 +284,45 @@ pub fn NativeFileLog::open_compressed(
   algo : Int32,
 ) -> NativeFileLog raise @io.IoError {
   let bytes = @utf8.encode(path)
+  // Lazy decompression (3.3 fifth round): hold the compressed bytes and
+  // defer inflating to the first read_at — a CLI query is a fresh process
+  // that opens every segment of the store, and eager inflation paid the
+  // full decompression cost (~45ms for a 7-segment 40k-record store) even
+  // when the query's time window or result limit touched a single bucket.
   let compressed = read_file(path)
+  {
+    fd: (-1 : Int32),
+    path: bytes,
+    size: raw_size,
+    flushed: raw_size,
+    pending: FixedArray::make(0, b'\x00'),
+    pending_len: 0,
+    closed: false,
+    data_synced: false,
+    raw: None,
+    compressed: Some(compressed),
+    comp_algo: algo,
+  }
+}
+
+///|
+/// Inflate the lazy compressed view on first use. A corrupt stream surfaces
+/// here instead of at open time — the caller maps it onto the same Corrupt
+/// error the eager path raised.
+fn NativeFileLog::ensure_decompressed(
+  self : NativeFileLog,
+) -> Unit raise @io.IoError {
+  match self.raw {
+    Some(_) => return
+    None => ()
+  }
+  let compressed : Bytes = match self.compressed {
+    Some(c) => c
+    None => return
+  }
+  let raw_size = self.size
   let raw = try {
-    if algo == 2 {
+    if self.comp_algo == 2 {
       @core.lz_decompress(compressed, raw_size)
     } else {
       @core.rle_decompress(compressed, raw_size)
@@ -282,18 +330,8 @@ pub fn NativeFileLog::open_compressed(
   } catch {
     _ => raise @io.IoError::Corrupt((0 : Int64))
   }
-  let len = raw.length().to_int64()
-  {
-    fd: (-1 : Int32),
-    path: bytes,
-    size: len,
-    flushed: len,
-    pending: FixedArray::make(0, b'\x00'),
-    pending_len: 0,
-    closed: false,
-    data_synced: false,
-    raw: Some(raw),
-  }
+  self.raw = Some(raw)
+  self.compressed = None
 }
 
 ///|
@@ -482,6 +520,10 @@ pub impl @io.LogReader for NativeFileLog with fn read_at(self, offset, len) {
   if offset < (0 : Int64) || offset + len.to_int64() > self.size {
     raise @io.IoError::OutOfBounds(offset)
   }
+  // Inflate on first use: a compressed segment arrives with raw=None and
+  // the compressed bytes attached; fd is -1, so the pread fallback must not
+  // be reached before this.
+  self.ensure_decompressed()
   match self.raw {
     Some(r) =>
       @core.slice(r, offset.to_int(), (offset + len.to_int64()).to_int())

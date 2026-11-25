@@ -389,6 +389,16 @@ struct IngestOptions {
   format : String
   key_bytes : Bytes
   field_bytes : Bytes
+  // Whether `--key-field` was given explicitly (the default "key" is
+  // indistinguishable by value). A schema ingest (2.2) promotes the service
+  // name to the key only when the caller did NOT pick a key field themselves
+  // — an explicit `--key-field id` is the user's uniqueness contract, and the
+  // kv-superseded pruning treats same-key rewrites as replaceable, so letting
+  // the service name overwrite it made the deduplication silently fail and
+  // `maintain` dropped whole segments of history (3.3 fifth round). With an
+  // explicit key field the service still lands in the value (`service=<s>`
+  // prefix on the normalized form), so `--service` filters keep working.
+  key_field_explicit : Bool
   value_field_bytes : Bytes
   ts_field_bytes : Bytes?
   template_bytes : Bytes?
@@ -6186,14 +6196,36 @@ fn schema_transform(
   value : Bytes,
   fields : Array[(Bytes, Bytes)],
   fallback_ts : Int64,
+  key_explicit : Bool,
 ) -> (Bytes, Bytes, Int64?) {
   let f = @core.schema_from_fields(fields, fallback_ts)
   let k = match f.service {
-    Some(s) => s
+    // The service name becomes the record key only when the caller did not
+    // pick a key field themselves (2.2 default). An explicit --key-field is
+    // the user's uniqueness contract: the kv-superseded pruning treats
+    // same-key rewrites as replaceable, so letting the service name
+    // overwrite it let `maintain` drop whole segments of history (3.3 fifth
+    // round: 40000 unique-id records down to 1524).
+    Some(s) => if key_explicit { key } else { s }
     None => key
   }
   let v = @core.schema_value(f)
-  let v2 = if v.length() == 0 { value } else { v }
+  // With an explicit key field the service is no longer carried by the key —
+  // keep it queryable by prefixing the normalized form (`--service` matches
+  // the parsed field through schema_matches; `--indexed` sees the
+  // `service=<s>` field column through value_fields).
+  let v2 = if v.length() == 0 {
+    value
+  } else if key_explicit && f.service is Some(s) {
+    let prefix = @buffer.Buffer::Buffer()
+    prefix.write_bytes(b"service=")
+    prefix.write_bytes(s)
+    prefix.write_bytes(b" ")
+    prefix.write_bytes(v)
+    prefix.to_bytes()
+  } else {
+    v
+  }
   (k, v2, f.ts)
 }
 
@@ -6540,7 +6572,13 @@ fn ingest_lines(
         while j < chunk_end {
           let (raw_k, raw_v, fields) = parse_ingest_line(lines[j], opts)
           let (k, v, schema_ts) = if opts.schema {
-            schema_transform(raw_k, raw_v, fields, ts_base + j.to_int64())
+            schema_transform(
+              raw_k,
+              raw_v,
+              fields,
+              ts_base + j.to_int64(),
+              opts.key_field_explicit,
+            )
           } else {
             (raw_k, raw_v, None)
           }
@@ -15889,6 +15927,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
+      let mut key_field_explicit = false
       let mut value_field = ""
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
@@ -15928,6 +15967,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--key-field" && i + 1 < args.length() {
           key_field = args[i + 1]
+          key_field_explicit = true
           i = i + 1
         } else if a == "--value-field" && i + 1 < args.length() {
           value_field = args[i + 1]
@@ -16045,6 +16085,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         format,
         key_bytes: @utf8.encode(key),
         field_bytes: @utf8.encode(key_field),
+        key_field_explicit,
         value_field_bytes: @utf8.encode(value_field),
         ts_field_bytes: match ts_field {
           Some(f) => Some(@utf8.encode(f))
@@ -16104,6 +16145,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut format = "lines"
       let mut key = "log"
       let mut key_field = "key"
+      let mut key_field_explicit = false
       let mut value_field = ""
       let mut ts_field : String? = (None : String?)
       let mut template : String? = (None : String?)
@@ -16148,6 +16190,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           i = i + 1
         } else if a == "--key-field" && i + 1 < args.length() {
           key_field = args[i + 1]
+          key_field_explicit = true
           i = i + 1
         } else if a == "--value-field" && i + 1 < args.length() {
           value_field = args[i + 1]
@@ -16244,6 +16287,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         format,
         key_bytes: @utf8.encode(key),
         field_bytes: @utf8.encode(key_field),
+        key_field_explicit,
         value_field_bytes: @utf8.encode(value_field),
         ts_field_bytes: match ts_field {
           Some(f) => Some(@utf8.encode(f))
