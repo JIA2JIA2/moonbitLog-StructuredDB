@@ -8358,7 +8358,14 @@ fn cmd_search(
   until : String?,
   require_time : Bool,
   timeout : String?,
+  json : Bool,
 ) -> Unit raise @io.IoError {
+  // An empty needle is a substring of everything — both paths would scan the
+  // whole table and "match" every record, which is never what the user
+  // meant. Refuse it instead of pretending it succeeded.
+  if text.length() == 0 {
+    raise @io.IoError::Invalid("search text must not be empty")
+  }
   let scope = active_scope(dir)
   if inverted && wildcard {
     raise @io.IoError::Invalid(
@@ -8388,11 +8395,13 @@ fn cmd_search(
         )
       } else {
         let win = query_window_ms()
-        println(
-          "INFO search scoped to the last " +
-          (win / (1000 : Int64)).to_string() +
-          "s (default window; pass --since to override, --since 0 for everything)",
-        )
+        if !json {
+          println(
+            "INFO search scoped to the last " +
+            (win / (1000 : Int64)).to_string() +
+            "s (default window; pass --since to override, --since 0 for everything)",
+          )
+        }
         since_ts = Some(now_ms() - win)
       }
   }
@@ -8532,12 +8541,20 @@ fn cmd_search(
                 stop = true
                 return false
               }
-              print_record(rec)
+              if json {
+                print_json_record(rec)
+              } else {
+                print_record(rec)
+              }
               hits = hits + 1
             }
             true
           })
-          println(matches_summary(hits, truncated, max_hits) + " (inverted)")
+          if json {
+            eprintln(matches_summary(hits, truncated, max_hits) + " (inverted)")
+          } else {
+            println(matches_summary(hits, truncated, max_hits) + " (inverted)")
+          }
         } else {
           let mut seen_cands = 0
           for off in cands {
@@ -8577,7 +8594,11 @@ fn cmd_search(
                   match_needle(r.value, needle, ignore_case)
                 }
                 if hit && in_time && scope_allows_key(scope, r.key) {
-                  print_record(r)
+                  if json {
+                    print_json_record(r)
+                  } else {
+                    print_record(r)
+                  }
                   hits = hits + 1
                 }
               }
@@ -8590,7 +8611,11 @@ fn cmd_search(
         Some(m) => raise @io.IoError::Invalid(m)
         None => ()
       }
-      println(matches_summary(hits, truncated, max_hits) + " (inverted)")
+      if json {
+        eprintln(matches_summary(hits, truncated, max_hits) + " (inverted)")
+      } else {
+        println(matches_summary(hits, truncated, max_hits) + " (inverted)")
+      }
     })
     return
   }
@@ -8658,7 +8683,11 @@ fn cmd_search(
         None => ()
       }
       if hit && in_time {
-        print_record(rec)
+        if json {
+          print_json_record(rec)
+        } else {
+          print_record(rec)
+        }
         hits = hits + 1
         if max_hits >= 0 && hits >= max_hits {
           truncated = true
@@ -8671,7 +8700,11 @@ fn cmd_search(
       Some(m) => raise @io.IoError::Invalid(m)
       None => ()
     }
-    println(matches_summary(hits, truncated, max_hits))
+    if json {
+      eprintln(matches_summary(hits, truncated, max_hits))
+    } else {
+      println(matches_summary(hits, truncated, max_hits))
+    }
   })
 }
 
@@ -9549,7 +9582,11 @@ fn cmd_query(
           ")",
         )
       }
-      println(matches_summary(hits, truncated, max_hits) + " (indexed)")
+      if json {
+        eprintln(matches_summary(hits, truncated, max_hits) + " (indexed)")
+      } else {
+        println(matches_summary(hits, truncated, max_hits) + " (indexed)")
+      }
     })
     return
   }
@@ -9711,7 +9748,11 @@ fn cmd_query(
         }
       }
     }
-    println(matches_summary(hits, truncated, max_hits))
+    if json {
+      eprintln(matches_summary(hits, truncated, max_hits))
+    } else {
+      println(matches_summary(hits, truncated, max_hits))
+    }
   })
 }
 
@@ -16651,6 +16692,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       let mut until : String? = (None : String?)
       let mut require_time = false
       let mut timeout : String? = (None : String?)
+      let mut json = false
       let mut i = 4
       while i < args.length() {
         let a = args[i]
@@ -16683,6 +16725,10 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         } else if a == "--timeout" && i + 1 < args.length() {
           timeout = Some(args[i + 1])
           i = i + 1
+        } else if a == "--json" {
+          json = true
+        } else {
+          raise @io.IoError::Invalid("unknown search option: " + a)
         }
         i = i + 1
       }
@@ -16700,6 +16746,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         until,
         require_time,
         timeout,
+        json,
       )
     }
   } else if cmd == "query" {
