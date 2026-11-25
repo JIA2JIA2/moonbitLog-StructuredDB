@@ -1839,6 +1839,7 @@ fn cmd_scan_time(
       ms
     }
   }
+  assert_time_window("scan-time", lo_ts, hi_ts)
   let qg = scan_query_guard(dir, timeout)
   let sg : ScanGuard = { qg, seen: 0, win_bytes: 0, abort: None, }
   run_read_snapshot(dir, log => {
@@ -8386,6 +8387,10 @@ fn cmd_search(
     Some(s) => Some(parse_ts_arg("until", s))
     None => None
   }
+  match (since_ts, until_ts) {
+    (Some(lo), Some(hi)) => assert_time_window("search", lo, hi)
+    _ => ()
+  }
   match since_ts {
     Some(_) => ()
     None =>
@@ -8928,11 +8933,48 @@ fn ScanGuard::raise_if_aborted(self : ScanGuard) -> Unit raise @io.IoError {
 /// Default query time window (4.3): scans without an explicit `--since` are
 /// scoped to the last this-many milliseconds (24h), so a forgotten time
 /// bound cannot trigger an unbounded scan. Override with
-/// `MOONLOG_QUERY_WINDOW_MS`.
-fn query_window_ms() -> Int64 {
+/// `MOONLOG_QUERY_WINDOW_MS`. A zero or negative override makes every
+/// default-windowed query silently return zero records behind an absurd
+/// INFO note ("scoped to the last -5s") — a broken env value must fail
+/// loudly (4.3 fourth round), not quietly empty every result the operator
+/// looks at.
+fn query_window_ms() -> Int64 raise @io.IoError {
   match @env.get_env_var("MOONLOG_QUERY_WINDOW_MS") {
-    Some(v) => @string.parse_int64(v) catch { _ => 86_400_000 }
+    Some(v) => {
+      let w : Int64 = @string.parse_int64(v) catch { _ => 86_400_000 }
+      if w >= 1 {
+        w
+      } else {
+        raise @io.IoError::Invalid(
+          "query window must be >= 1ms: " +
+          w.to_string() +
+          " (check MOONLOG_QUERY_WINDOW_MS)",
+        )
+      }
+    }
     None => 86_400_000
+  }
+}
+
+///|
+/// Reject an inverted event-time window (4.3 fourth round): `--since` after
+/// `--until` mathematically scans the empty set, which every entry point
+/// reported as a plain "(0 matches)" — a swapped or mistyped argument
+/// silently emptied the result instead of failing. `lo == hi` stays legal
+/// (the half-open window is then empty by construction).
+fn assert_time_window(
+  cmd : String,
+  lo : Int64,
+  hi : Int64,
+) -> Unit raise @io.IoError {
+  if lo > hi {
+    raise @io.IoError::Invalid(
+      cmd +
+      ": inverted time window — --since " +
+      lo.to_string() +
+      " is after --until " +
+      hi.to_string(),
+    )
   }
 }
 
@@ -9067,6 +9109,7 @@ fn scan_time_bounds(
     Some(s) => parse_ts_arg("until", s)
     None => TS_MAX
   }
+  assert_time_window(cmd, lo, hi)
   (lo, hi)
 }
 
@@ -9191,6 +9234,10 @@ fn cmd_query(
   let until_ts : Int64? = match until {
     Some(s) => Some(parse_ts_arg("until", s))
     None => None
+  }
+  match (since_ts, until_ts) {
+    (Some(lo), Some(hi)) => assert_time_window("query", lo, hi)
+    _ => ()
   }
   let min_rank : Int32? = match level_min {
     Some(s) => {
@@ -10209,6 +10256,10 @@ fn cmd_aggregate(
   let until_ts : Int64? = match until {
     Some(s) => Some(parse_ts_arg("until", s))
     None => None
+  }
+  match (since_ts, until_ts) {
+    (Some(lo), Some(hi)) => assert_time_window("aggregate", lo, hi)
+    _ => ()
   }
   // 5.1 production guards: share the 4.6 query slot/guard and scan outside
   // the writer lock, so a slow aggregation does not stall ingestion.
@@ -12146,6 +12197,10 @@ fn cmd_cluster(
     budget: max_scan_bytes(),
     scanned: 0,
     segs: 0,
+  }
+  match (since_ts, until_ts) {
+    (Some(lo), Some(hi)) => assert_time_window("cluster", lo, hi)
+    _ => ()
   }
   let counts : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
   let frames : @hashmap.HashMap[Bytes, Int32] = @hashmap.HashMap::HashMap([])
