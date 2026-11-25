@@ -37,6 +37,8 @@ pub fn json_object_fields(Bytes) -> Array[(Bytes, Bytes)] raise @json.ParseError
 
 pub fn level_rank(Bytes) -> Int32
 
+pub fn level_word_from_syslog(Bytes) -> Bytes?
+
 pub fn lz_compress(Bytes) -> Bytes
 
 pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError

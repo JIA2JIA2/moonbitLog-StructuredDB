@@ -245,8 +245,12 @@ fn level_word_from_number(v : Bytes) -> Bytes? {
 ///|
 /// Syslog/journald PRIORITY (0-7) mapped to the same word form: 0-2
 /// (emerg/alert/crit) → fatal, 3 (err) → error, 4 (warning) → warn,
-/// 5-6 (notice/info) → info, 7 → debug.
-fn level_word_from_syslog(v : Bytes) -> Bytes? {
+/// 5-6 (notice/info) → info, 7 → debug. Public so the field-column builder
+/// can store the same level words the linear schema extraction produces —
+/// without this the `--level` pushdown has no posting for a record whose
+/// only level evidence is a PRIORITY pair (the linear path still matched it,
+/// so --indexed disagreed with plain query). None for anything outside 0-7.
+pub fn level_word_from_syslog(v : Bytes) -> Bytes? {
   if v.length() != 1 {
     return None
   }

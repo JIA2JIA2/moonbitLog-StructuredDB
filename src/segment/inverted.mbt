@@ -17,7 +17,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 6
+const INV_VERSION : UInt32 = 8
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -150,13 +150,41 @@ fn inv_add_field(
   } else if slot == 5 {
     (b"message", inv_lower_bytes(value))
   } else {
-    (name, value)
+    // Non-canonical VALUES keep their literal spelling (base64/hex/paths
+    // carry case-sensitive semantics, and the query side probes both
+    // spellings — M195). The NAME however folds: the column name is a probe
+    // target and the linear refinement matches names case-insensitively, so
+    // a record's `Latency=250` must be findable as `--where latency=250` —
+    // a literal-case column name made the pushdown probe miss its own match
+    // (the query side cannot enumerate the record side's spellings).
+    (inv_lower_bytes(name), value)
   }
   let fb = @buffer.Buffer::Buffer()
   fb.write_bytes(nb)
   fb.write_bytes(b"=")
   fb.write_bytes(vb)
   inv_add(fields, fb.to_bytes(), idx)
+  // A PRIORITY pair (syslog/journald, deliberately outside the canonical
+  // slot map because its 0-7 scale collides with the OTel 1-24 rank) carries
+  // level evidence the linear schema extraction consumes as a last resort —
+  // so the field column must hold the same level word, or `--level` /
+  // `--level-min` pushdowns would skip the segment while a plain query still
+  // matched the record (4.2 fourth round). The literal priority column stays
+  // for `--where priority=N`. The name is matched case-insensitively (the
+  // column itself folds the name, so `nb == name` no longer holds for
+  // upper-case spellings) and the word must be a real 0-7 value (the helper
+  // rejects everything else).
+  if inv_lower_bytes(name) == b"priority" {
+    match @core.level_word_from_syslog(value) {
+      Some(word) => {
+        let lb = @buffer.Buffer::Buffer()
+        lb.write_bytes(b"level=")
+        lb.write_bytes(word)
+        inv_add(fields, lb.to_bytes(), idx)
+      }
+      None => ()
+    }
+  }
 }
 
 ///|

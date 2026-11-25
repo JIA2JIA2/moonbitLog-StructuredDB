@@ -9288,52 +9288,67 @@ fn cmd_query(
   } else {
     None
   }
-  let idx_filters : Array[(Bytes, Array[Bytes], Bool)] = []
+  // Filter names are an array too: a non-canonical `--where` name must probe
+  // its case variants (`Latency` vs `latency` — the column keeps the literal
+  // name while the linear refinement matches case-insensitively), and any
+  // one of the names matching is enough (OR over names, AND over filters).
+  let idx_filters : Array[(Array[Bytes], Array[Bytes], Bool)] = []
   if indexed {
     // 3.2: field columns store canonical names with ASCII-lowercase values
     // (aliases squashed to the 2.2 slots, JSON records flattened), so
     // pushdown probes lowercase values. The raw value is probed too for
     // `service`, whose `__key__=` column keeps the original key case.
     match level_values {
-      Some(vals) => idx_filters.push((b"level", vals, false))
+      Some(vals) => idx_filters.push(([b"level"], vals, false))
       None => ()
     }
     match service_b {
       Some(s) => {
         let s_l = follow_lower_ascii(s)
         let vals : Array[Bytes] = if s_l == s { [s] } else { [s_l, s] }
-        idx_filters.push((b"service", vals, true))
+        idx_filters.push(([b"service"], vals, true))
       }
       None => ()
     }
     match host_b {
-      Some(h) => idx_filters.push((b"host", [follow_lower_ascii(h)], false))
+      Some(h) => idx_filters.push(([b"host"], [follow_lower_ascii(h)], false))
       None => ()
     }
     match trace_b {
-      Some(t) => idx_filters.push((b"trace_id", [follow_lower_ascii(t)], false))
+      Some(t) =>
+        idx_filters.push(([b"trace_id"], [follow_lower_ascii(t)], false))
       None => ()
     }
     // Custom field filter (4.2 third round): field columns hold arbitrary
     // `name=value` pairs, so the condition pushes down like the built-in
     // ones. Alias names resolve to their canonical column (`severity_number`
     // probes `level`); values probe both spellings since non-canonical
-    // fields keep their literal case in the column.
+    // fields keep their literal case in the column. A non-canonical NAME
+    // keeps its literal case there too, so the probe set carries both
+    // spellings of the name (4.2 fourth round) — the linear refinement
+    // matches names case-insensitively, and without the variant the pushdown
+    // would empty the candidate set and skip a segment the plain query
+    // searches fine.
     match field_ff {
       Some(ff) => {
         let slot = @core.canonical_field(ff.0)
         let fname = if slot == 1 {
-          b"level"
+          [b"level"]
         } else if slot == 2 {
-          b"service"
+          [b"service"]
         } else if slot == 3 {
-          b"host"
+          [b"host"]
         } else if slot == 4 {
-          b"trace_id"
+          [b"trace_id"]
         } else if slot == 5 {
-          b"message"
+          [b"message"]
         } else {
-          ff.0
+          let f_l = follow_lower_ascii(ff.0)
+          if f_l == ff.0 {
+            [ff.0]
+          } else {
+            [ff.0, f_l]
+          }
         }
         let v_l = follow_lower_ascii(ff.1)
         let vals2 : Array[Bytes] = if v_l == ff.1 {
@@ -9351,7 +9366,17 @@ fn cmd_query(
     if pushed.length() > 0 {
       pushed = pushed + ","
     }
-    pushed = pushed + (@utf8.decode(f.0) catch { _ => "" })
+    // The explain line names one probe per filter (the first of the case
+    // variants for a non-canonical --where name) — the audit contract is
+    // "which conditions pushed down", not every spelling probed.
+    pushed = pushed +
+      (if f.0.length() > 0 {
+        @utf8.decode(f.0[0]) catch {
+          _ => ""
+        }
+      } else {
+        ""
+      })
   }
   if idx_filters.length() > 0 {
     run_read_snapshot(dir, log => {
@@ -9408,11 +9433,13 @@ fn cmd_query(
         let mut best_len : Int32 = 0
         let mut seg_empty = false
         for f in idx_filters {
-          let (fname, fvals, also_key) = f
+          let (fnames, fvals, also_key) = f
           let set : @hashmap.HashMap[UInt64, Bool] = @hashmap.HashMap::HashMap([])
-          for v in fvals {
-            for i2 in seg.inv_field_postings(fname, v) {
-              set.set(seg.base_offset + i2.to_uint64(), true)
+          for fname in fnames {
+            for v in fvals {
+              for i2 in seg.inv_field_postings(fname, v) {
+                set.set(seg.base_offset + i2.to_uint64(), true)
+              }
             }
           }
           if also_key {
