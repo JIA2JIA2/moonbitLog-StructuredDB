@@ -22,7 +22,7 @@
 
 - **`ingest` 采集**：`lines`/`kv`/`json`/`template` 四种解析，字段可提升为记录键；位点持久化为命名游标（路径编码，同名文件不串断点），支持断点续采；源不存在/是目录直接报错；轮转按文件身份 + 已消费尾部签名判定（新文件更大或文件系统复用 inode 时同样从 0 重采），签名随游标持久化，重启后仍生效。
 - **多源接入**：本地 agent（`ingest --follow`，SIGTERM 优雅退出并打印终态）、离线批量（`--once`）、HTTP 推送（`http` 网关：`/`、`/push`、`/health`、`/stats`；`Content-Length` 与 `Transfer-Encoding: chunked` 均可，无长度 body 返回 411、空体 400，超出长度的字节不并入本条）、消息队列（`ingest --fifo`，写者关闭时无换行的末行也入库，不与下一个写者拼接）。
-- **缓冲与背压**：HTTP 入站有界队列，入队返回 202、满返回 429 + Retry-After；积压告警 `WARN/RESOLVED`（阈值随队列容量缩放）；SIGTERM 退出前全量 drain。
+- **缓冲与背压**：HTTP 入站有界队列，入队返回 202、满返回 429 + Retry-After、单请求超队列容量返回 413（提示拆分）；积压告警 `WARN/RESOLVED`（阈值随队列容量缩放）；drain 失败的批次留在队头重试（已 202 的数据不丢），单次 `ERROR`/`RESOLVED` 与 `/stats` 的 `drain_errors` 可观测；单个请求失败回 500 不杀服务；SIGTERM 有界 drain（10s），仍有未落盘数据时打印 `UNPERSISTED` 并 exit 1。
 - **吞吐**：`append_batch` + `SyncPolicy::Batch` + `--batch` 分批；记录 CRC 改为 8 字节切片查表（批量写主热点，本机 never 约 1.8×、batch 约 1.35×）；`bench-write` 两阶段校验无丢失，QPS 只计写入路径、最终 flush 单列。
 - **幂等与重放**：`--idempotent` 内容等值去重；`--dedup-id`/`--dedup-field` 显式唯一 ID；`X-Batch-Id`/`--batch-id` 整批去重。状态存于 `DEDUP`/`BATCHES`，随备份迁移，删除 sidecar 可从 `__uid=` 内嵌重建。
 - **源头采样**：`--min-level`、`--sample-rate`（FNV-1a 确定性）、`--include`/`--exclude`；采样在入站执行一次，`/stats` 的 `sampling` 块可对账。

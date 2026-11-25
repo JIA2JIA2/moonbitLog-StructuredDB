@@ -399,6 +399,12 @@ struct IngestOptions {
   // 6.2: the HTTP push server accounts each tenant's write quota when the
   // request is accepted (202), so its drain path must not account again.
   skip_quota : Bool
+  // 1.3: the HTTP drain already enforced the Bearer role's data scope per key
+  // at admission. Re-checking it with the process environment's
+  // MOONLOG_TOKEN here used to reject records that an unscoped Bearer client
+  // had legitimately pushed (and killed the writer); the drain must trust the
+  // admission-time check.
+  skip_scope : Bool
   // Durability policy for this ingest pipeline. Commands keep the CLI default
   // (Always, MOONLOG_SYNC overridable); the HTTP drain uses Batch so backlog
   // recovery fsyncs once per --batch instead of once per line.
@@ -879,7 +885,16 @@ fn[T] run_locked(
     exclusive,
     lock_timeout_ms(),
   )
-  let result = action()
+  // Release on the error path too: a failing action (scope/quota rejection,
+  // IO error) used to leak the flock, so every later writer in the same
+  // process hit "syscall -1" until it died — which is exactly how a single
+  // failed HTTP drain used to take the whole server down.
+  let result = action() catch {
+    e => {
+      lock.release()
+      raise e
+    }
+  }
   lock.release()
   result
 }
@@ -5918,7 +5933,7 @@ fn ingest_lines(
   // that breaks cross-timezone event-time ordering, so it is counted and
   // surfaced by every ingest entry point.
   let mut ts_fallback = 0
-  let scope = active_scope(dir)
+  let scope = if opts.skip_scope { None } else { active_scope(dir) }
   let mut i = 0
   // One lock hold and one metadata write per window of up to 16 batches:
   // each metadata flush is an atomic MANIFEST/sidecar update with several
@@ -6461,6 +6476,11 @@ struct HttpQueue {
   // the oldest buffered lines have waited) and the last snapshot report ts.
   mut head_ts : Int64
   mut last_report : Int64
+  // 1.3 drain failure protection: a failed batch stays at the head and is
+  // retried (nothing accepted with 202 is dropped), one WARN per episode,
+  // cumulative failures surfaced via /stats and the shutdown summary.
+  mut drain_errors : Int64
+  mut drain_alert_active : Bool
 }
 
 ///|
@@ -6553,6 +6573,8 @@ fn selfmon_report_http(dir : String, q : HttpQueue) -> Unit {
     q.peak_pending.to_string() +
     ",\"rejected_lines\":" +
     q.rejected_lines.to_string() +
+    ",\"drain_errors\":" +
+    q.drain_errors.to_string() +
     "}"
   ignore(
     @backend_native.write_file(dir + "/SELFMON/http.json", @utf8.encode(line)) catch {
@@ -6604,9 +6626,30 @@ fn sampling_stats_json(
 }
 
 ///|
-fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
+/// Short human-readable form of an IO error, matching the CLI error channel,
+/// so a failed drain can report what broke without terminating the server.
+fn io_error_text(e : @io.IoError) -> String {
+  match e {
+    @io.IoError::Closed => "io closed"
+    @io.IoError::OutOfBounds(o) => "out of bounds " + o.to_string()
+    @io.IoError::Corrupt(o) => "corrupt at " + o.to_string()
+    @io.IoError::Syscall(c) => "syscall " + c.to_string()
+    @io.IoError::Invalid(m) => m
+  }
+}
+
+///|
+/// Write one batch from the queue head and return whether it landed.
+///
+/// The batch is dequeued only after a successful write. The previous order
+/// removed it first, so any drain error (a payload that passed admission but
+/// fails parsing, a disk fault, ...) silently dropped lines already
+/// acknowledged with 202 — the exact failure 1.3 forbids. A failed batch now
+/// stays at the head, is retried next round, and the queue capacity provides
+/// the backpressure (429) instead of dropping acknowledged data.
+fn http_queue_drain(q : HttpQueue, dir : String) -> Bool {
   if q.pending <= 0 {
-    return
+    return true
   }
   let take = if q.pending < q.batch { q.pending } else { q.batch }
   let chunk : Array[Bytes] = []
@@ -6618,38 +6661,77 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Unit raise @io.IoError {
     freed_bytes = freed_bytes + line.length().to_int64()
     i = i + 1
   }
-  q.head = q.head + take
-  q.pending = q.pending - take
-  q.pending_bytes = q.pending_bytes - freed_bytes
-  let (batch_written, _, batch_dup, batch_ts_fb) = ingest_lines(
-    dir,
-    chunk,
-    q.opts,
-    q.dedup,
-    true,
-  )
-  q.written = q.written + batch_written.to_int64()
-  q.duplicates = q.duplicates + batch_dup.to_int64()
-  q.ts_fallback = q.ts_fallback + batch_ts_fb.to_int64()
-  if q.head > 4096 && q.head * 2 > q.lines.length() {
-    let rest : Array[Bytes] = []
-    let mut j = q.head
-    while j < q.lines.length() {
-      rest.push(q.lines[j])
-      j = j + 1
+  let result = try {
+    let (batch_written, _, batch_dup, batch_ts_fb) = ingest_lines(
+      dir,
+      chunk,
+      q.opts,
+      q.dedup,
+      true,
+    )
+    Some((batch_written, batch_dup, batch_ts_fb))
+  } catch {
+    e => {
+      q.drain_errors = q.drain_errors + (1 : Int64)
+      if !q.drain_alert_active {
+        q.drain_alert_active = true
+        println(
+          "ERROR drain failed: " +
+          io_error_text(e) +
+          " (pending " +
+          q.pending.to_string() +
+          " lines kept, retrying)",
+        )
+      }
+      // Keep the independent selfmon snapshot fresh during the failure too:
+      // otherwise it would keep reporting the last successful pending value
+      // while the queue actually keeps growing.
+      if now_ms() - q.last_report >= 1000 {
+        q.last_report = now_ms()
+        selfmon_report_http(dir, q)
+      }
+      None
     }
-    q.lines = rest
-    q.head = 0
   }
-  // M182: the same alert check also runs after the enqueue, because one
-  // drain round can consume the whole queue (see http_backlog_check).
-  http_backlog_check(q)
-  // 6.4: report the writer snapshot at most once a second so the
-  // independent selfmon command sees backlog without adding per-batch
-  // fsync cost.
-  if now_ms() - q.last_report >= 1000 {
-    q.last_report = now_ms()
-    selfmon_report_http(dir, q)
+  match result {
+    None => false
+    Some((batch_written, batch_dup, batch_ts_fb)) => {
+      q.head = q.head + take
+      q.pending = q.pending - take
+      q.pending_bytes = q.pending_bytes - freed_bytes
+      q.written = q.written + batch_written.to_int64()
+      q.duplicates = q.duplicates + batch_dup.to_int64()
+      q.ts_fallback = q.ts_fallback + batch_ts_fb.to_int64()
+      if q.drain_alert_active {
+        q.drain_alert_active = false
+        println(
+          "RESOLVED drain recovered after " +
+          q.drain_errors.to_string() +
+          " failed attempts (no accepted lines were dropped)",
+        )
+      }
+      if q.head > 4096 && q.head * 2 > q.lines.length() {
+        let rest : Array[Bytes] = []
+        let mut j = q.head
+        while j < q.lines.length() {
+          rest.push(q.lines[j])
+          j = j + 1
+        }
+        q.lines = rest
+        q.head = 0
+      }
+      // M182: the same alert check also runs after the enqueue, because one
+      // drain round can consume the whole queue (see http_backlog_check).
+      http_backlog_check(q)
+      // 6.4: report the writer snapshot at most once a second so the
+      // independent selfmon command sees backlog without adding per-batch
+      // fsync cost.
+      if now_ms() - q.last_report >= 1000 {
+        q.last_report = now_ms()
+        selfmon_report_http(dir, q)
+      }
+      true
+    }
   }
 }
 
@@ -6717,7 +6799,9 @@ fn handle_http_connection(
             )
             return
           }
-          http_queue_drain(q, dir)
+          // Best-effort while the body streams in: a failed batch stays
+          // queued for the main loop to retry.
+          ignore(http_queue_drain(q, dir))
           let chunk = @backend_native.conn_read(conn, 4096)
           if chunk.length() == 0 {
             http_respond(conn, 400, "{\"error\":\"incomplete chunked body\"}")
@@ -6733,8 +6817,9 @@ fn handle_http_connection(
           body.length() < 1_048_576 &&
           now_ms() < deadline {
       // Keep writing buffered lines while the body streams in, so a large
-      // upload does not starve the disk writer.
-      http_queue_drain(q, dir)
+      // upload does not starve the disk writer. A failed batch stays queued
+      // for the main loop to retry.
+      ignore(http_queue_drain(q, dir))
       let chunk = @backend_native.conn_read(conn, 4096)
       if chunk.length() == 0 {
         break
@@ -6822,6 +6907,8 @@ fn handle_http_connection(
         q.rejected_requests.to_string() +
         ",\"rejected_lines\":" +
         q.rejected_lines.to_string() +
+        ",\"drain_errors\":" +
+        q.drain_errors.to_string() +
         "}"
       http_respond(conn, 200, payload)
       close_log(log)
@@ -6925,6 +7012,42 @@ fn handle_http_connection(
     // Source-side sampling runs before the queue, so the capacity below counts
     // only lines that will actually be written.
     let (kept, sampled_out) = sampling_filter_lines(lines, q.opts)
+    // 1.3: admit-time validation for failures the drain would otherwise hit
+    // only after the 202 was already returned. An embedded tab/newline in the
+    // dedup id is rejected here (400) instead of poisoning the queue and
+    // killing the writer later.
+    match q.opts.dedup_field_bytes {
+      Some(_) =>
+        for line in kept {
+          let (_, _, fields) = parse_ingest_line(line, q.opts)
+          match dedup_uid_from_fields(fields, q.opts) {
+            Some(u) =>
+              if !dedup_uid_ok(u) {
+                http_respond(
+                  conn, 400, "{\"error\":\"dedup id contains a tab/newline\"}",
+                )
+                return
+              }
+            None => ()
+          }
+        }
+      None => ()
+    }
+    // A request larger than the whole queue can never be admitted, not even
+    // when the queue is empty: tell the client to split it instead of letting
+    // it retry the same 429 forever.
+    if kept.length() > q.capacity {
+      http_respond(
+        conn,
+        413,
+        "{\"error\":\"request exceeds queue capacity\",\"lines\":" +
+        kept.length().to_string() +
+        ",\"capacity\":" +
+        q.capacity.to_string() +
+        ",\"hint\":\"split into smaller batches\"}",
+      )
+      return
+    }
     // 6.2 write/storage quota: pre-checked per request against the tenant's
     // rule and recorded when accepted (202), so a spent budget survives
     // restarts and a 202 always promises space under the storage share. The
@@ -7144,6 +7267,8 @@ fn cmd_http(
     quota_rules: load_quota_rules(dir),
     head_ts: 0,
     last_report: 0,
+    drain_errors: 0,
+    drain_alert_active: false,
   }
   @backend_native.install_shutdown_handler()
   let mut stopping = false
@@ -7155,28 +7280,52 @@ fn cmd_http(
     let drain_limit = q.capacity / q.batch + 1
     let mut drained = 0
     while q.pending > 0 && drained < drain_limit {
-      http_queue_drain(q, dir)
+      if !http_queue_drain(q, dir) {
+        break
+      }
       drained = drained + 1
     }
     stopping = @backend_native.shutdown_requested()
     if !stopping {
       let conn = @backend_native.tcp_accept_timeout(listen_fd, 200)
       if conn >= 0 {
-        handle_http_connection(dir, conn, q)
+        // A per-request failure (lock-busy /stats, sidecar IO error, ...)
+        // must not terminate the server: answer 500 and keep serving and
+        // draining. Before this, a single failed request killed the writer
+        // and dropped everything still in the acknowledged queue.
+        handle_http_connection(dir, conn, q) catch {
+          e =>
+            http_respond(
+              conn,
+              500,
+              "{\"error\":\"" + json_escape_str(io_error_text(e)) + "\"}",
+            )
+        }
         @backend_native.conn_close_graceful(conn)
       }
     }
   }
   // Graceful shutdown: write every buffered line before exiting, so nothing
-  // accepted with 202 is lost.
-  while q.pending > 0 {
-    http_queue_drain(q, dir)
+  // accepted with 202 is lost. Bounded — a permanently failing disk must not
+  // hang the stop forever — and an unpersisted remainder is reported and
+  // exits non-zero instead of pretending the drain succeeded.
+  let drain_deadline = now_ms() + 10000
+  while q.pending > 0 && now_ms() < drain_deadline {
+    if !http_queue_drain(q, dir) {
+      @backend_native.sleep_ms(50)
+    }
   }
+  let unpersisted = q.pending
   // 6.4: final snapshot so selfmon sees the drained (pending=0) terminal
   // state instead of a stale pre-shutdown backlog.
   selfmon_report_http(dir, q)
   println(
-    "moonlog http shut down (backlog drained, " +
+    "moonlog http shut down (" +
+    (if unpersisted > 0 {
+      "UNPERSISTED " + unpersisted.to_string() + " lines, "
+    } else {
+      "backlog drained, "
+    }) +
     q.accepted.to_string() +
     " accepted / " +
     q.written.to_string() +
@@ -7193,9 +7342,19 @@ fn cmd_http(
     " rejected / " +
     q.rejected_lines.to_string() +
     " lines, " +
+    q.drain_errors.to_string() +
+    " drain errors, " +
     q.alerts.to_string() +
     " backlog alerts total)",
   )
+  if unpersisted > 0 {
+    eprintln(
+      "error: " +
+      unpersisted.to_string() +
+      " accepted lines could not be persisted (drain failed)",
+    )
+    @backend_native.exit_process(1)
+  }
 }
 
 ///|
@@ -15106,6 +15265,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
           None => load_partition_policy(args[2])
         },
         skip_quota: false,
+        skip_scope: false,
         sync: batch_entry_sync(),
       }
       cmd_ingest(
@@ -15293,6 +15453,9 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
         },
         // 6.2: the HTTP server accounts per-tenant write quota on accept.
         skip_quota: true,
+        // 1.3: admission already enforced the Bearer role's scope per key; the
+        // drain must not re-check it against the process env token.
+        skip_scope: true,
         sync: @log.SyncPolicy::Batch,
       }
       cmd_http(
