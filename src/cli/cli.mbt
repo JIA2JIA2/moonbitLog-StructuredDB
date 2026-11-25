@@ -1410,12 +1410,6 @@ fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
 }
 
 ///|
-
-///|
-/// Custom `--field name=value` refinement (4.2 third round): the field name
-/// resolves through the unified schema (2.2) so alias spellings hit the same
-/// slot, unknown names compare literally (case-insensitive), and the value
-/// compares case-insensitively (field columns store lowercase).
 fn field_filter_match(
   fields : Array[(Bytes, Bytes)],
   ff : (Bytes, Bytes),
@@ -1436,6 +1430,12 @@ fn field_filter_match(
 }
 
 ///|
+/// Custom `--field name=value` refinement (4.2 third round): the field name
+/// resolves through the unified schema (2.2) so alias spellings hit the same
+/// slot, unknown names compare literally (case-insensitive), and the value
+/// compares case-insensitively (field columns store lowercase).
+
+///|
 fn ctx_field_from_pairs(
   fields : Array[(Bytes, Bytes)],
   names : Array[Bytes],
@@ -1448,12 +1448,17 @@ fn ctx_field_from_pairs(
       // container-prefixed OTel spelling used to miss: the literal squash
       // compares "errortraceid" against "traceid"), and falls back to the
       // case-insensitive literal squash for non-canonical names (thread_id
-      // is not a 2.2 slot).
+      // is not a 2.2 slot). The tail-segment match is the third layer for
+      // free-form metric names that no slot covers: `--quantile-field
+      // latency` against `error.latency` (OTel exception attributes) used
+      // to yield zero samples, leaving the dashboard's latency trend
+      // silently empty while the canonical-slot columns (level, service)
+      // stayed correct (5.5 fourth round).
       let q_slot = @core.canonical_field(name)
       let km = if q_slot >= 0 && p_slot >= 0 {
         q_slot == p_slot
       } else {
-        ctx_name_eq(pair.0, name)
+        ctx_name_eq(pair.0, name) || ctx_name_tail_eq(pair.0, name)
       }
       if km {
         return Some(pair.1)
