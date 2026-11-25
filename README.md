@@ -37,7 +37,7 @@
 ### 存储治理（3.x）
 
 - **时间分区**：`--partition day|hour|off` 按时间桶自动滚动建段；`partition-policy` 持久化到 `<dir>/PARTITION`，写命令自动沿用。
-- **倒排 + 字段列索引**：段级 `.inv` sidecar（懒构建、原子落盘、CRC 校验），支持词级倒排、字段等值/范围 posting、中文 unigram；sidecar v5 使用 front coding + delta varint 压缩。
+- **倒排 + 字段列索引**：段级 `.inv` sidecar（懒构建、原子落盘、CRC 校验），支持词级倒排、字段等值/范围 posting、中文 unigram；sidecar v6 使用 front coding + delta varint 压缩，字段列与查询过滤共用同一提取契约（`value_fields`：JSON 直写、容器包装、尾随 meta kv 全形态）。
 - **段数据压缩**：`compress` 对已 roll 段做 LZSS/RLE，`stats` 报告实际磁盘占用（跟随冷层链接）。
 - **生命周期 TTL**：`<dir>/TTL` 支持 `default`/`service`/`level`/`prefix` 规则；`ttl-expire` 整段回收并写 `TTL_AUDIT`（含链式完整性校验）。
 - **副本与高可用**：`replicate --follow` 增量镜像；`HA_STATE` 记录角色，`ha-failover`/`ha-watch`/`ha-rebalance` 支持受监督的自动切换；拒绝以 primary 为目标的正向同步，防 failover 后误删副本写入。

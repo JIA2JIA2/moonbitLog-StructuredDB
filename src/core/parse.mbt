@@ -1239,3 +1239,99 @@ pub fn json_object_fields(
       }
   }
 }
+
+///|
+/// Whether the bytes look like a plain kv key: ASCII letter or underscore
+/// first, then letters/digits/underscore/dot/dash. Anything else (a quoted
+/// fragment of the JSON body, a brace) is not a real field name.
+pub fn plain_kv_key(name : Bytes) -> Bool {
+  let len = name.length()
+  if len == 0 || len > 64 {
+    return false
+  }
+  let first = name.at(0).to_int()
+  if !((first >= 65 && first <= 90) ||
+    (first >= 97 && first <= 122) ||
+    first == 95) {
+    return false
+  }
+  let mut i = 1
+  while i < len {
+    let c = name.at(i).to_int()
+    if !((c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c == 95 ||
+      c == 46 ||
+      c == 45) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Merge the trailing kv pairs of a JSON record into the parsed field set
+/// (2.4): the `--meta` enrichment appends ` env=prod ...` after the JSON
+/// object, and without this merge the metadata is stored but unqueryable.
+/// A kv pair whose name is already a JSON field (or is not a plain kv key
+/// shape) is skipped, so keys quoted inside the JSON body cannot leak as
+/// fake fields.
+pub fn merge_json_trailing_kv(
+  fields : Array[(Bytes, Bytes)],
+  value : Bytes,
+) -> Unit {
+  let known : Array[Bytes] = []
+  for f in fields {
+    known.push(f.0)
+  }
+  for pair in parse_kv_pairs(value) {
+    let mut skip = false
+    for k in known {
+      if k == pair.0 {
+        skip = true
+        break
+      }
+    }
+    if skip || !plain_kv_key(pair.0) {
+      continue
+    }
+    fields.push(pair)
+    known.push(pair.0)
+  }
+}
+
+///|
+/// The single field-extraction entry the write path, the query filter and
+/// the inverted-index field columns must all agree on (3.2 fifth round):
+/// a value starting with `{` is the JSON object itself; a JSON object
+/// wrapped by a container prefix (`2026-... stdout F {...}`) is located via
+/// the balanced-object span; trailing kv pairs (` env=prod`) are merged;
+/// anything else is the kv parser. The `.inv` field columns used to flatten
+/// only a leading `{`, so wrapped-JSON records had empty columns and
+/// `query --indexed` skipped the whole segment even when it held matches —
+/// the filter side had grown the container tolerance but the pre-filter had
+/// not.
+pub fn value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
+  if value.length() > 0 {
+    let mut i = 0
+    while i < value.length() &&
+          (value.at(i).to_int() == 32 || value.at(i).to_int() == 9) {
+      i = i + 1
+    }
+    if i < value.length() && value.at(i).to_int() == 123 {
+      let fields = json_object_fields(value) catch { _ => [] }
+      merge_json_trailing_kv(fields, value)
+      return fields
+    }
+    if bytes_contains(value, b"{") {
+      let fields = json_object_fields(value) catch { _ => [] }
+      if fields.length() > 0 {
+        merge_json_trailing_kv(fields, value)
+        return fields
+      }
+    }
+  }
+  parse_kv_pairs(value)
+}

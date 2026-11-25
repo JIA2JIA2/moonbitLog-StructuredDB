@@ -17,7 +17,7 @@ pub(all) struct InvIndex {
 const INV_MAGIC : UInt32 = 0x4D4C4956
 
 ///|
-const INV_VERSION : UInt32 = 5
+const INV_VERSION : UInt32 = 6
 
 ///|
 const INV_HEADER : Int32 = 12
@@ -181,27 +181,14 @@ pub fn[W, R : @io.LogReader] Segment::build_inv_index(
     for tok in tokenize(rec.value, 64) {
       inv_add(terms, tok, idx)
     }
-    for pair in @core.parse_kv_pairs(rec.value) {
+    // The field columns must use the same extraction contract as the query
+    // filter (3.2 fifth round): `@core.value_fields` flattens JSON bodies
+    // AND container-wrapped records (`2026-... stdout F {...}` — the
+    // CRI/Docker shape used to leave empty columns here, so `query --indexed`
+    // skipped the segment even when it held matches) and merges trailing
+    // `--meta` kv pairs.
+    for pair in @core.value_fields(rec.value) {
       inv_add_field(fields, pair.0, pair.1, idx)
-    }
-    if rec.value.length() > 0 && rec.value.at(0).to_int() == 123 {
-      // JSON/OTel records (2.1): the exact `name=value` columns are built
-      // from the flattened fields too — `parse_kv_pairs` sees no pairs in a
-      // JSON object, so without this SDK-style values have empty columns and
-      // `query --indexed` pushdown would skip the whole segment even when it
-      // holds matches.
-      let flat : Array[(Bytes, Bytes)]? = Some(
-        @core.json_object_fields(rec.value),
-      ) catch {
-        _ => None
-      }
-      match flat {
-        Some(pairs) =>
-          for pair in pairs {
-            inv_add_field(fields, pair.0, pair.1, idx)
-          }
-        None => ()
-      }
     }
     let kb = @buffer.Buffer::Buffer()
     kb.write_bytes(b"__key__=")

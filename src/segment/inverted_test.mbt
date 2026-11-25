@@ -284,3 +284,41 @@ test "field columns normalize aliases, JSON and value case (3.2)" {
   // Keys keep their original case in the `__key__` column.
   assert_eq(seg.inv_field_postings(b"__key__", b"svc"), [1])
 }
+
+///|
+test "field columns carry container-wrapped JSON records" {
+  let store = @backend_mem.MemLog::new()
+  let seg : @segment.Segment[@backend_mem.MemLog, @backend_mem.MemLog] = @segment.Segment::new(
+    store,
+    store,
+    (0 : UInt64),
+  )
+  ignore(
+    seg.append(
+      b"log",
+      b"2026-11-25T10:00:00.123456789Z stdout F {\"level\":\"error\",\"service\":\"checkout\",\"message\":\"db timeout\"}",
+      (1 : Int64),
+    ) catch {
+      _ => panic()
+    },
+  )
+  seg.build_inv_index()
+  // The pre-filter used to flatten only a leading `{` and saw empty columns
+  // here, so `query --indexed` skipped the whole segment even though the
+  // filter side (ctx_value_fields) held the match — 0 results against a
+  // 1-hit linear query.
+  assert_eq(seg.inv_field_postings(b"service", b"checkout").length(), 1)
+  assert_eq(seg.inv_field_postings(b"level", b"error").length(), 1)
+  // Trailing --meta kv pairs land in the columns too.
+  ignore(
+    seg.append(
+      b"log",
+      b"{\"level\":\"warn\",\"service\":\"orders\"} env=prod region=cn-north",
+      (2 : Int64),
+    ) catch {
+      _ => panic()
+    },
+  )
+  seg.build_inv_index()
+  assert_eq(seg.inv_field_postings(b"env", b"prod").length(), 1)
+}

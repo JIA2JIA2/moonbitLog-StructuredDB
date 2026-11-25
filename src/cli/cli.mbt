@@ -1329,89 +1329,14 @@ fn ctx_name_eq(a : Bytes, b : Bytes) -> Bool {
 /// locates the first balanced object — and falls back to kv if that fails.
 
 ///|
-/// Merge the trailing kv pairs of a JSON record into the parsed field set.
-/// The `--meta` enrichment appends ` env=prod ...` after the JSON object, and
-/// without this merge the metadata is stored but unqueryable — the JSON
-/// flattening drops everything after the closing brace. A kv pair whose name
-/// is already a JSON field (or is not a plain kv key shape) is skipped, so
-/// keys quoted inside the JSON body cannot leak as fake fields.
-fn merge_json_trailing_kv(
-  fields : Array[(Bytes, Bytes)],
-  value : Bytes,
-) -> Unit {
-  let known : Array[Bytes] = []
-  for f in fields {
-    known.push(f.0)
-  }
-  for pair in @core.parse_kv_pairs(value) {
-    let mut skip = false
-    for k in known {
-      if k == pair.0 {
-        skip = true
-        break
-      }
-    }
-    if skip || !plain_kv_key(pair.0) {
-      continue
-    }
-    fields.push(pair)
-    known.push(pair.0)
-  }
-}
-
-///|
-/// Whether the bytes look like a plain kv key: ASCII letter or underscore
-/// first, then letters/digits/underscore/dot/dash. Anything else (a quoted
-/// fragment of the JSON body, a brace) is not a real field name.
-fn plain_kv_key(name : Bytes) -> Bool {
-  let len = name.length()
-  if len == 0 || len > 64 {
-    return false
-  }
-  let first = name.at(0).to_int()
-  if !((first >= 65 && first <= 90) ||
-    (first >= 97 && first <= 122) ||
-    first == 95) {
-    return false
-  }
-  let mut i = 1
-  while i < len {
-    let c = name.at(i).to_int()
-    if !((c >= 65 && c <= 90) ||
-      (c >= 97 && c <= 122) ||
-      (c >= 48 && c <= 57) ||
-      c == 95 ||
-      c == 46 ||
-      c == 45) {
-      return false
-    }
-    i = i + 1
-  }
-  true
-}
-
-///|
+/// Parse a record value into field pairs: JSON objects are flattened (2.1),
+/// anything else uses the kv parser. A JSON value wrapped by a container
+/// prefix (`2026-... stdout F {...}`) is still recognized, and trailing kv
+/// pairs from `--meta` enrichment are merged — the shared extraction contract
+/// lives in `@core.value_fields` so the `.inv` field columns (pre-filter)
+/// and this filter side can never drift apart again (3.2 fifth round).
 fn ctx_value_fields(value : Bytes) -> Array[(Bytes, Bytes)] {
-  if value.length() > 0 {
-    let mut i = 0
-    while i < value.length() &&
-          (value.at(i).to_int() == 32 || value.at(i).to_int() == 9) {
-      i = i + 1
-    }
-    if i < value.length() && value.at(i).to_int() == 123 {
-      let fields = @core.json_object_fields(value) catch { _ => [] }
-      merge_json_trailing_kv(fields, value)
-      return fields
-    }
-    if @core.bytes_contains(value, b"{") {
-      let fields = @core.json_object_fields(value) catch { _ => [] }
-      if fields.length() > 0 {
-        merge_json_trailing_kv(fields, value)
-        return fields
-      }
-    }
-  }
-  @core.parse_kv_pairs(value)
+  @core.value_fields(value)
 }
 
 ///|

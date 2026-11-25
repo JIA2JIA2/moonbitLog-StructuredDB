@@ -490,3 +490,39 @@ test "json_object_fields tolerates wrapper prefixes and suffixes" {
   }
   assert_eq(bad is None, true)
 }
+
+///|
+test "value_fields is the shared extraction contract across shapes" {
+  // JSON body.
+  assert_eq(
+    @core.value_fields(b"{\"level\":\"error\",\"service\":\"orders\"}").length(),
+    2,
+  )
+  // Container-wrapped JSON (CRI/Docker): the pre-filter used to see empty
+  // columns here and `query --indexed` skipped segments that held matches.
+  let wrapped = @core.value_fields(
+    b"2026-11-25T10:00:00.123456789Z stdout F {\"level\":\"error\",\"service\":\"checkout\"}",
+  )
+  assert_eq(wrapped.length(), 2)
+  // Trailing --meta kv pairs merge; a JSON field wins over a same-named
+  // trailing pair (the JSON value is authoritative).
+  let meta = @core.value_fields(
+    b"{\"level\":\"warn\",\"env\":\"dev\"} env=prod region=cn",
+  )
+  assert_eq(meta.length(), 3)
+  for pair in meta {
+    if pair.0 == b"env" {
+      assert_eq(pair.1, b"dev")
+    }
+  }
+  // Plain kv records keep their shape.
+  assert_eq(@core.value_fields(b"level=info service=api").length(), 2)
+  // Quoted fragments of the JSON body cannot leak as fake field names.
+  let leak = @core.value_fields(b"{\"note\":\"a=b y=z\"}")
+  for pair in leak {
+    if pair.0 == b"note" {
+      assert_eq(pair.1, b"a=b y=z")
+    }
+  }
+  assert_eq(leak.length(), 1)
+}

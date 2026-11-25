@@ -43,6 +43,8 @@ pub fn lz_decompress(Bytes, Int64) -> Bytes raise MetaError
 
 pub fn mask_sensitive(Bytes, Array[Bytes]) -> Bytes
 
+pub fn merge_json_trailing_kv(Array[(Bytes, Bytes)], Bytes) -> Unit
+
 pub fn normalize_log_template(Bytes) -> Bytes
 
 pub fn normalize_ts(Bytes, Int64) -> Int64
@@ -63,7 +65,11 @@ pub fn parse_rbac_line(Bytes) -> RbacRole?
 
 pub fn parse_rfc2822_ms(Bytes, Int64) -> Int64
 
+pub fn parse_rfc3164_ms(Bytes, Int64, Int64) -> Int64
+
 pub fn parse_ttl_policy(Bytes) -> TtlPolicy?
+
+pub fn plain_kv_key(Bytes) -> Bool
 
 pub fn quota_for_role(Array[QuotaRule], Bytes) -> QuotaRule?
 
@@ -102,6 +108,8 @@ pub fn slice(Bytes, Int32, Int32) -> Bytes
 pub fn ttl_days_of(TtlPolicy, Bytes, Bytes?) -> Int64
 
 pub fn ttl_record_level(Bytes) -> Bytes?
+
+pub fn value_fields(Bytes) -> Array[(Bytes, Bytes)]
 
 pub fn wildcard_contains(Bytes, Bytes, Bool) -> Bool
 
