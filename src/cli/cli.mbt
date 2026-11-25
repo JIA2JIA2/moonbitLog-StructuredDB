@@ -1275,24 +1275,29 @@ fn cmd_put_batch(
   let n = args.length()
   run_locked(dir, true, () => {
     // 1.4 批次号: a confirmed batch id is replayed as a no-op; an unconfirmed
-    // one is recorded only after the batch is admitted, so a quota/scope
-    // failure lets the client retry the whole batch safely.
+    // one is recorded only after the batch is written, so a quota/scope
+    // failure lets the client retry the whole batch safely. The key is
+    // namespaced by the role bound to MOONLOG_TOKEN, matching the HTTP server,
+    // so two tenants may use the same client-side batch id.
     let ids = load_batch_ids(dir)
-    match batch_id {
+    let batch_scope = active_role_name(dir)
+    let batch_id_key : String? = match batch_id {
       Some(bid) => {
         if !valid_batch_id(bid) {
           raise @io.IoError::Invalid(
             "invalid batch id: non-empty, <= 256 bytes, no newline/tab",
           )
         }
-        if ids.get(bid) is Some(_) {
+        let key = batch_key(batch_scope, bid)
+        if ids.get(key) is Some(_) {
           println(
             "skipped batch " + bid + " (duplicate-batch, nothing written)",
           )
           return
         }
+        Some(key)
       }
-      None => ()
+      None => None
     }
     let rule = active_quota_rule(dir)
     let recs : Array[(Bytes, Bytes, Int64)] = []
@@ -1324,8 +1329,8 @@ fn cmd_put_batch(
       charge.push((r.0, (r.0.length() + r.1.length()).to_int64()))
     }
     quota_charge_storage_keys(dir, charge)
-    match batch_id {
-      Some(bid) => record_batch_id(dir, ids, bid)
+    match batch_id_key {
+      Some(key) => record_batch_id(dir, ids, key)
       None => ()
     }
     for off in offsets {
@@ -5711,6 +5716,42 @@ const DEDUP_FILE : String = "DEDUP"
 const BATCHES_FILE : String = "BATCHES"
 
 ///|
+/// Namespace a batch id by the writing role: two tenants may legitimately use
+/// the same client-side batch id, and a directory-wide namespace made the
+/// second tenant's batch silently disappear as a "duplicate". The open-local
+/// mode (no RBAC) keeps the bare id, so existing BATCHES lines still match;
+/// under RBAC the separator is a tab, which `valid_batch_id` already forbids
+/// inside a caller-supplied id.
+fn batch_key(role : String, id : String) -> String {
+  if id.length() == 0 {
+    ""
+  } else if role.length() == 0 {
+    id
+  } else {
+    role + "\t" + id
+  }
+}
+
+///|
+/// The role name bound to the process environment's MOONLOG_TOKEN, or "" when
+/// there is no RBAC file / no matching role (open-local mode). Mirrors
+/// `active_scope`, so CLI batch ids share the HTTP server's namespace.
+fn active_role_name(dir : String) -> String {
+  if !@backend_native.file_exists(dir + "/RBAC") {
+    return ""
+  }
+  let rules = load_rbac_rules(dir)
+  let token = match @env.get_env_var("MOONLOG_TOKEN") {
+    Some(t) => @utf8.encode(t)
+    None => b""
+  }
+  match @core.rbac_find(rules, token) {
+    Some(role) => bytes_to_string(role.name)
+    None => ""
+  }
+}
+
+///|
 /// Validate a caller-supplied batch id: non-empty, bounded, single-line.
 fn valid_batch_id(id : String) -> Bool {
   id.length() > 0 &&
@@ -6425,6 +6466,16 @@ fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
 }
 
 ///|
+/// One queued push line plus the batch key it arrived under (empty when the
+/// request carried no X-Batch-Id). The batch is confirmed only once every line
+/// of it has actually landed, so a crash between 202 and the drain leaves the
+/// batch unconfirmed and a replay is re-ingested instead of skipped.
+struct QLine {
+  line : Bytes
+  batch : String
+}
+
+///|
 /// Bounded in-flight queue for the HTTP push server: received lines wait here
 /// while the writer drains them in batches of `batch`. When a request would
 /// exceed `capacity`, it is rejected with 429 (explicit backpressure — the
@@ -6432,9 +6483,14 @@ fn http_respond(conn : Int32, status : Int32, body : String) -> Unit {
 /// `alert_threshold` raises a warning and increments `alerts`.
 struct HttpQueue {
   // Confirmed batch ids (1.4): loaded once at startup from <dir>/BATCHES and
-  // grown in memory as new batch ids are admitted.
+  // only added to once every line of the batch has actually landed. A replay
+  // of a still-in-flight batch is answered as duplicate from `inflight`
+  // without enqueueing it twice.
   batch_ids : @hashmap.HashMap[String, Int32]
-  mut lines : Array[Bytes]
+  // Batch key -> lines still queued for it. The batch is moved into
+  // `batch_ids` (and appended to BATCHES) when the counter reaches zero.
+  inflight : @hashmap.HashMap[String, Int32]
+  mut lines : Array[QLine]
   mut head : Int32
   mut pending : Int32
   capacity : Int32
@@ -6489,6 +6545,7 @@ fn http_queue_enqueue(
   q : HttpQueue,
   lines : Array[Bytes],
   bytes : Int64,
+  batch : String,
 ) -> Bool {
   if q.pending + lines.length() > q.capacity {
     return false
@@ -6503,7 +6560,14 @@ fn http_queue_enqueue(
     q.head_ts = now_ms()
   }
   for line in lines {
-    q.lines.push(line)
+    q.lines.push({ line, batch, })
+  }
+  if batch.length() > 0 {
+    let queued = match q.inflight.get(batch) {
+      Some(n) => n
+      None => 0
+    }
+    q.inflight.set(batch, queued + lines.length())
   }
   q.pending = q.pending + lines.length()
   q.pending_bytes = q.pending_bytes + bytes
@@ -6652,19 +6716,21 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Bool {
     return true
   }
   let take = if q.pending < q.batch { q.pending } else { q.batch }
-  let chunk : Array[Bytes] = []
+  let chunk : Array[QLine] = []
+  let payload : Array[Bytes] = []
   let mut i = 0
   let mut freed_bytes : Int64 = 0
   while i < take {
-    let line = q.lines[q.head + i]
-    chunk.push(line)
-    freed_bytes = freed_bytes + line.length().to_int64()
+    let item = q.lines[q.head + i]
+    chunk.push(item)
+    payload.push(item.line)
+    freed_bytes = freed_bytes + item.line.length().to_int64()
     i = i + 1
   }
   let result = try {
     let (batch_written, _, batch_dup, batch_ts_fb) = ingest_lines(
       dir,
-      chunk,
+      payload,
       q.opts,
       q.dedup,
       true,
@@ -6702,6 +6768,38 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Bool {
       q.written = q.written + batch_written.to_int64()
       q.duplicates = q.duplicates + batch_dup.to_int64()
       q.ts_fallback = q.ts_fallback + batch_ts_fb.to_int64()
+      // 1.4: confirm batch keys only now that every line of this chunk landed.
+      // Confirming at admission (the old behavior) made a crash between 202
+      // and the drain leave BATCHES claiming the batch was written, so the
+      // client's replay was answered "duplicate" and the data was lost.
+      let landed_per_batch : @hashmap.HashMap[String, Int32] = @hashmap.HashMap::HashMap([],
+      )
+      for item in chunk {
+        if item.batch.length() > 0 {
+          let n = match landed_per_batch.get(item.batch) {
+            Some(v) => v
+            None => 0
+          }
+          landed_per_batch.set(item.batch, n + 1)
+        }
+      }
+      landed_per_batch.each(fn(key, landed) {
+        let remaining = match q.inflight.get(key) {
+          Some(n) => n - landed
+          None => 0
+        }
+        if remaining <= 0 {
+          q.inflight.set(key, 0)
+          // The data is already durable; a BATCHES write failure only means a
+          // replay may be re-ingested (duplicate, never lost), so it must not
+          // fail the drain.
+          record_batch_id(dir, q.batch_ids, key) catch {
+            _ => ()
+          }
+        } else {
+          q.inflight.set(key, remaining)
+        }
+      })
       if q.drain_alert_active {
         q.drain_alert_active = false
         println(
@@ -6711,7 +6809,7 @@ fn http_queue_drain(q : HttpQueue, dir : String) -> Bool {
         )
       }
       if q.head > 4096 && q.head * 2 > q.lines.length() {
-        let rest : Array[Bytes] = []
+        let rest : Array[QLine] = []
         let mut j = q.head
         while j < q.lines.length() {
           rest.push(q.lines[j])
@@ -6960,19 +7058,32 @@ fn handle_http_connection(
       http_respond(conn, 400, "{\"error\":\"too many lines\"}")
       return
     }
-    // 1.4 批次号: a confirmed batch id is replayed as a no-op, so client
-    // retries never duplicate data. Unconfirmed ids are only recorded once the
-    // request is admitted (202), so a 429 lets the client retry safely.
+    // 1.4 批次号: a batch is a duplicate only once every line of it has landed
+    // (batch_ids) or is already queued (inflight). The id is confirmed on drain
+    // success, not at admission: a crash between 202 and the drain must leave
+    // it unconfirmed so the client's replay is re-ingested instead of skipped
+    // (which lost the data outright). The key is namespaced by role so two
+    // tenants may use the same client-side batch id.
     let batch_id_req = @utf8.decode_lossy(request.batch_id)
-    if batch_id_req.length() > 0 && q.batch_ids.get(batch_id_req) is Some(_) {
+    if batch_id_req.length() > 0 && !valid_batch_id(batch_id_req) {
       http_respond(
-        conn,
-        200,
-        "{\"status\":\"duplicate-batch\",\"skipped\":" +
-        lines.length().to_string() +
-        "}",
+        conn, 400, "{\"error\":\"invalid batch id (non-empty, <=256 bytes, no newline/tab)\"}",
       )
       return
+    }
+    let batch_key_req = batch_key(bytes_to_string(role_name), batch_id_req)
+    if batch_key_req.length() > 0 {
+      if q.batch_ids.get(batch_key_req) is Some(_) ||
+        q.inflight.get(batch_key_req) is Some(_) {
+        http_respond(
+          conn,
+          200,
+          "{\"status\":\"duplicate-batch\",\"skipped\":" +
+          lines.length().to_string() +
+          "}",
+        )
+        return
+      }
     }
     // 6.1 index isolation: reject the whole request when any line falls
     // outside the token role's data scope (the 202 contract stays intact).
@@ -7069,7 +7180,7 @@ fn handle_http_connection(
         }
         None => ()
       }
-      if http_queue_enqueue(q, kept, incoming) {
+      if http_queue_enqueue(q, kept, incoming, batch_key_req) {
         quota_record_write(dir, rule, incoming)
         // Charge tenant storage by data-scope ownership: parse each kept
         // line's key (the drain re-parses anyway) and add the payload bytes
@@ -7080,9 +7191,6 @@ fn handle_http_connection(
           charge.push((hk, (hk.length() + hv.length()).to_int64()))
         }
         quota_charge_storage_keys(dir, charge)
-        if batch_id_req.length() > 0 {
-          record_batch_id(dir, q.batch_ids, batch_id_req)
-        }
         q.accepted = q.accepted + kept.length().to_int64()
         q.sampled = q.sampled + sampled_out.to_int64()
         http_respond(
@@ -7112,10 +7220,12 @@ fn handle_http_connection(
     } else {
       q.sampled = q.sampled + sampled_out.to_int64()
       // The batch is fully resolved even when the sampler dropped every line:
-      // record the id so a retry is a no-op instead of re-sampling (and
-      // re-counting) the same payload.
-      if batch_id_req.length() > 0 {
-        record_batch_id(dir, q.batch_ids, batch_id_req)
+      // confirm the key immediately so a retry is a no-op instead of
+      // re-sampling (and re-counting) the same payload.
+      if batch_key_req.length() > 0 {
+        record_batch_id(dir, q.batch_ids, batch_key_req) catch {
+          _ => ()
+        }
       }
       http_respond(
         conn,
@@ -7243,6 +7353,7 @@ fn cmd_http(
   }
   let q : HttpQueue = {
     batch_ids: load_batch_ids(dir),
+    inflight: @hashmap.HashMap::HashMap([]),
     lines: [],
     head: 0,
     pending: 0,
