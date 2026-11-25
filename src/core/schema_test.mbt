@@ -208,14 +208,15 @@ test "severity_number maps onto the level slot with OTel bands" {
   // The field name squashes to a level alias.
   assert_eq(@core.canonical_field(b"severity_number"), 1)
   assert_eq(@core.canonical_field(b"SeverityNumber"), 1)
-  // Extraction keeps the raw numeric value; band matching turns it into a
-  // rank, so `severity_number=17` equals `error` but not `warn`.
+  // Extraction normalizes the number onto the OTel band word form, so
+  // `severity_number=17` and `severity_text=ERROR` store the same schema
+  // shape and `--level error` matches literally as well as by rank.
   let fields = @core.parse_kv_pairs(
     b"severity_number=17 service=orders host=n1 trace_id=t9 message=boom",
   )
   let f = @core.schema_from_fields(fields, (0 : Int64))
   match f.level {
-    Some(v) => assert_eq(v, b"17")
+    Some(v) => assert_eq(v, b"error")
     None => panic()
   }
   assert_true(
@@ -280,4 +281,261 @@ test "schema_value quotes values with spaces so re-parse round-trips" {
     (0 : Int64),
   )
   assert_eq(@core.schema_value(f4), b"message=boom")
+}
+
+///|
+test "OTel JSON nested shapes normalize all six fields" {
+  let fields = @core.json_object_fields(
+    b"{\"timeUnixNano\":\"1732531200000000000\",\"severityText\":\"ERROR\",\"severityNumber\":17,\"body\":{\"stringValue\":\"db connection timeout\"},\"resource\":{\"service\":{\"name\":\"checkout\"},\"host\":{\"name\":\"pod-7x\"}},\"traceId\":\"abc123\"}",
+  )
+  let f = @core.schema_from_fields(fields, (0 : Int64))
+  match f.ts {
+    Some(t) => assert_eq(t, (1732531200000 : Int64))
+    None => panic()
+  }
+  match f.level {
+    Some(v) => assert_eq(v, b"ERROR")
+    None => panic()
+  }
+  match f.service {
+    Some(v) => assert_eq(v, b"checkout")
+    None => panic()
+  }
+  match f.host {
+    Some(v) => assert_eq(v, b"pod-7x")
+    None => panic()
+  }
+  match f.trace_id {
+    Some(v) => assert_eq(v, b"abc123")
+    None => panic()
+  }
+  match f.message {
+    Some(v) => assert_eq(v, b"db connection timeout")
+    None => panic()
+  }
+}
+
+///|
+test "ECS nested shapes resolve log.level, error.message, error.trace.id" {
+  let fields = @core.json_object_fields(
+    b"{\"@timestamp\":\"2026-11-25T10:00:01.500Z\",\"log\":{\"level\":\"warn\"},\"service\":{\"name\":\"billing\"},\"host\":{\"name\":\"node-2\"},\"error\":{\"message\":\"pool exhausted\",\"trace\":{\"id\":\"tr-ecs-9\"}}}",
+  )
+  let f = @core.schema_from_fields(fields, (0 : Int64))
+  match f.ts {
+    Some(t) => assert_eq(t, (1795600801500 : Int64))
+    None => panic()
+  }
+  match f.level {
+    Some(v) => assert_eq(v, b"warn")
+    None => panic()
+  }
+  match f.service {
+    Some(v) => assert_eq(v, b"billing")
+    None => panic()
+  }
+  match f.host {
+    Some(v) => assert_eq(v, b"node-2")
+    None => panic()
+  }
+  match f.trace_id {
+    Some(v) => assert_eq(v, b"tr-ecs-9")
+    None => panic()
+  }
+  match f.message {
+    Some(v) => assert_eq(v, b"pool exhausted")
+    None => panic()
+  }
+}
+
+///|
+test "journald kv lines normalize through the schema rounds" {
+  let fields = @core.parse_kv_pairs(
+    b"__REALTIME_TIMESTAMP=1732531200000123 _HOSTNAME=node-1 SYSLOG_IDENTIFIER=sshd PRIORITY=3 MESSAGE=Failed password",
+  )
+  let f = @core.schema_from_fields(fields, (0 : Int64))
+  match f.ts {
+    // journald __REALTIME_TIMESTAMP is microsecond precision; normalize_ts
+    // scales it down to epoch milliseconds.
+    Some(t) => assert_eq(t, (1732531200000 : Int64))
+    None => panic()
+  }
+  match f.service {
+    Some(v) => assert_eq(v, b"sshd")
+    None => panic()
+  }
+  match f.host {
+    Some(v) => assert_eq(v, b"node-1")
+    None => panic()
+  }
+  match f.level {
+    Some(v) => assert_eq(v, b"error")
+    None => panic()
+  }
+  match f.message {
+    Some(v) => assert_eq(v, b"Failed")
+    None => panic()
+  }
+  assert_true(f.trace_id is None)
+}
+
+///|
+test "level rounds prefer word forms over numbers regardless of order" {
+  let a = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"severity_number=17 severity_text=ERROR"),
+    (0 : Int64),
+  )
+  match a.level {
+    Some(v) => assert_eq(v, b"ERROR")
+    None => panic()
+  }
+  let b = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"severity_text=ERROR severity_number=17"),
+    (0 : Int64),
+  )
+  match b.level {
+    Some(v) => assert_eq(v, b"ERROR")
+    None => panic()
+  }
+}
+
+///|
+test "OTel numeric severities normalize to band words" {
+  fn num_level(v : Bytes) -> Bytes? {
+    @core.schema_from_fields(
+      [@core.parse_kv_pairs(b"severity_number=" + v)[0]],
+      (0 : Int64),
+    ).level
+  }
+  match num_level(b"1") {
+    Some(v) => assert_eq(v, b"debug")
+    None => panic()
+  }
+  match num_level(b"9") {
+    Some(v) => assert_eq(v, b"info")
+    None => panic()
+  }
+  match num_level(b"24") {
+    Some(v) => assert_eq(v, b"fatal")
+    None => panic()
+  }
+  assert_true(num_level(b"0") is None)
+  assert_true(num_level(b"30") is None)
+}
+
+///|
+test "syslog PRIORITY maps to the rank word form" {
+  fn prio_level(v : Bytes) -> Bytes? {
+    @core.schema_from_fields(
+      [@core.parse_kv_pairs(b"priority=" + v)[0]],
+      (0 : Int64),
+    ).level
+  }
+  match prio_level(b"0") {
+    Some(v) => assert_eq(v, b"fatal")
+    None => panic()
+  }
+  match prio_level(b"2") {
+    Some(v) => assert_eq(v, b"fatal")
+    None => panic()
+  }
+  match prio_level(b"3") {
+    Some(v) => assert_eq(v, b"error")
+    None => panic()
+  }
+  match prio_level(b"4") {
+    Some(v) => assert_eq(v, b"warn")
+    None => panic()
+  }
+  match prio_level(b"6") {
+    Some(v) => assert_eq(v, b"info")
+    None => panic()
+  }
+  match prio_level(b"7") {
+    Some(v) => assert_eq(v, b"debug")
+    None => panic()
+  }
+  assert_true(prio_level(b"8") is None)
+  assert_true(prio_level(b"12") is None)
+}
+
+///|
+test "observedTimeUnixNano is a ts fallback, event time wins" {
+  let only = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"observedTimeUnixNano=1732531200000000000"),
+    (0 : Int64),
+  )
+  match only.ts {
+    Some(t) => assert_eq(t, (1732531200000 : Int64))
+    None => panic()
+  }
+  let both = @core.schema_from_fields(
+    @core.parse_kv_pairs(
+      b"timeUnixNano=1732531200000000000 observedTimeUnixNano=1732531300000000000",
+    ),
+    (0 : Int64),
+  )
+  match both.ts {
+    Some(t) => assert_eq(t, (1732531200000 : Int64))
+    None => panic()
+  }
+}
+
+///|
+test "non-container prefixes do not peel" {
+  assert_eq(@core.canonical_field(b"user.message"), -1)
+  assert_eq(@core.canonical_field(b"myapp.servicename"), -1)
+  assert_eq(@core.canonical_field(b"pod.name"), -1)
+  let f = @core.schema_from_fields(
+    @core.parse_kv_pairs(b"user.message=hello myapp.servicename=svc"),
+    (0 : Int64),
+  )
+  assert_true(f.message is None)
+  assert_true(f.service is None)
+}
+
+///|
+test "canonical slots for container-prefixed aliases" {
+  assert_eq(@core.canonical_field(b"resource.service.name"), 2)
+  assert_eq(@core.canonical_field(b"resource.host.name"), 3)
+  assert_eq(@core.canonical_field(b"error.message"), 5)
+  assert_eq(@core.canonical_field(b"error.trace.id"), 4)
+  assert_eq(@core.canonical_field(b"log.level"), 1)
+  assert_eq(@core.canonical_field(b"kubernetes.labels.app"), 2)
+  assert_eq(@core.canonical_field(b"body.stringValue"), 5)
+  assert_eq(@core.canonical_field(b"timeUnixNano"), 0)
+  assert_eq(@core.canonical_field(b"__REALTIME_TIMESTAMP"), 0)
+  assert_eq(@core.canonical_field(b"SYSLOG_IDENTIFIER"), 2)
+  // syslog PRIORITY deliberately stays outside the slot map: its 0-7 scale
+  // collides with the OTel 1-24 rank used by TTL rules.
+  assert_eq(@core.canonical_field(b"priority"), -1)
+}
+
+///|
+test "cross-service joint filter hits OTel shapes" {
+  let raw = b"{\"timeUnixNano\":\"1732531200000000000\",\"severityText\":\"ERROR\",\"body\":{\"stringValue\":\"db connection timeout\"},\"resource\":{\"service\":{\"name\":\"checkout\"},\"host\":{\"name\":\"pod-7x\"}},\"traceId\":\"abc123\"}"
+  let fields = @core.json_object_fields(raw)
+  assert_true(
+    @core.schema_matches(
+      fields,
+      b"log",
+      raw,
+      Some(b"error"),
+      Some(b"checkout"),
+      Some(b"pod-7x"),
+      Some(b"ABC123"),
+      Some(b"timeout"),
+    ),
+  )
+  assert_true(
+    !@core.schema_matches(
+      fields,
+      b"log",
+      raw,
+      Some(b"error"),
+      Some(b"checkout"),
+      Some(b"other-host"),
+      None,
+      None,
+    ),
+  )
 }

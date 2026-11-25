@@ -1936,6 +1936,11 @@ fn cmd_parse_check(
       }
     } else if format == "kv" {
       fields = @core.parse_kv_pairs(line)
+    } else if format == "lines" {
+      // lines stays parse-ok for plain text, but kv-shaped lines (journald
+      // records, `level=... message=...`) still expose their fields so
+      // --schema can report the canonical six for them.
+      fields = @core.parse_kv_pairs(line)
     }
     if ok {
       parsed = parsed + 1
@@ -5518,6 +5523,14 @@ fn parse_ingest_line(
         }
       None => (opts.key_bytes, line, [])
     }
+  }
+  // lines: no structured parsing by default, but a --schema ingest still
+  // resolves the six canonical fields from kv-shaped lines (journald
+  // `__REALTIME_TIMESTAMP=... _HOSTNAME=... MESSAGE=...`), so plain-text
+  // sources get the same normalization as JSON/kv formats.
+  if opts.schema {
+    let pairs = @core.parse_kv_pairs(line)
+    return (opts.key_bytes, line, pairs)
   }
   (opts.key_bytes, line, [])
 }

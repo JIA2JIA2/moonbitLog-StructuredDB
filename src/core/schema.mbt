@@ -23,29 +23,24 @@ fn squash_field_name(name : Bytes) -> Bytes {
 ///|
 /// Canonical slot for a unified-schema field name (2.2): ts=0, level=1,
 /// service=2, host=3, trace_id=4, message=5, other=-1. Matching squashes case
-/// and separators, then accepts common aliases including OTel-style names
-/// (`service.name`, `trace.id`, `host.name`, `severity_text`, `body`).
+/// and separators, accepts common aliases including OTel-style names
+/// (`service.name`, `trace.id`, `host.name`, `severity_text`, `body`) and
+/// container-prefixed paths (`resource.service.name`, `error.message`,
+/// `log.level`, `kubernetes.labels.app`): leading segments are peeled only
+/// while they are known log-pipeline containers, so `user.message` or
+/// `myapp.servicename` stay unrecognized.
 pub fn canonical_field(name : Bytes) -> Int32 {
-  let s = squash_field_name(name)
-  if s == b"ts" || s == b"timestamp" || s == b"time" {
+  if field_name_matches(name, canonical_ts_names) {
     0
-  } else if s == b"level" ||
-    s == b"severity" ||
-    s == b"severitytext" ||
-    s == b"severitynumber" ||
-    s == b"lvl" {
+  } else if field_name_matches(name, canonical_level_names) {
     1
-  } else if s == b"service" ||
-    s == b"servicename" ||
-    s == b"app" ||
-    s == b"application" ||
-    s == b"svc" {
+  } else if field_name_matches(name, service_names) {
     2
-  } else if s == b"host" || s == b"hostname" || s == b"node" {
+  } else if field_name_matches(name, host_names) {
     3
-  } else if s == b"traceid" || s == b"trace" {
+  } else if field_name_matches(name, trace_names) {
     4
-  } else if s == b"message" || s == b"msg" || s == b"log" || s == b"body" {
+  } else if field_name_matches(name, message_names) {
     5
   } else {
     -1
@@ -53,16 +48,49 @@ pub fn canonical_field(name : Bytes) -> Int32 {
 }
 
 ///|
-let ts_names : Array[Bytes] = [b"ts", b"timestamp", b"time"]
+/// Event-time field spellings (2.2/2.3): OTel `timeUnixNano` and journald
+/// `__REALTIME_TIMESTAMP` carry the event time like `ts`/`@timestamp`.
+let ts_names : Array[Bytes] = [
+  b"ts", b"timestamp", b"time", b"timeunixnano", b"realtimetimestamp",
+]
 
 ///|
-let level_names : Array[Bytes] = [
+/// OTel observed time: a fallback timestamp source consulted only when no
+/// event-time field is present.
+let observed_ts_names : Array[Bytes] = [b"observedtimeunixnano"]
+
+///|
+/// Canonical lookup superset for slot resolution. Level keeps the numeric
+/// OTel form so TTL rules and inverted-index slots keep working; syslog
+/// `priority` is deliberately NOT a slot: its 0-7 scale collides with the
+/// OTel 1-24 rank, so it only feeds the schema normalization rounds below.
+let canonical_ts_names : Array[Bytes] = [
+  b"ts", b"timestamp", b"time", b"timeunixnano", b"realtimetimestamp", b"observedtimeunixnano",
+]
+
+///|
+let canonical_level_names : Array[Bytes] = [
   b"level", b"severity", b"severitytext", b"severitynumber", b"lvl",
 ]
 
 ///|
+/// Level round 1: word forms always win, whatever the field order.
+let level_word_names : Array[Bytes] = [
+  b"level", b"severity", b"severitytext", b"lvl",
+]
+
+///|
+/// Level round 2: OTel numeric severity, normalized to the word form so the
+/// stored schema shape matches word-emitting services.
+let level_number_names : Array[Bytes] = [b"severitynumber"]
+
+///|
+/// Level round 3: journald/syslog PRIORITY (0-7).
+let priority_names : Array[Bytes] = [b"priority"]
+
+///|
 let service_names : Array[Bytes] = [
-  b"service", b"servicename", b"app", b"application", b"svc",
+  b"service", b"servicename", b"app", b"application", b"svc", b"syslogidentifier",
 ]
 
 ///|
@@ -72,7 +100,18 @@ let host_names : Array[Bytes] = [b"host", b"hostname", b"node"]
 let trace_names : Array[Bytes] = [b"traceid", b"trace"]
 
 ///|
-let message_names : Array[Bytes] = [b"message", b"msg", b"log", b"body"]
+let message_names : Array[Bytes] = [
+  b"message", b"msg", b"log", b"body", b"bodystringvalue",
+]
+
+///|
+/// Log-pipeline container segments whose leading prefix is peeled when
+/// resolving a field name: `resource.service.name`, `attributes.trace.id`,
+/// `kubernetes.labels.app`, `error.message`, `log.level`, ...
+let container_prefixes : Array[Bytes] = [
+  b"resource", b"attributes", b"labels", b"fields", b"tags", b"event", b"log", b"error",
+  b"record", b"metadata", b"kubernetes", b"otel",
+]
 
 ///|
 /// The six canonical fields extracted from a parsed field set. Absent fields
@@ -87,38 +126,188 @@ pub(all) struct SchemaFields {
 }
 
 ///|
+/// ASCII-lowercase squash of `name[start, end)` (separators dropped).
+fn squash_span(name : Bytes, start : Int32, end : Int32) -> Bytes {
+  let buf = @buffer.Buffer::Buffer()
+  let mut i = start
+  while i < end {
+    let c = name.at(i).to_int()
+    if !is_field_sep(c) {
+      if c >= 65 && c <= 90 {
+        buf.write_byte((c + 32).to_byte())
+      } else {
+        buf.write_byte(c.to_byte())
+      }
+    }
+    i = i + 1
+  }
+  buf.to_bytes()
+}
+
+///|
+fn is_field_sep(c : Int32) -> Bool {
+  c == 95 || c == 45 || c == 46 || c == 64
+}
+
+///|
+/// Alias match with container-prefix peeling: the full squashed name is
+/// tried first, then leading segments that are known log-pipeline containers
+/// are peeled one at a time (`kubernetes.labels.app` → `app`). Any hit
+/// accepts the field; a non-container leading segment stops the peel, so
+/// `user.message` and `myapp.servicename` stay unrecognized.
+fn field_name_matches(name : Bytes, names : Array[Bytes]) -> Bool {
+  let s = squash_field_name(name)
+  for n in names {
+    if s == n {
+      return true
+    }
+  }
+  let len = name.length()
+  let mut i = 0
+  while i < len {
+    let mut j = i
+    while j < len && !is_field_sep(name.at(j).to_int()) {
+      j = j + 1
+    }
+    if j == i || j == len {
+      break
+    }
+    let seg = squash_span(name, i, j)
+    let mut container = false
+    for c in container_prefixes {
+      if seg == c {
+        container = true
+        break
+      }
+    }
+    if !container {
+      break
+    }
+    let rest = squash_span(name, j + 1, len)
+    for n in names {
+      if rest == n {
+        return true
+      }
+    }
+    i = j + 1
+  }
+  false
+}
+
+///|
+/// First field whose name matches any alias (with container peeling); the
+/// field order in the record decides within a round.
+fn find_value(fields : Array[(Bytes, Bytes)], names : Array[Bytes]) -> Bytes? {
+  for pair in fields {
+    if field_name_matches(pair.0, names) {
+      return Some(pair.1)
+    }
+  }
+  None
+}
+
+///|
+/// OTel severity number (1-24) normalized to the word form the rank table
+/// uses, so `severity_number: 17` and `severity_text: "ERROR"` store the
+/// same schema shape (word forms keep cross-service filtering literal).
+fn level_word_from_number(v : Bytes) -> Bytes? {
+  let len = v.length()
+  if len == 0 || len > 2 {
+    return None
+  }
+  let mut value = 0
+  let mut i = 0
+  while i < len {
+    let c = v.at(i).to_int()
+    if c < 48 || c > 57 {
+      return None
+    }
+    value = value * 10 + (c - 48)
+    i = i + 1
+  }
+  if value < 1 || value > 24 {
+    return None
+  }
+  let word = if value <= 8 {
+    b"debug"
+  } else if value <= 12 {
+    b"info"
+  } else if value <= 16 {
+    b"warn"
+  } else if value <= 20 {
+    b"error"
+  } else {
+    b"fatal"
+  }
+  Some(word)
+}
+
+///|
+/// Syslog/journald PRIORITY (0-7) mapped to the same word form: 0-2
+/// (emerg/alert/crit) → fatal, 3 (err) → error, 4 (warning) → warn,
+/// 5-6 (notice/info) → info, 7 → debug.
+fn level_word_from_syslog(v : Bytes) -> Bytes? {
+  if v.length() != 1 {
+    return None
+  }
+  let c = v.at(0).to_int()
+  if c < 48 || c > 55 {
+    return None
+  }
+  let word = if c <= 50 {
+    b"fatal"
+  } else if c == 51 {
+    b"error"
+  } else if c == 52 {
+    b"warn"
+  } else if c <= 54 {
+    b"info"
+  } else {
+    b"debug"
+  }
+  Some(word)
+}
+
+///|
 /// Extract the six canonical fields from a parsed field set. Timestamp values
 /// are parsed as epoch milliseconds; an unparsable value falls back to
 /// `fallback`. Timestamps go through `normalize_ts` (any numeric precision
-/// or ISO-8601 zone offset). Implemented as six independent first-match
-/// lookups over the field list (no shared loop state, no mutable struct
-/// fields).
+/// or ISO-8601 zone offset). Each slot resolves in priority rounds instead of
+/// one shared first-match pass: ts consults event-time fields before OTel
+/// observed time; level consults word forms, then the OTel number, then
+/// syslog PRIORITY — so a record carrying both severity_text and
+/// severity_number normalizes to the word whatever the field order.
 pub fn schema_from_fields(
   fields : Array[(Bytes, Bytes)],
   fallback : Int64,
 ) -> SchemaFields {
-  fn first_value(names : Array[Bytes]) -> Bytes? {
-    for pair in fields {
-      let s = squash_field_name(pair.0)
-      for name in names {
-        if s == name {
-          return Some(pair.1)
-        }
-      }
-    }
-    None
-  }
-  let ts_opt : Int64? = match first_value(ts_names) {
+  let ts_opt : Int64? = match find_value(fields, ts_names) {
     Some(v) => Some(normalize_ts(v, fallback))
-    None => None
+    None =>
+      match find_value(fields, observed_ts_names) {
+        Some(v) => Some(normalize_ts(v, fallback))
+        None => None
+      }
+  }
+  let level_opt : Bytes? = match find_value(fields, level_word_names) {
+    Some(v) => Some(v)
+    None =>
+      match find_value(fields, level_number_names) {
+        Some(v) => level_word_from_number(v)
+        None =>
+          match find_value(fields, priority_names) {
+            Some(v) => level_word_from_syslog(v)
+            None => None
+          }
+      }
   }
   {
     ts: ts_opt,
-    level: first_value(level_names),
-    service: first_value(service_names),
-    host: first_value(host_names),
-    trace_id: first_value(trace_names),
-    message: first_value(message_names),
+    level: level_opt,
+    service: find_value(fields, service_names),
+    host: find_value(fields, host_names),
+    trace_id: find_value(fields, trace_names),
+    message: find_value(fields, message_names),
   }
 }
 
