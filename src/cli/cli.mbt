@@ -5049,9 +5049,24 @@ fn cmd_drill(dir : String, keep : Bool, json : Bool) -> Unit raise @io.IoError {
 ///|
 /// Poll interval for `replicate --follow`, overridable with
 /// `MOONLOG_REPLICATE_INTERVAL`.
-fn replicate_interval_ms() -> Int32 {
+fn replicate_interval_ms() -> Int32 raise @io.IoError {
   match @env.get_env_var("MOONLOG_REPLICATE_INTERVAL") {
-    Some(v) => @string.parse_int(v) catch { _ => 200 }
+    Some(v) => {
+      let w : Int32 = @string.parse_int(v) catch { _ => 200 }
+      if w >= 1 {
+        w
+      } else {
+        // Same busy-poll hazard as the follow interval: the mirror loop
+        // polls its source on this cadence, and a non-positive delay turns
+        // the idle 200ms wait into a while-true scan on every follower and
+        // every ha-watch-adjacent deployment.
+        raise @io.IoError::Invalid(
+          "replicate interval must be >= 1ms: " +
+          w.to_string() +
+          " (check MOONLOG_REPLICATE_INTERVAL)",
+        )
+      }
+    }
     None => 200
   }
 }
@@ -5617,9 +5632,25 @@ fn cmd_replicate(
 
 ///|
 /// Poll interval for `follow`, overridable with `MOONLOG_FOLLOW_INTERVAL`.
-fn follow_interval_ms() -> Int32 {
+fn follow_interval_ms() -> Int32 raise @io.IoError {
   match @env.get_env_var("MOONLOG_FOLLOW_INTERVAL") {
-    Some(v) => @string.parse_int(v) catch { _ => 200 }
+    Some(v) => {
+      let w : Int32 = @string.parse_int(v) catch { _ => 200 }
+      if w >= 1 {
+        w
+      } else {
+        // Zero or negative turns the follow loop into a busy poll: sleep_ms
+        // with a non-positive delay returns immediately, so the 200ms-idle
+        // tail becomes a while-true scan burning a full core on a directory
+        // that may never change — a production tail must fail loudly, not
+        // cook the node silently (4.5 fourth round).
+        raise @io.IoError::Invalid(
+          "follow interval must be >= 1ms: " +
+          w.to_string() +
+          " (check MOONLOG_FOLLOW_INTERVAL)",
+        )
+      }
+    }
     None => 200
   }
 }
