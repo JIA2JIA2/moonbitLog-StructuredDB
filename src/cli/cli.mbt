@@ -15819,7 +15819,13 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 3 {
       println(USAGE)
     } else {
-      let mut unit = "day"
+      // The default view unit follows the directory's PARTITION policy: an
+      // hour-partitioned store viewed per day aggregates three buckets into
+      // one line, which reads as "no new partitions were rolled" — the exact
+      // thing 3.1's auto-roll view must make visible. An explicit --unit
+      // still wins.
+      let pol_ms = load_partition_policy(args[2])
+      let mut unit = if pol_ms == 3600000L { "hour" } else { "day" }
       let mut json = false
       let mut i = 3
       while i < args.length() {
