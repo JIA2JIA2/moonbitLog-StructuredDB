@@ -44,13 +44,16 @@
 ///                                    trigger, counts, policy); rotations
 ///                                    (TTL_AUDIT.N) are included; --verify
 ///                                    reports line and chain integrity
-///   replicate <src> <dst> [--follow]
+///   replicate <src> <dst> [--follow] [--allow-trim]
 ///                                    incrementally mirror the source log into
 ///                                    a complete replica directory (--follow
 ///                                    repeats on an interval and only warns
 ///                                    while the source is down); a promoted
 ///                                    replica rejects forward sync so outage
-///                                    writes are never trimmed
+///                                    writes are never trimmed, and a sync
+///                                    that would trim data the replica holds
+///                                    beyond the source is refused unless
+///                                    --allow-trim confirms the source wins
 ///   ha-failover <primary> <replica> [--active <link>] [--json]
 ///              [--force] [--other-replicas <csv>]
 ///                                    promote the replica (role=primary),
@@ -58,15 +61,21 @@
 ///                                    atomically repoint the stable link;
 ///                                    refused while the primary is reachable or
 ///                                    the replica is already primary (--force
-///                                    overrides); --other-replicas marks the
-///                                    remaining replicas standby and reports
-///                                    their lag
+///                                    overrides); reports the replica's lag
+///                                    against the old primary (null when the
+///                                    primary is down — the outage writes
+///                                    return via ha-rebalance);
+///                                    --other-replicas marks the remaining
+///                                    replicas standby and reports their lag
 ///   ha-status <primary> [replica] [--json]
 ///                                    show roles, reachability, switch time —
 ///                                    and, with a replica, the lag in offsets
 ///   ha-rebalance <old-primary> <new-primary> [--json]
 ///                                    mirror the promoted primary back onto the
-///                                    old directory and mark it standby
+///                                    old directory and mark it standby;
+///                                    reports how many records existed only on
+///                                    the old directory (diverged writes) and
+///                                    are discarded by the switch
 ///   ha-watch <primary> <replica> --active <link>
 ///            [--interval ms] [--fail-threshold N] [--json] [--once]
 ///                                    promote automatically after N failed
@@ -5101,7 +5110,11 @@ fn save_ha_state(
 }
 
 ///|
-fn replicate_pass(src : String, dst : String) -> Int32 raise @io.IoError {
+fn replicate_pass(
+  src : String,
+  dst : String,
+  allow_trim~ : Bool = false,
+) -> Int32 raise @io.IoError {
   if !@backend_native.file_exists(src) {
     raise @io.IoError::Invalid("source unavailable: " + src)
   }
@@ -5120,6 +5133,31 @@ fn replicate_pass(src : String, dst : String) -> Int32 raise @io.IoError {
         )
       }
     None => ()
+  }
+  // HA safety (3.5 fourth round): the role marker above only exists after a
+  // ha-failover, but the plain `replicate` replica — the M123 path where the
+  // client just switches directories — carries none, and its outage writes
+  // were trimmed silently by the very next forward sync (measured: replica
+  // 55 -> 50, no warning). Guard on the data itself: when the target holds
+  // more records than the source, the source cannot supply them and the
+  // mirror would delete them. Only ha-rebalance (whose contract is "the new
+  // primary wins", with the discard reported) passes allow_trim.
+  let src_off = run_locked_snapshot_offset(src)
+  let dst_off = run_locked_snapshot_offset(dst)
+  if !allow_trim && src_off >= 0 && dst_off > src_off {
+    raise @io.IoError::Invalid(
+      "replicate target " +
+      dst +
+      " holds " +
+      (dst_off - src_off).to_string() +
+      " record(s) the source lacks (offset " +
+      dst_off.to_string() +
+      " vs " +
+      src_off.to_string() +
+      "); a forward sync would delete them (writes made on the replica during " +
+      "an outage?) — promote it with ha-failover, rebalance from it, or pass " +
+      "--allow-trim to confirm the source wins",
+    )
   }
   run_locked(src, true, () => {
     let log = open_log(src)
@@ -5180,6 +5218,28 @@ fn cmd_ha_failover(
   if primary_reachable {
     save_ha_state(primary, "standby", replica)
   }
+  // RPO visibility at the switch (3.5 fourth round): the promotion is the
+  // moment the divergence window becomes permanent until a rebalance, so the
+  // lag is reported right here. The value is the records the switch would
+  // lose: how far the replica trails the old primary, floored at 0 (a
+  // replica that already leads the primary loses nothing). When the old
+  // primary is down the lag cannot be measured (its offset is unknown) —
+  // the value stays -1 and the report says so, rather than implying a clean
+  // switch.
+  let lag : Int64 = if primary_reachable {
+    let po = run_locked_snapshot_offset(primary)
+    let ro = run_locked_snapshot_offset(replica)
+    if po < 0 || ro < 0 {
+      (-1 : Int64)
+    } else if po > ro {
+      po - ro
+    } else {
+      (0 : Int64)
+    }
+  } else {
+    (-1 : Int64)
+  }
+  let lag_json = if lag >= 0 { lag.to_string() } else { "null" }
   match active {
     Some(link) => @backend_native.replace_symlink(replica, link)
     None => ()
@@ -5212,6 +5272,8 @@ fn cmd_ha_failover(
       (if primary_reachable { "true" } else { "false" }) +
       ",\"forced\":" +
       (if force { "true" } else { "false" }) +
+      ",\"lag\":" +
+      lag_json +
       ",\"active\":" +
       (match active {
         Some(l) => "\"" + json_escape_str(l) + "\""
@@ -5234,6 +5296,18 @@ fn cmd_ha_failover(
     )
   } else {
     println("promoted " + replica + " to primary (from " + primary + ")")
+    if lag >= 0 {
+      println(
+        "lag " +
+        lag.to_string() +
+        " record(s) behind the old primary at the switch",
+      )
+    } else {
+      println(
+        "old primary unreachable — its lag at the switch is unknown; writes " +
+        "it held after the last sync (if any) return via ha-rebalance",
+      )
+    }
     match active {
       Some(l) => println("active path now points at " + replica + " via " + l)
       None => ()
@@ -5384,7 +5458,11 @@ fn cmd_ha_status(primary : String, replica : String?, json : Bool) -> Unit {
 ///|
 /// Rebalance after failover: mirror the promoted primary back onto the old
 /// primary directory (single-writer: the new primary wins), then mark the old
-/// directory as a standby so a later forward sync is still refused.
+/// directory as a standby so a later forward sync is still refused. Writes
+/// that diverged on the old directory while it was down (and never made it to
+/// the promoted primary) are discarded by the switch — M123's "the new
+/// primary wins" contract — but they are counted and reported instead of
+/// vanishing silently.
 fn cmd_ha_rebalance(
   old_primary : String,
   new_primary : String,
@@ -5396,7 +5474,14 @@ fn cmd_ha_rebalance(
   // Mark the old directory as a standby first so replicate_pass accepts it as
   // a target even if it carried a stale primary marker.
   save_ha_state(old_primary, "standby", new_primary)
-  let n = replicate_pass(new_primary, old_primary)
+  let old_off = run_locked_snapshot_offset(old_primary)
+  let new_off = run_locked_snapshot_offset(new_primary)
+  let n = replicate_pass(new_primary, old_primary, allow_trim=true)
+  let discarded : Int64 = if old_off >= 0 && new_off >= 0 && old_off > new_off {
+    old_off - new_off
+  } else {
+    0
+  }
   if json {
     println(
       "{\"rebalanced\":true,\"target\":\"" +
@@ -5405,6 +5490,8 @@ fn cmd_ha_rebalance(
       json_escape_str(new_primary) +
       "\",\"segments\":" +
       n.to_string() +
+      ",\"discarded\":" +
+      discarded.to_string() +
       "}",
     )
   } else {
@@ -5417,6 +5504,14 @@ fn cmd_ha_rebalance(
       n.to_string() +
       " segment(s))",
     )
+    if discarded > 0 {
+      println(
+        "discarded " +
+        discarded.to_string() +
+        " record(s) that existed only on the old directory (diverged while " +
+        "it was down; the new primary wins)",
+      )
+    }
     println("old primary is now a standby; new primary remains authoritative")
   }
 }
@@ -5435,6 +5530,15 @@ fn cmd_ha_watch(
   json : Bool,
   once : Bool,
 ) -> Unit raise @io.IoError {
+  // A threshold below 1 fires on the very first probe regardless of the
+  // primary's health (0 >= 0 is always true) — a configuration error, not a
+  // policy; an interval below 1 spins the probe loop with no delay.
+  if fail_threshold < 1 {
+    raise @io.IoError::Invalid("fail-threshold must be >= 1")
+  }
+  if interval < 1 {
+    raise @io.IoError::Invalid("interval must be >= 1")
+  }
   let mut fails : Int32 = 0
   while true {
     if @backend_native.file_exists(primary) {
@@ -5447,7 +5551,17 @@ fn cmd_ha_watch(
       // back mid-watch, or another watcher already promoted the replica) —
       // surfacing the refusal beats lying about a completed switch.
       cmd_ha_failover(primary, replica, Some(active), [], json, false)
-      println("ha-watch: primary unreachable, failover complete")
+      if json {
+        println(
+          "{\"watch\":true,\"primary\":\"" +
+          json_escape_str(primary) +
+          "\",\"promoted\":\"" +
+          json_escape_str(replica) +
+          "\",\"failover_complete\":true}",
+        )
+      } else {
+        println("ha-watch: primary unreachable, failover complete")
+      }
       return
     }
     if once {
@@ -5462,11 +5576,12 @@ fn cmd_replicate(
   src : String,
   dst : String,
   follow : Bool,
+  allow_trim : Bool,
 ) -> Unit raise @io.IoError {
   if follow {
     let mut was_ok = true
     while true {
-      let n = replicate_pass(src, dst) catch { _ => -1 }
+      let n = replicate_pass(src, dst, allow_trim~) catch { _ => -1 }
       if n < 0 {
         if was_ok {
           println("WARN replicate: source unavailable, retrying")
@@ -5481,7 +5596,7 @@ fn cmd_replicate(
       @backend_native.sleep_ms(replicate_interval_ms())
     }
   } else {
-    let n = replicate_pass(src, dst)
+    let n = replicate_pass(src, dst, allow_trim~)
     println("synced " + n.to_string() + " segment(s) to " + dst)
   }
 }
@@ -17520,14 +17635,17 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
       println(USAGE)
     } else {
       let mut follow = false
+      let mut allow_trim = false
       let mut i = 4
       while i < args.length() {
         if args[i] == "--follow" {
           follow = true
+        } else if args[i] == "--allow-trim" {
+          allow_trim = true
         }
         i = i + 1
       }
-      cmd_replicate(args[2], args[3], follow)
+      cmd_replicate(args[2], args[3], follow, allow_trim)
     }
   } else if cmd == "archive" {
     if args.length() < 4 {
