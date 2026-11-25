@@ -1293,6 +1293,62 @@ fn ctx_is_sep(c : Int32) -> Bool {
 }
 
 ///|
+/// Field-name match that also accepts container-prefixed spellings
+/// (`error.latency` for `--metric latency` — OTel exception attributes are
+/// the real production shape, and the flat squash compared "errorlatency"
+/// against "latency", silently dropping the metric from the evaluation).
+/// Splits `a` on the ctx separators and compares every TAIL-segment run
+/// against `b` squashed, so segment boundaries stay visible:
+/// `myerrorlatency` (one segment) does not match.
+fn ctx_name_tail_eq(a : Bytes, b : Bytes) -> Bool {
+  let bsq = @buffer.Buffer::Buffer()
+  let mut j = 0
+  while j < b.length() {
+    let c = b.at(j).to_int()
+    if !ctx_is_sep(c) {
+      if c >= 65 && c <= 90 {
+        bsq.write_byte((c + 32).to_byte())
+      } else {
+        bsq.write_byte(c.to_byte())
+      }
+    }
+    j = j + 1
+  }
+  let target = bsq.to_bytes()
+  if target.length() == 0 {
+    return false
+  }
+  // Every tail-segment start of `a`: a new segment begins after a separator
+  // run, and the tail run is squashed the same way as `b`.
+  let mut start = 0
+  while start < a.length() {
+    let key = @buffer.Buffer::Buffer()
+    let mut i = start
+    while i < a.length() {
+      let c = a.at(i).to_int()
+      if !ctx_is_sep(c) {
+        if c >= 65 && c <= 90 {
+          key.write_byte((c + 32).to_byte())
+        } else {
+          key.write_byte(c.to_byte())
+        }
+      }
+      i = i + 1
+    }
+    if key.to_bytes() == target {
+      return true
+    }
+    while start < a.length() && !ctx_is_sep(a.at(start).to_int()) {
+      start = start + 1
+    }
+    while start < a.length() && ctx_is_sep(a.at(start).to_int()) {
+      start = start + 1
+    }
+  }
+  false
+}
+
+///|
 /// ASCII case-insensitive byte equality for correlation identifiers.
 fn ctx_bytes_eq_ci(a : Bytes, b : Bytes) -> Bool {
   if a.length() != b.length() {
@@ -13206,6 +13262,15 @@ fn cmd_watch(
   let threshold_n = @string.parse_int(threshold) catch {
     _ => raise @io.IoError::Invalid("invalid threshold: " + threshold)
   }
+  if threshold_n < 1 {
+    // A zero or negative count threshold is satisfied by an empty window
+    // (count >= threshold is always true), so the watch fires every single
+    // evaluation — the "alarm storm" the state machine exists to prevent,
+    // caused by a typo instead of real data.
+    raise @io.IoError::Invalid(
+      "threshold must be >= 1: " + threshold_n.to_string(),
+    )
+  }
   // Metric statistic: avg smooths spikes away (2 slow requests among 20
   // fast ones stay under an avg threshold) — max/p95 surface them.
   let metric_stat : String = match metric_stat_s {
@@ -13291,12 +13356,18 @@ fn cmd_watch(
     None => None
   }
   let metric_thr : Double? = match metric_threshold {
-    Some(v) =>
-      Some(
-        @string.parse_double(v) catch {
-          _ => raise @io.IoError::Invalid("invalid metric-threshold: " + v)
-        },
-      )
+    Some(v) => {
+      let w : Double = @string.parse_double(v) catch {
+        _ => raise @io.IoError::Invalid("invalid metric-threshold: " + v)
+      }
+      if w < 0.0 {
+        // A negative latency/error threshold is satisfied by every metric
+        // value, so the watch fires on every evaluation — same alarm-storm
+        // shape as threshold <= 0. 0 stays legal (floor-style indicators).
+        raise @io.IoError::Invalid("metric-threshold must be >= 0: " + v)
+      }
+      Some(w)
+    }
     None => None
   }
   match (metric_b, metric_thr) {
@@ -13321,10 +13392,19 @@ fn cmd_watch(
     None => None
   }
   let every = match every_ms {
-    Some(v) =>
-      @string.parse_int(v) catch {
+    Some(v) => {
+      let w : Int32 = @string.parse_int(v) catch {
         _ => raise @io.IoError::Invalid("invalid every: " + v)
       }
+      if w >= 1 {
+        w
+      } else {
+        // sleep_ms(0) returns immediately: every=0 turns the 1s-idle eval
+        // loop into a busy poll burning a full core on a quiet directory
+        // (4.5 fourth round, same floor contract as MOONLOG_FOLLOW_INTERVAL).
+        raise @io.IoError::Invalid("every must be >= 1ms: " + w.to_string())
+      }
+    }
     None => 1000
   }
   let metric_mode = metric_b is Some(_)
@@ -13484,7 +13564,7 @@ fn cmd_watch(
         match metric_b {
           Some(mf) =>
             for pair in fields {
-              if ctx_name_eq(pair.0, mf) {
+              if ctx_name_eq(pair.0, mf) || ctx_name_tail_eq(pair.0, mf) {
                 let d_opt = Some(
                   @string.parse_double(@utf8.decode_lossy(pair.1)),
                 ) catch {
