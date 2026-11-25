@@ -10297,6 +10297,13 @@ fn cmd_aggregate(
       }
     None => 20
   }
+  if top_n <= 0 {
+    // A negative or zero --top silently showed zero buckets (top_counts'
+    // min(length, top_n) made the loop vanish), which reads like an empty
+    // dataset rather than the parameter error it is — same refusal the
+    // dashboard already had (5.1 fourth round).
+    raise @io.IoError::Invalid("top must be positive")
+  }
   let is_prefix = by.has_prefix("prefix:")
   let prefix_n = if is_prefix {
     @string.parse_int(by[7:by.length()].to_owned()) catch {
@@ -12235,6 +12242,12 @@ fn cmd_cluster(
         _ => raise @io.IoError::Invalid("invalid top count: " + s)
       }
     None => 20
+  }
+  if top_n <= 0 {
+    // Same refusal as aggregate/dashboard: a negative --top silently showed
+    // zero buckets instead of failing the parameter error it is (5.1 fourth
+    // round).
+    raise @io.IoError::Invalid("top must be positive")
   }
   let min_n = match min_count {
     Some(s) => {
