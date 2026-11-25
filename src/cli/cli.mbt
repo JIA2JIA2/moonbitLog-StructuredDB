@@ -12158,10 +12158,18 @@ fn blank_line(v : Bytes) -> Bool {
 /// "error"`); `None` when the record is not JSON or carries neither stack
 /// nor message.
 fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes, Int32)? {
-  if value.length() == 0 || value.at(0).to_int() != 123 {
+  // Field extraction goes through the shared @core.value_fields contract:
+  // it flattens plain JSON objects AND container-wrapped bodies
+  // (`2026-...Z stdout F {...}` — Docker/CRI/syslog wrappers are the
+  // production shape, and the old first-byte `{` guard dropped them back to
+  // the single-line template, where the whole JSON collapsed into
+  // {<str>:<str>,...} and unrelated errors merged into one cluster), so the
+  // wrapper form clusters by its message/stack like every other JSON
+  // record. Non-JSON values yield no fields and fall through to None.
+  let fields = @core.value_fields(value)
+  if fields.length() == 0 {
     return None
   }
-  let fields = @core.json_object_fields(value) catch { _ => return None }
   let stack_names : Array[Bytes] = [
     b"stack", b"stacktrace", b"exception", b"exceptionstacktrace", b"errorstack",
     b"errstack",
@@ -12209,7 +12217,21 @@ fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes, Int32)? {
         }
         i = i + 1
       }
-      Some((@core.normalize_log_template(s), frames, sample, lvl))
+      // Cluster key: strip carriage returns before normalization — a stack
+      // arriving with \r\n separators (Windows containers) must cluster with
+      // the \n form of the same stack; the raw \r survives into the
+      // normalized template and split one stack into two clusters (5.2
+      // fourth round). Frame counting above already tolerates the suffix.
+      let key = @buffer.Buffer::Buffer()
+      let mut k = 0
+      while k < s.length() {
+        let c = s.at(k).to_int()
+        if c != 13 {
+          key.write_byte(s.at(k))
+        }
+        k = k + 1
+      }
+      Some((@core.normalize_log_template(key.to_bytes()), frames, sample, lvl))
     }
     None =>
       match msg {
@@ -12219,7 +12241,19 @@ fn cluster_json_record(value : Bytes) -> (Bytes, Int32, Bytes, Int32)? {
           } else {
             None
           }
-        None => None
+        None =>
+          // No message slot, but the record still carried fields (KV error
+          // records like `level=err code=42 ...`): the level verdict must
+          // survive, or the level-based pass drops the record entirely —
+          // M203's level exemption only ever worked for records that
+          // happened to have a message slot. sample falls back to the raw
+          // value; records without any level evidence stay None and keep the
+          // single-line template path.
+          if lvl >= 0 {
+            Some((@core.normalize_log_template(value), 0, value, lvl))
+          } else {
+            None
+          }
       }
   }
 }

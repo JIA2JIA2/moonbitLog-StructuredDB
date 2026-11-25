@@ -130,6 +130,7 @@ fn reserved_enum_value(v : Bytes) -> Bool {
   }
   let s = buf.to_bytes()
   s == b"error" ||
+  s == b"err" ||
   s == b"warn" ||
   s == b"warning" ||
   s == b"info" ||
