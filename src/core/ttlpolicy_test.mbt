@@ -9,12 +9,18 @@ test "parse ttl policy with default service and level rules" {
       // default is a separate field; only service/level lines are rules.
       assert_eq(policy.rules.length(), 3)
       // Service hit only → the service rule wins (default does not cap it).
-      assert_eq(@core.ttl_days_of(policy, b"orders", Some(b"info")), 90L)
+      assert_eq(@core.ttl_days_of(policy, b"orders", Some(b"info"), None), 90L)
       // Both dimensions hit → the stricter one wins.
-      assert_eq(@core.ttl_days_of(policy, b"orders", Some(b"error")), 90L)
-      assert_eq(@core.ttl_days_of(policy, b"payments", Some(b"debug")), 3L)
+      assert_eq(@core.ttl_days_of(policy, b"orders", Some(b"error"), None), 90L)
+      assert_eq(
+        @core.ttl_days_of(policy, b"payments", Some(b"debug"), None),
+        3L,
+      )
       // No rule hit → default.
-      assert_eq(@core.ttl_days_of(policy, b"payments", Some(b"info")), 30L)
+      assert_eq(
+        @core.ttl_days_of(policy, b"payments", Some(b"info"), None),
+        30L,
+      )
       // Level extraction from a schema-shaped value.
       assert_eq(
         @core.ttl_record_level(b"level=error host=h1 message=boom"),
@@ -36,17 +42,17 @@ test "prefix rules match tenant key namespaces (6.2)" {
       assert_eq(policy.rules.length(), 2)
       // Keys under the tenant prefix hit the prefix rule.
       assert_eq(
-        @core.ttl_days_of(policy, b"tenant-a/orders", Some(b"info")),
+        @core.ttl_days_of(policy, b"tenant-a/orders", Some(b"info"), None),
         7L,
       )
-      assert_eq(@core.ttl_days_of(policy, b"tenant-a/", None), 7L)
+      assert_eq(@core.ttl_days_of(policy, b"tenant-a/", None, None), 7L)
       // Keys outside every prefix fall back to the default.
-      assert_eq(@core.ttl_days_of(policy, b"tenant-c/x", None), 30L)
+      assert_eq(@core.ttl_days_of(policy, b"tenant-c/x", None, None), 30L)
       // Several hits → the stricter one wins.
       let both = @core.parse_ttl_policy(b"prefix t/ 90\nservice t/a 10\n")
       match both {
         Some(policy2) =>
-          assert_eq(@core.ttl_days_of(policy2, b"t/a", None), 10L)
+          assert_eq(@core.ttl_days_of(policy2, b"t/a", None, None), 10L)
         None => panic()
       }
     }
@@ -71,8 +77,8 @@ test "ttl policy rejects malformed lines and supports default-less files" {
   match p {
     Some(policy) => {
       assert_eq(policy.default_days, -1L)
-      assert_eq(@core.ttl_days_of(policy, b"hot", None), 2L)
-      assert_eq(@core.ttl_days_of(policy, b"cold", None), -1L)
+      assert_eq(@core.ttl_days_of(policy, b"hot", None, None), 2L)
+      assert_eq(@core.ttl_days_of(policy, b"cold", None, None), -1L)
     }
     None => panic()
   }
@@ -80,7 +86,7 @@ test "ttl policy rejects malformed lines and supports default-less files" {
   let z = @core.parse_ttl_policy(b"level debug 0\n")
   match z {
     Some(policy) =>
-      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"debug")), 0L)
+      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"debug"), None), 0L)
     None => panic()
   }
 }
@@ -93,13 +99,13 @@ test "ttl scope matching is case-insensitive for service and level" {
   match p {
     Some(policy) => {
       // Service scope: record key `orders` still hits the `Orders` rule.
-      assert_eq(@core.ttl_days_of(policy, b"orders", None), 1L)
+      assert_eq(@core.ttl_days_of(policy, b"orders", None, None), 1L)
       // Level scope: record level `error`/`Error` hits the `ERROR` rule.
-      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"error")), 2L)
-      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"Error")), 2L)
+      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"error"), None), 2L)
+      assert_eq(@core.ttl_days_of(policy, b"k", Some(b"Error"), None), 2L)
       // Prefix scope stays byte-exact (tenant namespaces).
-      assert_eq(@core.ttl_days_of(policy, b"t/a", None), 3L)
-      assert_eq(@core.ttl_days_of(policy, b"T/a", None), -1L)
+      assert_eq(@core.ttl_days_of(policy, b"t/a", None, None), 3L)
+      assert_eq(@core.ttl_days_of(policy, b"T/a", None, None), -1L)
     }
     None => panic()
   }
@@ -123,4 +129,62 @@ test "ttl_record_level covers JSON records and level aliases (3.4)" {
   // Plain values without any level slot stay None.
   assert_true(@core.ttl_record_level(b"{\"msg\":\"no level here\"}") is None)
   assert_true(@core.ttl_record_level(b"msg=plain") is None)
+}
+
+///|
+test "service scope also matches the record's service field (3.4 fourth round)" {
+  // With an explicit --key-field (M229) the key is the caller's own id and
+  // the service name lives in the value — key-only matching silently fell
+  // back to the default for exactly those records.
+  let p = @core.parse_ttl_policy(b"default 30\nservice payments 1\n")
+  match p {
+    Some(policy) => {
+      // The value's service field hits the rule even with a foreign key.
+      assert_eq(
+        @core.ttl_days_of(policy, b"id-1", Some(b"info"), Some(b"payments")),
+        1L,
+      )
+      // Case-insensitive in the value too.
+      assert_eq(@core.ttl_days_of(policy, b"id-2", None, Some(b"Payments")), 1L)
+      // The historical key shape keeps working.
+      assert_eq(@core.ttl_days_of(policy, b"payments", None, None), 1L)
+      // Both shapes hitting the same rule stay one rule.
+      assert_eq(
+        @core.ttl_days_of(policy, b"payments", None, Some(b"PAYMENTS")),
+        1L,
+      )
+      // A different service keeps the default.
+      assert_eq(@core.ttl_days_of(policy, b"id-3", None, Some(b"other")), 30L)
+      // No service anywhere and no key hit → default.
+      assert_eq(@core.ttl_days_of(policy, b"id-4", None, None), 30L)
+    }
+    None => panic()
+  }
+}
+
+///|
+test "ttl fields cover container-wrapped records and the service slot (3.4)" {
+  // CRI/container-wrapped records (the Docker/K8s shape): the pre-round copy
+  // only flattened a leading `{`, so wrapped records missed the level rule.
+  assert_eq(
+    @core.ttl_record_level(
+      b"2026-11-25T10:00:00.123456789Z stdout F {\"level\":\"ERROR\",\"msg\":\"x\"}",
+    ),
+    Some(b"ERROR"),
+  )
+  // Trailing meta pairs merged into the field set (2.4 policy enrichment).
+  assert_eq(@core.ttl_record_level(b"level=info env=prod"), Some(b"info"))
+  // The service slot resolves through the same shared contract.
+  assert_eq(
+    @core.ttl_record_service(b"{\"service\":\"orders\",\"level\":\"warn\"}"),
+    Some(b"orders"),
+  )
+  assert_eq(@core.ttl_record_service(b"svc=payments k=v"), Some(b"payments"))
+  assert_eq(
+    @core.ttl_record_service(
+      b"2026-11-25T10:00:00Z stdout F {\"app\":\"checkout\"}",
+    ),
+    Some(b"checkout"),
+  )
+  assert_true(@core.ttl_record_service(b"plain text") is None)
 }

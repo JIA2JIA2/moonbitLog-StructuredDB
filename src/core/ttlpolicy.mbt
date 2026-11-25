@@ -142,13 +142,28 @@ fn ttl_bytes_eq_ci(a : Bytes, b : Bytes) -> Bool {
 /// when several match, the stricter (smaller) one wins; when none match, the
 /// default applies. Days < 0 mean "no matching rule and no default" — the
 /// record never expires.
-pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
+pub fn ttl_days_of(
+  policy : TtlPolicy,
+  key : Bytes,
+  level : Bytes?,
+  service : Bytes?,
+) -> Int64 {
   let mut days : Int64 = -1
   let mut hit_any = false
   for rule in policy.rules {
     let (scope, name, d) = rule
     let hit = if scope == b"service" {
-      ttl_bytes_eq_ci(key, name)
+      // A record matches the per-service rule through its service field OR
+      // its key (the pre-4th-round shape, where the schema promotion put the
+      // service name in the key). With an explicit --key-field (M229) the
+      // key is the caller's own id and the service lives in the value —
+      // matching the key alone made the per-project retention rule silently
+      // fall back to default.
+      ttl_bytes_eq_ci(key, name) ||
+      (match service {
+        Some(s) => ttl_bytes_eq_ci(s, name)
+        None => false
+      })
     } else if scope == b"level" {
       match level {
         Some(l) => ttl_bytes_eq_ci(l, name)
@@ -174,27 +189,56 @@ pub fn ttl_days_of(policy : TtlPolicy, key : Bytes, level : Bytes?) -> Int64 {
 }
 
 ///|
-/// The parsed `level` field of a record value, if present. Sources: kv pairs
-/// plus the flattened JSON object for SDK-style records (2.1) — before the
-/// flattening, JSON records carried no recognizable level and the per-level
-/// retention rule silently missed them (3.4 third round). The level slot is
-/// identified through the unified schema (2.2), so `severity_text` and
-/// friends resolve exactly like `level=` does; value matching stays
-/// case-insensitive in `ttl_days_of`.
+/// The parsed `level` field of a record value, if present. Extraction goes
+/// through the shared `value_fields` contract (3.2 fifth round) — JSON
+/// bodies, container-wrapped records (`2026-... stdout F {...}`) and
+/// trailing meta kv pairs all resolve exactly like the query filter and the
+/// inverted field columns do; the pre-4th-round copy flattened only a
+/// leading `{`, so wrapped records missed the per-level retention rule and
+/// silently fell back to default. The level slot is identified through the
+/// unified schema (2.2), so `severity_text` and friends resolve exactly like
+/// `level=` does; value matching stays case-insensitive in `ttl_days_of`.
 pub fn ttl_record_level(value : Bytes) -> Bytes? {
-  let mut found : Bytes? = None
-  let mut walk : Array[(Bytes, Bytes)] = parse_kv_pairs(value)
-  if value.length() > 0 && value.at(0).to_int() == 123 {
-    let flat : Array[(Bytes, Bytes)]? = Some(json_object_fields(value)) catch {
-      _ => None
-    }
-    match flat {
-      Some(pairs) => walk = pairs
-      None => ()
+  ttl_field_of(value, 1)
+}
+
+///|
+/// The parsed `service` field of a record value, if present — same contract
+/// as `ttl_record_level` (3.4 fourth round): per-service retention rules must
+/// hit records whose key is the caller's own id (`--key-field`) and whose
+/// service lives in the value.
+pub fn ttl_record_service(value : Bytes) -> Bytes? {
+  ttl_field_of(value, 2)
+}
+
+///|
+/// Level and service slots in one pass over the shared `value_fields`
+/// contract (3.4 fourth round): `expire_by_policy` needs both for every
+/// record, and two separate walks doubled the extraction cost of the
+/// maintenance scan. Individual slots keep resolving through
+/// `ttl_record_level` / `ttl_record_service`.
+pub fn ttl_record_slots(value : Bytes) -> (Bytes?, Bytes?) {
+  let mut level : Bytes? = None
+  let mut service : Bytes? = None
+  for pair in value_fields(value) {
+    let slot = canonical_field(pair.0)
+    if slot == 1 {
+      level = Some(pair.1)
+    } else if slot == 2 {
+      service = Some(pair.1)
     }
   }
-  for pair in walk {
-    if canonical_field(pair.0) == 1 {
+  (level, service)
+}
+
+///|
+/// Slot-resolving field extraction shared by the TTL rules: `slot` 1 is the
+/// level, 2 the service (the unified-schema map). Last match wins, matching
+/// the query filter's `--field` behavior.
+fn ttl_field_of(value : Bytes, slot : Int32) -> Bytes? {
+  let mut found : Bytes? = None
+  for pair in value_fields(value) {
+    if canonical_field(pair.0) == slot {
       found = Some(pair.1)
     }
   }

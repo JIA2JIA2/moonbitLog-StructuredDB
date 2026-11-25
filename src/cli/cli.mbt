@@ -38,11 +38,12 @@
 ///   ttl-expire <dir> [--dry-run] [--json]
 ///                                    differentiated-TTL expiry per <dir>/TTL
 ///                                    (default/service/level rules); applied
-///                                    runs append to TTL_AUDIT.log
+///                                    runs append to TTL_AUDIT
 ///   ttl-audit <dir> [--since ms] [--until ms] [--limit N]
 ///              [--json] [--verify]   query the TTL_AUDIT trail (events,
-///                                    trigger, counts, policy); --verify
-///                                    reports line integrity
+///                                    trigger, counts, policy); rotations
+///                                    (TTL_AUDIT.N) are included; --verify
+///                                    reports line and chain integrity
 ///   replicate <src> <dst> [--follow]
 ///                                    incrementally mirror the source log into
 ///                                    a complete replica directory (--follow
@@ -2771,6 +2772,11 @@ fn cmd_prune_before(dir : String, ts : String) -> Unit raise @io.IoError {
 /// Append a TTL expiry event to `<dir>/TTL_AUDIT` (JSONL), so retention
 /// actions stay auditable beyond the one-line command output. Atomic append
 /// (O_APPEND), so concurrent maintain passes never overwrite each other.
+/// When the live trail has outgrown the shared audit auto-rotate threshold
+/// it rotates first (3.4 fourth round): maintain appends on every pass and
+/// an unbounded TTL_AUDIT eventually outgrows the disk — the exact failure
+/// M210 fixed for the operation audit. The callers hold the directory
+/// exclusive lock, so the rotation cannot race a concurrent append.
 fn append_ttl_audit(
   dir : String,
   policy_text : String,
@@ -2779,6 +2785,7 @@ fn append_ttl_audit(
   trigger : String,
 ) -> Unit {
   let path = ttl_audit_path(dir)
+  maybe_rotate_ttl_audit(dir, path)
   let prev = audit_prev_hash(path)
   let line = "{\"ts\":" +
     now_ms().to_string() +
@@ -2816,6 +2823,58 @@ fn ttl_audit_path(dir : String) -> String {
 }
 
 ///|
+/// Rotate the TTL audit trail into `TTL_AUDIT.N` (3.4 fourth round): the
+/// same shift-and-prune scheme as the operation audit (`AUDIT.N`), with one
+/// difference — no rotate-complete event is written anywhere (the TTL trail
+/// has no actor dimension and a rotation is not a retention decision). The
+/// fresh live file starts with a reset chain head, so every rotation is an
+/// independently verifiable chain. The callers hold the directory exclusive
+/// lock.
+fn ttl_audit_rotate(dir : String, keep_n : Int32) -> Unit {
+  let base = ttl_audit_path(dir)
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  for n in names {
+    if n.has_prefix("TTL_AUDIT.") {
+      let s = @string.parse_int(n[10:n.length()].to_owned()) catch { _ => -1 }
+      if s >= keep_n {
+        ignore(@backend_native.remove_file(dir + "/" + n))
+      }
+    }
+  }
+  let mut i = keep_n - 1
+  while i >= 1 {
+    let from = base + "." + i.to_string()
+    let to = base + "." + (i + 1).to_string()
+    if @backend_native.file_exists(from) {
+      ignore(@backend_native.rename_file(from, to))
+    }
+    i = i - 1
+  }
+  if @backend_native.file_exists(base) {
+    ignore(@backend_native.rename_file(base, base + ".1"))
+  }
+  ignore(@backend_native.write_file(base, b"") catch { _ => () })
+  set_audit_chain_tail(base, (0 : UInt32))
+}
+
+///|
+/// Rotate the TTL audit trail before appending when the live file has
+/// outgrown the shared audit auto-rotate threshold (`MOONLOG_AUDIT_ROTATE_BYTES`,
+/// 64 MiB default, 0 disables — one env governs both trails so neither can
+/// be quietly unbounded). Best effort: a failed stat or rotation never
+/// blocks the audit write itself; the next event retries.
+fn maybe_rotate_ttl_audit(dir : String, path : String) -> Unit {
+  let cap = audit_auto_rotate_bytes()
+  if cap <= 0 {
+    return
+  }
+  let size = @backend_native.file_size(path)
+  if size >= cap {
+    ttl_audit_rotate(dir, 5)
+  }
+}
+
+///|
 /// Read-only query over `<dir>/TTL_AUDIT` (3.4 "cleanup stays auditable" —
 /// the trail used to be write-only, inspectable only by raw `cat`). Events
 /// are the JSONL lines `append_ttl_audit` writes; `--since/--until` filter on
@@ -2849,11 +2908,38 @@ fn cmd_ttl_audit(
     raise @io.IoError::Invalid("limit must be >= 1")
   }
   let path = ttl_audit_path(dir)
-  let mut lines : Array[Bytes] = []
+  // Rotated siblings (`TTL_AUDIT.N`) read oldest-first, then the live file —
+  // the order `audit_read_lines` uses, so events stay in causal order across
+  // rotations and verify walks every chain (3.4 fourth round: before this,
+  // rotation hid the history from the query and --verify alike).
+  let lines : Array[Bytes] = []
+  let chain_files : Array[String] = []
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let rotated : Array[(Int32, String)] = []
+  for n in names {
+    if n.has_prefix("TTL_AUDIT.") {
+      let s = @string.parse_int(n[10:n.length()].to_owned()) catch { _ => -1 }
+      if s > 0 {
+        rotated.push((s, n))
+      }
+    }
+  }
+  rotated.sort_by(fn(a, b) { b.0.compare(a.0) })
+  for item in rotated {
+    let data = @backend_native.read_file(dir + "/" + item.1)
+    let (rows, _) = split_complete_lines(data, true)
+    for r in rows {
+      lines.push(r)
+    }
+    chain_files.push(dir + "/" + item.1)
+  }
   if @backend_native.file_exists(path) {
     let data = @backend_native.read_file(path)
     let (rows, _) = split_complete_lines(data, true)
-    lines = rows
+    for r in rows {
+      lines.push(r)
+    }
+    chain_files.push(path)
   }
   let total = lines.length()
   let mut valid = 0
@@ -2951,7 +3037,7 @@ fn cmd_ttl_audit(
   if json && verify {
     // 6.3 third pass: chain integrity for the TTL trail too — a middle row
     // removed or rewritten stays valid JSON but breaks its `prev` link.
-    let broken = audit_chain_check_file(ttl_audit_path(dir))
+    let broken = ttl_audit_chain_check(chain_files)
     println(
       "{\"lines\":" +
       total.to_string() +
@@ -2974,7 +3060,7 @@ fn cmd_ttl_audit(
     }
     println("[" + trimmed + "]")
   } else if verify {
-    let broken = audit_chain_check_file(ttl_audit_path(dir))
+    let broken = ttl_audit_chain_check(chain_files)
     println(
       "lines " +
       total.to_string() +
@@ -2994,6 +3080,22 @@ fn cmd_ttl_audit(
       "(" + shown.to_string() + " events, " + total.to_string() + " lines)",
     )
   }
+}
+
+///|
+/// Chain integrity across every file of the TTL audit trail (3.4 fourth
+/// round): each rotation is an independently verifiable chain (the fresh
+/// live file starts with a reset chain head), so `--verify` walks all of
+/// them oldest-first and reports the first broken row; -1 when every chain
+/// holds.
+fn ttl_audit_chain_check(files : Array[String]) -> Int32 {
+  for f in files {
+    let broken = audit_chain_check_file(f)
+    if broken >= 0 {
+      return broken
+    }
+  }
+  -1
 }
 
 ///|

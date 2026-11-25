@@ -105,9 +105,13 @@ pub fn shell_quote(String) -> String
 
 pub fn slice(Bytes, Int32, Int32) -> Bytes
 
-pub fn ttl_days_of(TtlPolicy, Bytes, Bytes?) -> Int64
+pub fn ttl_days_of(TtlPolicy, Bytes, Bytes?, Bytes?) -> Int64
 
 pub fn ttl_record_level(Bytes) -> Bytes?
+
+pub fn ttl_record_service(Bytes) -> Bytes?
+
+pub fn ttl_record_slots(Bytes) -> (Bytes?, Bytes?)
 
 pub fn value_fields(Bytes) -> Array[(Bytes, Bytes)]
 

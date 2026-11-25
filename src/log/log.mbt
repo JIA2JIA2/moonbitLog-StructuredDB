@@ -630,11 +630,11 @@ pub fn[W, R : @io.LogReader] Log::expire_by_policy(
     } else {
       let mut all_expired = true
       seg.for_each(seg.base_offset, seg.next_offset, rec => {
-        let days = @core.ttl_days_of(
-          policy,
-          rec.key,
-          @core.ttl_record_level(rec.value),
-        )
+        // Both rule dimensions resolve in one pass over the value (3.4
+        // fourth round): two separate extractions doubled the cost of the
+        // maintenance scan on every record.
+        let (level, service) = @core.ttl_record_slots(rec.value)
+        let days = @core.ttl_days_of(policy, rec.key, level, service)
         // A negative age means "keep forever" (no matching rule and no
         // default retention); treating it as an age would mark every record
         // expired. Quota-only policies rely on this: an unscoped tenant's
