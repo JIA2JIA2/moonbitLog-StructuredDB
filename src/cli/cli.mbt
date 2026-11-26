@@ -14399,6 +14399,15 @@ fn global_only_cmd(cmd : String) -> Bool {
     "prune-bytes", "prune-before", "prune-expired", "prune-superseded", "compress",
     "tier", "import", "maintain", "ttl-expire", "fsck", "selfmon", "serve", "rbac",
     "quota",
+    // Store-wide aggregate reads (6.1 fourth pass): `stats` and `partitions`
+    // report record/byte totals and per-segment time spans for the WHOLE
+    // directory — the exact tenant-scale leakage that a scoped role must not
+    // see (team-a on a mixed proj-a/proj-b store read records=12 bytes=840
+    // including the other tenant's 7 records, while `scan` on the same
+    // directory correctly showed only its own 5). The HTTP /stats endpoint
+    // has been unscoped-only since 6.2 (M171); the CLI now matches that
+    // contract instead of diverging from it.
+     "stats", "partitions",
     // Directory-level configuration commands (6.1 third pass): they rewrite
     // PARTITION/SCHEMA/TIER/MASK/META, which governs every tenant's write
     // path — a scoped role must not reconfigure the whole directory.
