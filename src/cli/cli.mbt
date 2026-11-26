@@ -4738,6 +4738,18 @@ fn cmd_restore(
     }
     close_log(log)
   })
+  // 6.5 fifth pass: the restored copy carries the accountability trail of its
+  // own recovery. The dispatch-level audit used to write args[2] — the
+  // BACKUP directory — which polluted a read-only snapshot (its AUDIT and
+  // pin log moved past the backup point, so a second restore materialized
+  // the first restore's own event) while the directory that was actually
+  // brought back had no "was restored" trace of its own. Written after the
+  // restore completes instead: the trail and anchor log copied from the
+  // backup continue with this event, so a failover takeover is traceable on
+  // the copy that took over. Always recorded, like `rbac init` — a restore
+  // bootstraps the target, whose audit-enablement state arrives with the
+  // backup itself.
+  audit_log(dst, audit_actor(dst), "restore", "allow", "from " + src)
 }
 
 ///|
@@ -4808,11 +4820,32 @@ fn drill_audit_names(dir : String) -> Array[String] {
 }
 
 ///|
-/// Count and byte size of the audit trail files inside `dir` (6.5).
+/// Audit-trail file names for DRILL RECONCILIATION (6.5 fifth pass): the
+/// chain-walk set above deliberately excludes the `AUDIT.head` pin logs
+/// (their `size=`/`tail=` lines are not chain rows), but the reconciliation
+/// must still cover them — the pin log is what makes the restored trail's
+/// tail provable (6.3 fourth pass), so a backup that lost it must not read
+/// as a clean drill. Byte-for-byte against the restored copy, same as the
+/// trail files.
+fn drill_audit_recon_names(dir : String) -> Array[String] {
+  let names = @backend_native.list_dir(dir) catch { _ => [] }
+  let found : Array[String] = []
+  for name in names {
+    if name == "AUDIT" || name.has_prefix("AUDIT.") {
+      found.push(name)
+    }
+  }
+  found
+}
+
+///|
+/// Count and byte size of the audit trail files inside `dir` (6.5): the
+/// reconciliation set including the pin logs — the report shows the full
+/// accountability footprint the backup carries.
 fn drill_audit_stats(dir : String) -> (Int32, Int64) {
   let mut files = 0
   let mut bytes : Int64 = 0
-  for name in drill_audit_names(dir) {
+  for name in drill_audit_recon_names(dir) {
     files = files + 1
     let s = @backend_native.file_size(dir + "/" + name)
     if s > 0 {
@@ -4825,12 +4858,13 @@ fn drill_audit_stats(dir : String) -> (Int32, Int64) {
 ///|
 /// Audit-trail reconciliation for a recovery drill (6.5): "absent" when the
 /// backup carries no audit files, "ok" when the restored copy carries the
-/// identical set byte for byte, and "mismatch" otherwise — a lost rotation
-/// or a truncated trail would silently drop the accountability history a
-/// disaster recovery is supposed to preserve.
+/// identical set byte for byte, and "mismatch" otherwise — a lost rotation,
+/// a truncated trail or a dropped pin log would silently drop the
+/// accountability history (or its tail provability) that a disaster
+/// recovery is supposed to preserve.
 fn drill_audit_check(bak : String, rst : String) -> String {
-  let src_names = drill_audit_names(bak)
-  let dst_names = drill_audit_names(rst)
+  let src_names = drill_audit_recon_names(bak)
+  let dst_names = drill_audit_recon_names(rst)
   if src_names.length() == 0 && dst_names.length() == 0 {
     return "absent"
   }
@@ -16555,7 +16589,8 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     )
   } else if audit_enabled(args[2]) &&
     audit_cmd_listed(cmd) &&
-    !(cmd == "rbac" && args.length() > 3 && args[3] == "check") {
+    !(cmd == "rbac" && args.length() > 3 && args[3] == "check") &&
+    cmd != "restore" {
     audit_log(
       args[2],
       audit_actor(args[2]),

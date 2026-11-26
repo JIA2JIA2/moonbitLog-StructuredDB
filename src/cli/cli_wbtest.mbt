@@ -532,3 +532,43 @@ test "selfmon error trim keeps unparseable rows (6.4 fourth pass)" {
   assert_false(kept.contains("old"))
   remove_tree(dir)
 }
+
+///|
+test "drill audit reconciliation covers the pin log (6.5 fifth pass)" {
+  let bak = "/tmp/moonlog-wbtest-drill-head-bak"
+  let rst = "/tmp/moonlog-wbtest-drill-head-rst"
+  remove_tree(bak)
+  remove_tree(rst)
+  ignore(@backend_native.ensure_dir(bak))
+  ignore(@backend_native.ensure_dir(rst))
+  let trail = b"{\"ts\":1,\"actor\":\"local\",\"action\":\"query\"}\n"
+  let head = b"size=39 tail=abc12345\n"
+  @backend_native.write_file(bak + "/AUDIT", trail) catch {
+    _ => ()
+  }
+  @backend_native.write_file(bak + "/AUDIT.head", head) catch {
+    _ => ()
+  }
+  // Identical on both sides: ok.
+  @backend_native.write_file(rst + "/AUDIT", trail) catch {
+    _ => ()
+  }
+  @backend_native.write_file(rst + "/AUDIT.head", head) catch {
+    _ => ()
+  }
+  assert_eq(drill_audit_check(bak, rst), "ok")
+  // A backup that lost the pin log while the restored copy carries one:
+  // mismatch — without the pin log the restored trail's tail is unprovable,
+  // and the old chain-walk-only set read that state as a clean drill.
+  ignore(@backend_native.remove_file(bak + "/AUDIT.head"))
+  assert_eq(drill_audit_check(bak, rst), "mismatch")
+  // The pin log never enters the chain walk (size=/tail= lines are not
+  // chain rows) — reconciliation and walk stay separate sets.
+  @backend_native.write_file(bak + "/AUDIT.head", head) catch {
+    _ => ()
+  }
+  assert_true(drill_audit_chain_ok(bak))
+  assert_true(drill_audit_chain_ok(rst))
+  remove_tree(bak)
+  remove_tree(rst)
+}
