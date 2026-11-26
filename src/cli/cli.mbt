@@ -16528,6 +16528,26 @@ fn cmd_bench_write(
 }
 
 ///|
+/// Guard against an option word landing in a positional slot (6.5 fifth
+/// pass, review H1): `backup <dir> --json` used to take "--json" as the
+/// output path — the backup silently materialized a directory named
+/// `--json` in the process CWD (the long-untracked repo-root artifact is
+/// exactly this defect's historical output) while the caller never got the
+/// machine-readable output. Commands whose early positional slot is an
+/// output path/prefix raise here instead of consuming the option word.
+fn reject_option_as_positional(
+  cmd : String,
+  arg : String,
+  slot : String,
+) -> Unit raise @io.IoError {
+  if arg.has_prefix("--") {
+    raise @io.IoError::Invalid(
+      "missing <" + slot + "> for " + cmd + ": got " + arg,
+    )
+  }
+}
+
+///|
 fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
   if args.length() < 2 {
     println(USAGE)
@@ -16963,6 +16983,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "dst")
       let mut json = false
       for j in 4..<args.length() {
         if args[j] == "--json" {
@@ -16977,6 +16998,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "dst")
       let mut json = false
       for j in 4..<args.length() {
         if args[j] == "--json" {
@@ -18544,6 +18566,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "dst")
       let mut follow = false
       let mut allow_trim = false
       let mut i = 4
@@ -18561,6 +18584,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "file")
       let mut list = false
       let mut extract = false
       let mut into : String? = (None : String?)
@@ -18717,12 +18741,14 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "file")
       cmd_export(args[2], args[3])
     }
   } else if cmd == "export-jsonl" {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "file")
       let mut mode = "text"
       let mut json = false
       let mut prefix : String? = (None : String?)
@@ -18797,6 +18823,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "prefix")
       let mut into : String? = (None : String?)
       let mut json = false
       let mut all = false
@@ -18820,6 +18847,7 @@ fn dispatch(args : Array[String]) -> Unit raise @io.IoError {
     if args.length() < 4 {
       println(USAGE)
     } else {
+      reject_option_as_positional(cmd, args[3], "file")
       cmd_import(args[2], args[3])
     }
   } else if cmd == "rbac" {

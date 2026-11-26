@@ -572,3 +572,29 @@ test "drill audit reconciliation covers the pin log (6.5 fifth pass)" {
   remove_tree(bak)
   remove_tree(rst)
 }
+
+///|
+test "option word in a positional slot is rejected loudly (6.5 fifth pass, H1)" {
+  // The historic shape: `backup <dir> --json` took "--json" as the output
+  // path and silently materialized a repo-root directory named `--json`.
+  let mut raised = false
+  ignore(reject_option_as_positional("backup", "--json", "dst")) catch {
+    e =>
+      match e {
+        @io.IoError::Invalid(msg) => {
+          raised = true
+          assert_true(msg.contains("missing <dst> for backup"))
+        }
+        _ => ()
+      }
+  }
+  assert_true(raised)
+  // Every guarded slot rejects any option-shaped word, not just --json.
+  raised = false
+  ignore(reject_option_as_positional("purge", "--all", "prefix")) catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+  // A real path passes untouched.
+  ignore(reject_option_as_positional("backup", "/tmp/real-dst", "dst"))
+}
