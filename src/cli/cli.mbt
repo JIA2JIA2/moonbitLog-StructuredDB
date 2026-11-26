@@ -11647,18 +11647,25 @@ fn cmd_dashboard(
 /// (JSON flattened or KV), so volatile siblings (trace_id, latency, level)
 /// do not split one error shape into many templates; fall back to the raw
 /// value when no such field exists (plain-line logs keep their old shape).
+/// JSON-shaped means a bare `{...}` (first byte) **or** a wrapper-prefixed
+/// `... {...}` — the CRI/Docker/syslog production shapes that
+/// `ctx_value_fields` (3.2/M222) already tolerate on the field side. The
+/// wrapper shapes used to fall back to the raw value, whose timestamp
+/// prefix normalized the whole line into `{<str>:<str>,...}` — every
+/// distinct message collapsed into one undiscriminating template (5.2 fixed
+/// the same shape for cluster; anomalies had not picked it up). KV/plain
+/// lines keep the whole-value semantics: a KV `msg=db timeout` would stop
+/// at the first space and collapse distinct errors to one word.
 fn anomaly_error_text(
   rec : @core.Record,
   fields : Array[(Bytes, Bytes)],
 ) -> Bytes {
-  // JSON values carry whole message fields (a KV `msg=...` would stop at the
-  // first space, collapsing distinct errors to one word), so only JSON is
-  // reduced to its message; KV/plain lines keep the previous whole-value
-  // template semantics.
-  if rec.value.length() > 0 && rec.value.at(0).to_int() == 123 {
-    let names : Array[Bytes] = [
-      b"message", b"msg", b"body", b"error", b"exception", b"reason", b"detail",
-    ]
+  let names : Array[Bytes] = [
+    b"message", b"msg", b"body", b"error", b"exception", b"reason", b"detail",
+  ]
+  let is_json_shaped = rec.value.length() > 0 &&
+    (rec.value.at(0).to_int() == 123 || match_needle(rec.value, b"{", false))
+  if is_json_shaped {
     match ctx_field_from_pairs(fields, names) {
       Some(m) => m
       None => rec.value
@@ -11989,7 +11996,15 @@ fn cmd_anomalies(
     // --min-count). Total-volume z-scores miss composition shifts (one
     // pattern 4x while another drops) and the diff detector only sees
     // templates absent from the baseline, so a 4x surge on a known error
-    // used to go completely unreported.
+    // used to go completely unreported. The normalization uses the ACTUAL
+    // resolved window spans, not the --recent/--baseline parameters: with an
+    // anchored `--since/--until` window (the M169 historical drill-down
+    // shape) the resolved recent span is `recent_end - recent_start` while
+    // the parameter stayed e.g. 3600s, so a 600s drill-down window over a
+    // 4x-per-minute surge compared 40 records against an expected 60 — the
+    // spike vanished. Unanchored runs resolve to the same numbers as before.
+    let rec_span_ms = recent_end - recent_start
+    let base_span_ms = base_end - base_start
     let pspikes : Array[(Bytes, Int32, Int32, Double, Double)] = []
     for k in rec_tpl.keys() {
       match rec_tpl.get(k) {
@@ -11997,9 +12012,13 @@ fn cmd_anomalies(
           if rc >= min_cnt {
             match base_tpl.get(k) {
               Some(bc) => {
-                let expected = bc.to_double() *
-                  rec_ms.to_double() /
-                  base_ms.to_double()
+                let expected = if base_span_ms > 0 {
+                  bc.to_double() *
+                  rec_span_ms.to_double() /
+                  base_span_ms.to_double()
+                } else {
+                  0.0
+                }
                 let z = if expected > 0.0 {
                   (rc.to_double() - expected) / sqrt_double(expected)
                 } else {
