@@ -1287,8 +1287,35 @@ pub fn save_cursor(dir : String, position : UInt64) -> Unit raise @io.IoError {
 
 ///|
 /// File name of a named consumer cursor's position file (`CURSOR.<name>`).
-fn named_cursor_name(name : String) -> String {
+pub fn named_cursor_name(name : String) -> String {
   CURSOR_PREFIX + name
+}
+
+///|
+/// Remove every persisted consumer cursor in `dir` (the default `CURSOR`
+/// plus all named `CURSOR.<name>` files) and return how many were deleted.
+///
+/// Compact-style rewrites (purge, compact, compact-expired) renumber the
+/// offset space from 0, so any committed position survives the rewrite as a
+/// pointer past the new end: the consumer silently skips the renumbered
+/// records and then every record written after them — purge's own report
+/// used to claim `cursors_reset:true` without touching a single file. The
+/// rewrite paths call this right after compaction; consumers restart from 0
+/// and re-read the compacted remainder, which is the conservative direction
+/// (re-reading is safe, skipping is not).
+pub fn clear_cursor_files(dir : String) -> Int32 raise @io.IoError {
+  let mut cleared = 0
+  if file_exists(cursor_path(dir)) {
+    if remove_file(cursor_path(dir)) {
+      cleared = cleared + 1
+    }
+  }
+  for name in list_named_cursors(dir) {
+    if remove_file(dir + "/" + named_cursor_name(name)) {
+      cleared = cleared + 1
+    }
+  }
+  cleared
 }
 
 ///|

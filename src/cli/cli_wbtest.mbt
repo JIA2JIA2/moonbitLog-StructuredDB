@@ -718,3 +718,73 @@ test "option word in a positional slot is rejected loudly (6.5 fifth pass, H1)" 
   // A real path passes untouched.
   ignore(reject_option_as_positional("backup", "/tmp/real-dst", "dst"))
 }
+
+///|
+test "purge clears consumer cursors it renumbers (6.6)" {
+  let dir = "/tmp/moonlog-wbtest-purge-cursor"
+  remove_tree(dir)
+  ignore(@backend_native.ensure_dir(dir))
+  let log = @backend_native.open_log_dir(dir, 200)
+  ignore(log.append(@utf8.encode("a/1"), b"v1", 1000L))
+  ignore(log.append(@utf8.encode("a/2"), b"v2", 1001L))
+  ignore(log.append(@utf8.encode("b/1"), b"v3", 1002L))
+  log.flush()
+  @backend_native.flush_meta(dir, log)
+  close_log(log)
+  // Consumers parked past the soon-to-be-renumbered end: the default cursor
+  // and a named one. Purge compacts 3 records down to 1, so a surviving
+  // position 2/3 would point past the new end and silently skip the
+  // renumbered b/1 (new offset 0) plus everything written after it — the
+  // old report claimed `cursors_reset:true` without touching a file.
+  @backend_native.save_cursor(dir, (2 : UInt64))
+  @backend_native.save_named_cursor(dir, "worker", (3 : UInt64))
+  cmd_purge(dir, "a/", (None : String?), false, false)
+  assert_false(@backend_native.file_exists(@backend_native.cursor_path(dir)))
+  assert_false(@backend_native.file_exists(dir + "/CURSOR.worker"))
+  // A purge that matches nothing skips compaction entirely: the offset
+  // space is untouched and committed cursors survive intact.
+  @backend_native.save_cursor(dir, (1 : UInt64))
+  cmd_purge(dir, "nonexistent/", (None : String?), false, false)
+  assert_true(@backend_native.file_exists(@backend_native.cursor_path(dir)))
+  assert_eq(@backend_native.load_cursor(dir), (1 : UInt64))
+  remove_tree(dir)
+}
+
+///|
+test "compact rewrites clear cursors, import keeps them (6.6)" {
+  let dir = "/tmp/moonlog-wbtest-compact-cursor"
+  let blob = dir + "-blob.bin"
+  remove_tree(dir)
+  ignore(@backend_native.ensure_dir(dir))
+  let log = @backend_native.open_log_dir(dir, 200)
+  ignore(log.append(b"k1", b"v1", 1000L))
+  ignore(log.append(b"k2", b"v2", 1001L))
+  log.flush()
+  @backend_native.flush_meta(dir, log)
+  close_log(log)
+  // compact replays the live snapshot into a renumbered offset space: the
+  // cursor must go, or a consumer parked at 1 skips the rewritten records.
+  @backend_native.save_cursor(dir, (1 : UInt64))
+  cmd_compact(dir)
+  assert_false(@backend_native.file_exists(@backend_native.cursor_path(dir)))
+  // compact-expired renumbers the same way.
+  @backend_native.save_cursor(dir, (1 : UInt64))
+  cmd_compact_expired(dir, "3600000")
+  assert_false(@backend_native.file_exists(@backend_native.cursor_path(dir)))
+  // import_bytes appends after the existing offset space — no renumbering,
+  // no cursor loss (the old "offsets renumbered" warning described a
+  // rewrite that never happens).
+  let src = @backend_native.open_log_dir(dir, 200)
+  let data = src.export_bytes()
+  @backend_native.flush_meta(dir, src)
+  close_log(src)
+  @backend_native.write_file(blob, data) catch {
+    _ => ()
+  }
+  @backend_native.save_cursor(dir, (1 : UInt64))
+  cmd_import(dir, blob)
+  assert_true(@backend_native.file_exists(@backend_native.cursor_path(dir)))
+  assert_eq(@backend_native.load_cursor(dir), (1 : UInt64))
+  ignore(@backend_native.remove_file(blob))
+  remove_tree(dir)
+}

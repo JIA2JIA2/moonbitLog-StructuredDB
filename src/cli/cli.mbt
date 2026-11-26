@@ -3829,8 +3829,16 @@ fn cmd_compact(dir : String) -> Unit raise @io.IoError {
       seg.writer.close()
     })
     @backend_native.flush_meta(dir, log)
+    // Compaction replays the live snapshot into a renumbered offset space,
+    // so committed cursor positions point past the new end (6.6): clearing
+    // the files makes consumers restart from 0 instead of silently skipping.
+    let cleared = @backend_native.clear_cursor_files(dir)
     println("compacted " + n.to_string() + " records")
-    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
+    println(
+      "cursors cleared: " +
+      cleared.to_string() +
+      " file(s) (offsets renumbered; consumers restart from 0)",
+    )
     close_log(log)
     quota_recalc_storage_quiet(dir)
   })
@@ -3851,8 +3859,15 @@ fn cmd_compact_expired(dir : String, ttl : String) -> Unit raise @io.IoError {
       seg.writer.close()
     })
     @backend_native.flush_meta(dir, log)
+    // Same cursor rule as compact: the rewrite renumbers the offset space,
+    // so committed positions would silently skip the renumbered records.
+    let cleared = @backend_native.clear_cursor_files(dir)
     println("compacted " + n.to_string() + " records")
-    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
+    println(
+      "cursors cleared: " +
+      cleared.to_string() +
+      " file(s) (offsets renumbered; consumers restart from 0)",
+    )
     close_log(log)
     quota_recalc_storage_quiet(dir)
   })
@@ -4414,7 +4429,11 @@ fn cmd_export_jsonl(
       // Machine-readable export report (M216): the verification facts a
       // consumer needs to assert on — how many records the file holds, the
       // resolved epoch-ms window, and the mode — so the parseability of the
-      // produced file can be checked programmatically.
+      // produced file can be checked programmatically. Unbounded ends report
+      // null (6.6): the raw sentinels (0 / i64 max) parse back as 1970 or a
+      // meaningless far future under every downstream ms parser.
+      let from_json = if lo_ts > 0 { lo_ts.to_string() } else { "null" }
+      let until_json = if hi_ts < TS_MAX { hi_ts.to_string() } else { "null" }
       println(
         "{\"exported\":" +
         count.to_string() +
@@ -4423,9 +4442,9 @@ fn cmd_export_jsonl(
         "\",\"mode\":\"" +
         mode +
         "\",\"window_from\":" +
-        lo_ts.to_string() +
+        from_json +
         ",\"window_until\":" +
-        hi_ts.to_string() +
+        until_json +
         "}",
       )
     } else {
@@ -4440,10 +4459,13 @@ fn cmd_import(dir : String, file : String) -> Unit raise @io.IoError {
   run_locked(dir, true, () => {
     let data = @backend_native.read_file(file)
     let log = open_log(dir)
+    // import_bytes APPENDS after the existing offset space (unlike the
+    // compact-style rewrites), so committed cursors stay valid and no
+    // renumbering warning belongs here — the old one described a rewrite
+    // that never happens.
     let n = log.import_bytes(data)
     @backend_native.flush_meta(dir, log)
     println("imported " + n.to_string() + " records")
-    println("warning: offsets renumbered; reset any cursors (cursor-commit 0)")
     close_log(log)
     // 6.2: imported records land inside tenant scopes without passing the
     // write path, so refresh the storage ledgers right away instead of
@@ -4544,14 +4566,29 @@ fn cmd_purge(
       None => ()
     }
     // Erase: tombstone every matched key, then physically compact so the
-    // records and their tombstones leave the segment files.
+    // records and their tombstones leave the segment files. Compaction
+    // renumbers the offset space from 0 unconditionally (it replays the
+    // live snapshot), so committed consumer cursors must go with it (6.6
+    // eighth pass): a surviving position points past the new end and the
+    // consumer silently skips the renumbered remainder plus every record
+    // written after it — the purge report used to claim `cursors_reset:true`
+    // without touching a single cursor file, so a compliance erase quietly
+    // blinded the very consumers that were still running. With no matched
+    // keys there are no tombstones to reclaim and compaction is skipped
+    // entirely: the offset space, and every cursor, stay untouched.
+    let mut cursors_cleared = 0
+    let mut live = 0
     if keys.length() > 0 {
       ignore(log.delete_many(keys, now))
+      live = log.compact(on_drop=seg => {
+        @backend_native.remove_segment_files(dir, seg.base_offset)
+        seg.writer.close()
+      })
+      cursors_cleared = @backend_native.clear_cursor_files(dir)
+    } else {
+      // Same definition compact reports: the live (non-deleted, latest) view.
+      live = log.snapshot().length()
     }
-    let live = log.compact(on_drop=seg => {
-      @backend_native.remove_segment_files(dir, seg.base_offset)
-      seg.writer.close()
-    })
     @backend_native.flush_meta(dir, log)
     // Verify (6.6): after compaction nothing matching the prefix remains.
     let mut remaining = 0
@@ -4588,7 +4625,9 @@ fn cmd_purge(
         live.to_string() +
         ",\"remaining\":" +
         remaining.to_string() +
-        ",\"cursors_reset\":true}",
+        ",\"cursors_cleared\":" +
+        cursors_cleared.to_string() +
+        "}",
       )
     } else {
       println("PURGE status=" + status)
@@ -4619,9 +4658,13 @@ fn cmd_purge(
         remaining.to_string() +
         " (prefix scan after physical compaction)",
       )
-      println(
-        "warning: offsets renumbered; reset any cursors (cursor-commit 0)",
-      )
+      if keys.length() > 0 {
+        println(
+          "cursors cleared: " +
+          cursors_cleared.to_string() +
+          " file(s) (offset space renumbered by compaction; consumers restart from 0)",
+        )
+      }
     }
     quota_recalc_storage_quiet(dir)
   })
