@@ -2898,11 +2898,23 @@ fn append_ttl_audit(
     prev +
     "\"}\n"
   let body = @utf8.encode(line)
-  ignore(@backend_native.append_file(path, body) catch { _ => () })
-  set_audit_chain_tail(
-    path,
-    @core.crc32(@core.slice(body, 0, body.length() - 1)),
-  )
+  let ok : Bool = match
+    (Some(@backend_native.append_file(path, body)) catch { _ => None }) {
+    Some(_) => true
+    None => false
+  }
+  // Roll the in-process chain tail only when the bytes actually landed:
+  // rolling after a failed append would make the next event link to a tail
+  // that does not exist, i.e. guarantee a broken chain. The size mirrors the
+  // cache-freshness contract of audit_prev_hash (append_file creates the
+  // file, so a successful append means the file now ends at body.length()).
+  if ok {
+    set_audit_chain_tail(
+      path,
+      @backend_native.file_size(path),
+      @core.crc32(@core.slice(body, 0, body.length() - 1)),
+    )
+  }
 }
 
 ///|
@@ -2949,7 +2961,9 @@ fn ttl_audit_rotate(dir : String, keep_n : Int32) -> Unit {
     ignore(@backend_native.rename_file(base, base + ".1"))
   }
   ignore(@backend_native.write_file(base, b"") catch { _ => () })
-  set_audit_chain_tail(base, (0 : UInt32))
+  // The TTL trail has no tail anchor (the anchor guards the operation-audit
+  // trail, whose verify reports it); its chain walk stays row-relative.
+  set_audit_chain_tail(base, (0 : Int64), (0 : UInt32))
 }
 
 ///|
@@ -4778,11 +4792,15 @@ fn drill_sidecar_stats(dir : String) -> (Int32, Int64) {
 /// File names of the audit trail inside `dir` (6.5): the live `AUDIT` plus
 /// its rotated `AUDIT.N` siblings. These travel with a backup, so a recovery
 /// drill can reconcile the restored copy's accountability history.
+/// `AUDIT.head` (the 6.3 fourth-pass tail anchor) travels with the backup
+/// too, but it is not a chain file — it must not enter the drill's chain
+/// walk, which would read `rows=...` lines as (invalid) events.
 fn drill_audit_names(dir : String) -> Array[String] {
   let names = @backend_native.list_dir(dir) catch { _ => [] }
   let found : Array[String] = []
   for name in names {
-    if name == "AUDIT" || name.has_prefix("AUDIT.") {
+    if name == "AUDIT" ||
+      (name.has_prefix("AUDIT.") && !name.has_suffix(".head")) {
       found.push(name)
     }
   }
@@ -14489,6 +14507,11 @@ let audit_cmds : Array[String] = [
   // 6.3 third pass: destructive repair, data replication and bulk restore
   // are key operations — they move, isolate or re-append whole segments.
    "fsck", "replicate", "import",
+  // 6.3 fourth pass: bench-write is a write operation (bench: prefix) that
+  // M209 wired into quotas and M208 into whole-index RBAC, but it never
+  // made this list — bulk benchmark writes left no trail at all. A benchmark
+  // that can shift tenant quotas and record counts is a key operation.
+   "bench-write",
 ]
 
 ///|
@@ -14597,35 +14620,43 @@ fn crc32_hex(v0 : UInt32) -> String {
 }
 
 ///|
-/// In-process chain tail cache: (audit path, CRC32 hex of its last complete
-/// line). Refreshed by every append in this process; rotation resets the
-/// entry so the fresh trail starts a new chain. Cross-process appends are
-/// handled by re-reading the tail on a cache miss.
-let audit_chain_cache : Array[(String, String)] = []
+/// In-process chain tail cache: (audit path, file size at cache time, CRC32
+/// hex of its last complete line). Refreshed by every append in this
+/// process; rotation resets the entry so the fresh trail starts a new chain.
+/// The size is the freshness probe: another long-lived process (the HTTP
+/// gateway records denials while operator CLI commands append to the same
+/// AUDIT) may have grown the file since our last append — trusting the cached
+/// hex then would link a new event to a tail that is no longer the last row,
+/// and the next `audit --verify` would report a broken chain that nobody
+/// broke. Cross-process appends are handled by re-reading the tail on a
+/// size mismatch or a cache miss.
+let audit_chain_cache : Array[(String, Int64, String)] = []
 
 ///|
-fn set_audit_chain_tail(path : String, crc : UInt32) -> Unit {
+fn set_audit_chain_tail(path : String, size : Int64, crc : UInt32) -> Unit {
   let hex = crc32_hex(crc)
   let mut i = 0
   while i < audit_chain_cache.length() {
     if audit_chain_cache[i].0 == path {
-      audit_chain_cache[i] = (path, hex)
+      audit_chain_cache[i] = (path, size, hex)
       return
     }
     i = i + 1
   }
-  audit_chain_cache.push((path, hex))
+  audit_chain_cache.push((path, size, hex))
 }
 
 ///|
 /// CRC32-hex of the audit file's last complete line — the `prev` the next
 /// event links to (`00000000` when the file is empty). The in-process cache
-/// keeps consecutive appends O(1); a miss re-reads the file, whose size is
-/// bounded by the auto-rotate cap.
+/// keeps consecutive appends O(1) as long as the file has not grown under
+/// us; a miss (or a size mismatch — the file was appended by another
+/// process) re-reads the file, whose size is bounded by the auto-rotate cap.
 fn audit_prev_hash(path : String) -> String {
+  let sz = @backend_native.file_size(path)
   for entry in audit_chain_cache {
-    if entry.0 == path {
-      return entry.1
+    if entry.0 == path && entry.1 == sz {
+      return entry.2
     }
   }
   let data = @backend_native.read_file(path)
@@ -14635,7 +14666,7 @@ fn audit_prev_hash(path : String) -> String {
     end = end - 1
   }
   if end == 0 {
-    set_audit_chain_tail(path, (0 : UInt32))
+    set_audit_chain_tail(path, n.to_int64(), (0 : UInt32))
     return "00000000"
   }
   let mut start = end
@@ -14643,7 +14674,11 @@ fn audit_prev_hash(path : String) -> String {
     start = start - 1
   }
   let hex = crc32_hex(@core.crc32(@core.slice(data, start, end)))
-  set_audit_chain_tail(path, @core.crc32(@core.slice(data, start, end)))
+  set_audit_chain_tail(
+    path,
+    n.to_int64(),
+    @core.crc32(@core.slice(data, start, end)),
+  )
   hex
 }
 
@@ -14670,10 +14705,14 @@ fn audit_rotate_locked(dir : String, keep_n : Int32) -> Unit {
   let base = audit_path(dir)
   let names = @backend_native.list_dir(dir) catch { _ => [] }
   for n in names {
-    if n.has_prefix("AUDIT.") {
+    if n.has_prefix("AUDIT.") && !n.has_suffix(".head") {
       let s = @string.parse_int(n[6:n.length()].to_owned()) catch { _ => -1 }
       if s >= keep_n {
         ignore(@backend_native.remove_file(dir + "/" + n))
+        // The pin log follows its trail; pruning a rotation prunes its pins.
+        if @backend_native.file_exists(dir + "/" + n + ".head") {
+          ignore(@backend_native.remove_file(dir + "/" + n + ".head"))
+        }
       }
     }
   }
@@ -14689,8 +14728,18 @@ fn audit_rotate_locked(dir : String, keep_n : Int32) -> Unit {
   if @backend_native.file_exists(base) {
     ignore(@backend_native.rename_file(base, base + ".1"))
   }
+  // The pin log follows its trail: AUDIT.head -> AUDIT.1.head, so the
+  // archived trail keeps its pins and verify --all can still check them.
+  if @backend_native.file_exists(audit_anchor_path(base)) {
+    ignore(
+      @backend_native.rename_file(
+        audit_anchor_path(base),
+        audit_anchor_path(base + ".1"),
+      ),
+    )
+  }
   ignore(@backend_native.write_file(base, b"") catch { _ => () })
-  set_audit_chain_tail(base, (0 : UInt32))
+  set_audit_chain_tail(base, (0 : Int64), (0 : UInt32))
   audit_log(
     dir,
     audit_actor(dir),
@@ -14756,13 +14805,22 @@ fn audit_log(
     prev +
     "\"}\n"
   let body = @utf8.encode(line)
-  ignore(@backend_native.append_file(path, body) catch { _ => () })
-  // Roll the in-process chain tail: the next event in this process links to
-  // this line without re-reading the file (CRC of the line without its \n).
-  set_audit_chain_tail(
-    path,
-    @core.crc32(@core.slice(body, 0, body.length() - 1)),
-  )
+  let ok : Bool = match
+    (Some(@backend_native.append_file(path, body)) catch { _ => None }) {
+    Some(_) => true
+    None => false
+  }
+  // Roll the in-process chain tail and bump the tail anchor only when the
+  // bytes actually landed: rolling after a failed append would make the next
+  // event link to a tail that does not exist (a guaranteed broken chain),
+  // and an anchor claiming a row that was never written would fail the next
+  // verify. The cached size mirrors the file's post-append extent, which is
+  // the freshness probe audit_prev_hash trusts.
+  if ok {
+    let crc = @core.crc32(@core.slice(body, 0, body.length() - 1))
+    set_audit_chain_tail(path, @backend_native.file_size(path), crc)
+    audit_anchor_bump(path, crc32_hex(crc))
+  }
 }
 
 ///|
@@ -15431,17 +15489,22 @@ fn audit_read_lines(dir : String, all : Bool) -> (Array[String], Int32) {
 }
 
 ///|
-/// Walk one audit file's `prev` chain (6.3 third pass): returns -1 when
-/// every link holds, else the 1-based index of the first row whose `prev`
-/// does not match the running CRC32 of the preceding row. Rows without a
-/// `prev` field (legacy events written before the chain existed) skip the
-/// check but still feed the running CRC, so old trails stay verifiable as
-/// chained events append after them.
-fn audit_chain_check_file(path : String) -> Int32 {
+/// Walk one audit file's `prev` chain with statistics (6.3 fourth pass):
+/// returns `(first broken row or -1, non-empty row count, CRC32 hex of the
+/// last row)`. The last two feed the tail-anchor check — a chain links each
+/// row to its predecessor, but it only proves what the surviving rows claim:
+/// truncating the last N rows or rewriting the final row leaves every
+/// remaining link valid, and the next append links to the rewritten row, so
+/// the tampered state continues to verify. Rows without a `prev` field
+/// (legacy events written before the chain existed) skip the check but still
+/// feed the running CRC, so old trails stay verifiable as chained events
+/// append after them.
+fn audit_chain_stats(path : String) -> (Int32, Int64, String) {
   let data = @backend_native.read_file(path)
   let n = data.length()
   let mut expected = "00000000"
   let mut idx : Int32 = 0
+  let mut last_hex = "00000000"
   let mut start = 0
   while start < n {
     let mut e = start
@@ -15462,13 +15525,156 @@ fn audit_chain_check_file(path : String) -> Int32 {
       }
     }
     match row_prev {
-      Some(p) => if p != expected { return idx }
+      Some(p) => if p != expected { return (idx, idx.to_int64(), last_hex) }
       None => ()
     }
     expected = crc32_hex(@core.crc32(row))
+    last_hex = expected
     start = e + 1
   }
-  -1
+  (-1, idx.to_int64(), last_hex)
+}
+
+///|
+/// Chain-only walk (the historical entry point): -1 when every link holds,
+/// else the 1-based index of the first row whose `prev` does not match the
+/// running CRC32 of the preceding row.
+fn audit_chain_check_file(path : String) -> Int32 {
+  audit_chain_stats(path).0
+}
+
+///|
+/// Tail anchor for the live operation-audit trail (6.3 fourth pass):
+/// the chain's `prev` links only anchor a row to its predecessor — a chain
+/// head of `00000000` pins the beginning of the file, nothing pins the end.
+/// `AUDIT.head` is an append-only pin log: one `size=<bytes> tail=<crc>`
+/// line per append, where size is the trail's extent right after that
+/// append and tail is the CRC of the row ending there. `audit --verify`
+/// re-derives every pin, so the trail cannot shrink (truncation) and no
+/// already-pinned row can be rewritten without the check failing — and
+/// because the pin log is append-only, a later legitimate append never
+/// washes out evidence of an earlier tamper (a single overwrite-anchor
+/// would: the verify command's own audit event would re-pin over it).
+/// The byte offset beats a row count: the size is read straight off the
+/// file after the append (O(1), no arithmetic to drift), and a row appended
+/// by a foreign writer that does not pin only ever moves the file *past*
+/// the last pin — the safe direction verify reports as lag. The head file
+/// travels with backups (the `AUDIT.*` name family is carried by
+/// is_backup_file) and its rotated siblings (`AUDIT.N.head`) follow their
+/// trail on rotation. The TTL trail deliberately has no anchor (its walk
+/// stays row-relative).
+fn audit_anchor_path(base : String) -> String {
+  base + ".head"
+}
+
+///|
+/// Parse `<AUDIT>.head` (or a rotated sibling's) into its pin sequence
+/// `(size, tail_hex)` in append order; empty when the file is absent.
+/// Malformed lines are skipped — the remaining pins still verify, and a
+/// head file so broken that no pin survives reads as absent (verify reports
+/// the trail as unpinned rather than inventing a failure it cannot locate).
+fn audit_anchor_pins(base : String) -> Array[(Int64, String)] {
+  let path = audit_anchor_path(base)
+  if !@backend_native.file_exists(path) {
+    return []
+  }
+  let data = @backend_native.read_file(path)
+  let n = data.length()
+  let pins : Array[(Int64, String)] = []
+  let mut start = 0
+  while start < n {
+    let mut e = start
+    while e < n && data.at(e).to_int() != 10 {
+      e = e + 1
+    }
+    if e > start {
+      let mut size : Int64 = -1L
+      let mut tail = ""
+      for pair in @core.parse_kv_pairs(@core.slice(data, start, e)) {
+        if pair.0 == b"size" {
+          size = @string.parse_int64(@utf8.decode_lossy(pair.1)) catch {
+            _ => -1L
+          }
+        } else if pair.0 == b"tail" {
+          tail = @utf8.decode_lossy(pair.1)
+        }
+      }
+      if size >= 0 && tail.length() == 8 {
+        pins.push((size, tail))
+      }
+    }
+    start = e + 1
+  }
+  pins
+}
+
+///|
+/// CRC32 hex of the row that ends at byte offset `size` in an audit trail:
+/// a pin records the file extent right after an append, so that offset is
+/// the appended row's trailing newline. A file that grew past the pin pins
+/// the same row; a file where the offset is no longer a row end (bytes
+/// inserted/deleted) pins nothing — exactly the tampering evidence.
+/// Returns "" when `size` is out of range or not at a row boundary.
+fn audit_anchor_pinned_crc(data : Bytes, size : Int64) -> String {
+  let n = size.to_int()
+  if n <= 0 || n > data.length() {
+    return ""
+  }
+  if data.at(n - 1).to_int() != 10 {
+    return ""
+  }
+  let mut start = n - 1
+  while start > 0 && data.at(start - 1).to_int() != 10 {
+    start = start - 1
+  }
+  crc32_hex(@core.crc32(@core.slice(data, start, n - 1)))
+}
+
+///|
+/// Non-empty rows after the last pinned offset — the lag a verify shows
+/// when the file grew past the anchor (a foreign writer appending without
+/// pinning, or the crash window between the trail append and its pin).
+/// Returns -1 when `size` is past the file (the trail shrank under the pin
+/// log — truncation).
+fn audit_anchor_lag_rows(data : Bytes, size : Int64) -> Int64 {
+  let n = data.length()
+  let mut start = size.to_int()
+  if start > n {
+    return -1L
+  }
+  let mut rows : Int64 = 0L
+  while start < n {
+    let mut e = start
+    while e < n && data.at(e).to_int() != 10 {
+      e = e + 1
+    }
+    if e > start {
+      rows = rows + 1L
+    }
+    start = e + 1
+  }
+  rows
+}
+
+///|
+/// Pin the trail after a successful append: one line into the append-only
+/// pin log with the file's extent right now (read off the file, exact even
+/// when earlier pins lag behind) and the new last row's CRC. O_APPEND keeps
+/// concurrent pinners atomic, and the size can only be read at or beyond
+/// the previous pin, so racing appenders can only leave pins *behind* the
+/// file (verify reports the lag) — a pin ahead of the file means bytes went
+/// missing. Best effort, same as the append itself.
+fn audit_anchor_bump(base : String, tail_hex : String) -> Unit {
+  let size = @backend_native.file_size(base)
+  if size < 0 {
+    return
+  }
+  let text = "size=" + size.to_string() + " tail=" + tail_hex + "\n"
+  ignore(
+    @backend_native.append_file(audit_anchor_path(base), @utf8.encode(text)) catch {
+      _ => ()
+    },
+  )
 }
 
 ///|
@@ -15602,11 +15808,72 @@ fn cmd_audit(
     }
     let mut chain_ok = true
     let mut chain_where = ""
+    // Tail anchor (6.3 fourth pass): the live trail's AUDIT.head pins the
+    // row count and the last row's CRC as of the last append, so truncating
+    // the tail or rewriting the final row fails verify even though every
+    // remaining link holds. Rotated siblings are closed trails — they never
+    // grow again and their anchor state belongs to the live file — so only
+    // the live trail is anchor-checked.
+    let live = audit_path(dir)
+    let mut anchor_state = "absent"
+    let mut anchor_bytes : Int64 = -1L
+    let mut anchor_lag : Int64 = -1L
     for p in chain_paths {
-      let broken = audit_chain_check_file(p)
-      if broken >= 0 {
-        chain_ok = false
-        chain_where = p + "#" + broken.to_string()
+      if p == live {
+        let (broken, actual_rows, tail_hex) = audit_chain_stats(p)
+        if broken >= 0 {
+          chain_ok = false
+          chain_where = p + "#" + broken.to_string()
+        } else if @backend_native.file_exists(audit_anchor_path(p)) {
+          let pins = audit_anchor_pins(p)
+          if pins.length() == 0 {
+            anchor_state = "unreadable"
+            chain_ok = false
+            chain_where = p + "#anchor"
+          } else {
+            let data = @backend_native.read_file(p)
+            anchor_state = "anchored"
+            anchor_lag = 0L
+            let mut k = 0
+            while k < pins.length() {
+              let (size, tail) = pins[k]
+              anchor_bytes = size
+              let pinned = audit_anchor_pinned_crc(data, size)
+              if pinned != tail {
+                // "" means the pinned offset is out of range (the trail was
+                // truncated) or no longer a row end (bytes inserted, or the
+                // pinned row rewritten in place); any other mismatch means
+                // the row ending there was replaced. Because the pin log is
+                // append-only, later events never wash an earlier pin out —
+                // a tamper stays provable no matter how much is appended
+                // after it.
+                anchor_state = if data.length() < size.to_int() {
+                  "truncated"
+                } else {
+                  "mismatch"
+                }
+                chain_ok = false
+                chain_where = p + "#anchor@" + (k + 1).to_string()
+                break
+              }
+              k = k + 1
+            }
+            if anchor_state == "anchored" {
+              anchor_lag = audit_anchor_lag_rows(
+                data,
+                pins[pins.length() - 1].0,
+              )
+            }
+          }
+        }
+        ignore(actual_rows)
+        ignore(tail_hex)
+      } else {
+        let broken = audit_chain_check_file(p)
+        if broken >= 0 {
+          chain_ok = false
+          chain_where = p + "#" + broken.to_string()
+        }
       }
     }
     if json {
@@ -15625,6 +15892,12 @@ fn cmd_audit(
         latest.to_string() +
         ",\"chain_ok\":" +
         (if chain_ok { "true" } else { "false" }) +
+        ",\"anchor\":\"" +
+        anchor_state +
+        "\",\"anchor_bytes\":" +
+        anchor_bytes.to_string() +
+        ",\"anchor_lag\":" +
+        anchor_lag.to_string() +
         ",\"chain_broken\":\"" +
         chain_where +
         "\"}",
@@ -15648,7 +15921,23 @@ fn cmd_audit(
           "empty"
         }) +
         " chain=" +
-        (if chain_ok { "ok" } else { "broken(" + chain_where + ")" }),
+        (if chain_ok { "ok" } else { "broken(" + chain_where + ")" }) +
+        " tail=" +
+        (if anchor_state == "anchored" {
+          if anchor_lag > (0 : Int64) {
+            "anchored(lag " + anchor_lag.to_string() + " events)"
+          } else {
+            "anchored"
+          }
+        } else if anchor_state == "mismatch" {
+          "mismatch(anchor " + anchor_bytes.to_string() + " bytes)"
+        } else if anchor_state == "truncated" {
+          "truncated(anchor " + anchor_bytes.to_string() + " bytes)"
+        } else if anchor_state == "unreadable" {
+          "unreadable"
+        } else {
+          "absent"
+        }),
       )
     }
     return

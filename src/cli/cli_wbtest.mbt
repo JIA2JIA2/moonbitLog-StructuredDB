@@ -289,3 +289,145 @@ test "parse_duration_ms: plain numbers stay raw, time-unit suffixes scale to ms 
   assert_eq(parse_duration_ms("abc"), None)
   assert_eq(parse_duration_ms(""), None)
 }
+
+///|
+test "audit_prev_hash re-reads the tail when another process grew the file (6.3 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-audit-h3"
+  remove_tree(dir)
+  audit_log(dir, "local", "query", "allow", "t1")
+  let base = audit_path(dir)
+  let first = audit_prev_hash(base)
+  // Simulate another process (the HTTP gateway or an operator CLI) appending
+  // to the same AUDIT: the file grew under us, so the cached tail is stale
+  // and linking to it would make the next verify report a chain nobody
+  // broke. The size probe must force a re-read.
+  let foreign = @utf8.encode(
+    "{\"ts\":1,\"actor\":\"other\",\"action\":\"query\",\"decision\":\"allow\",\"target\":\"x\",\"prev\":\"00000000\"}\n",
+  )
+  ignore(@backend_native.append_file(base, foreign) catch { _ => () })
+  let second = audit_prev_hash(base)
+  assert_true(first != second)
+  assert_eq(
+    second,
+    crc32_hex(@core.crc32(@core.slice(foreign, 0, foreign.length() - 1))),
+  )
+  // Unchanged size: the cache stays the O(1) path and returns the same hex.
+  assert_eq(audit_prev_hash(base), second)
+  remove_tree(dir)
+}
+
+///|
+test "audit_chain_stats reports row count and last-row crc (6.3 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-audit-stats"
+  remove_tree(dir)
+  audit_log(dir, "local", "query", "allow", "t1")
+  audit_log(dir, "local", "stats", "allow", "t2")
+  audit_log(dir, "local", "backup", "allow", "t3")
+  let base = audit_path(dir)
+  let (broken, rows, tail) = audit_chain_stats(base)
+  assert_eq(broken, -1)
+  assert_eq(rows, 3L)
+  // The last-row crc equals the row pinned by an anchor at the file's
+  // current extent (the anchor's byte offset marks that row's end).
+  let size = @backend_native.file_size(base)
+  assert_eq(
+    tail,
+    audit_anchor_pinned_crc(@backend_native.read_file(base), size),
+  )
+  // An offset past the end (or zero) pins nothing — an anchor claiming bytes
+  // the file no longer has is exactly the truncation evidence.
+  assert_eq(
+    audit_anchor_pinned_crc(@backend_native.read_file(base), size + 1L),
+    "",
+  )
+  assert_eq(audit_anchor_pinned_crc(@backend_native.read_file(base), 0L), "")
+  remove_tree(dir)
+}
+
+///|
+test "audit pin log: bump appends pins that track the trail (6.3 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-audit-anchor"
+  remove_tree(dir)
+  // First append: one pin at the file's extent right after the append.
+  audit_log(dir, "local", "query", "allow", "t1")
+  let base = audit_path(dir)
+  let (_, rows, tail) = audit_chain_stats(base)
+  let pins = audit_anchor_pins(base)
+  assert_eq(pins.length(), 1)
+  assert_eq(pins[0].0, @backend_native.file_size(base))
+  assert_eq(pins[0].1, tail)
+  assert_eq(rows, 1L)
+  // A second append appends a second pin: sizes strictly grow, each pin
+  // re-derives against the trail.
+  audit_log(dir, "local", "stats", "allow", "t2")
+  let pins2 = audit_anchor_pins(base)
+  assert_eq(pins2.length(), 2)
+  assert_true(pins2[1].0 > pins2[0].0)
+  let data2 = @backend_native.read_file(base)
+  for i in 0..<pins2.length() {
+    assert_eq(audit_anchor_pinned_crc(data2, pins2[i].0), pins2[i].1)
+  }
+  // The pin log travels with the trail under its AUDIT.* name.
+  assert_true(@backend_native.file_exists(base + ".head"))
+  remove_tree(dir)
+}
+
+///|
+test "audit pin log flags tail truncation, rewrite and survives later appends (6.3 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-audit-tamper"
+  remove_tree(dir)
+  audit_log(dir, "local", "query", "allow", "t1")
+  audit_log(dir, "local", "stats", "allow", "t2")
+  let base = audit_path(dir)
+  let data = @backend_native.read_file(base)
+  let (all_rows, _) = split_complete_lines(data, true)
+  assert_eq(all_rows.length(), 2)
+  let pins = audit_anchor_pins(base)
+  assert_eq(pins.length(), 2)
+  // Shape 1 — truncate the last row: the chain stays intact (this is the
+  // blind spot M210's line-level and chain checks share) but the second pin
+  // reaches past the file end.
+  let mut kept : Bytes = b""
+  for i in 0..<(all_rows.length() - 1) {
+    kept = kept + all_rows[i] + b"\n"
+  }
+  @backend_native.write_file(base, kept) catch {
+    _ => ()
+  }
+  let data1 = @backend_native.read_file(base)
+  let (broken1, rows1, _) = audit_chain_stats(base)
+  assert_eq(broken1, -1)
+  assert_eq(rows1, 1L)
+  assert_true(data1.length() < pins[1].0.to_int())
+  assert_eq(audit_anchor_pinned_crc(data1, pins[1].0), "")
+  // Shape 2 — rewrite the last row keeping its row count and prev link,
+  // then let the next legitimate event append on top: the chain re-verifies
+  // (its next append links to the rewritten row) and a single overwrite
+  // anchor would be washed out — but the pin log is append-only, so pin #2
+  // still pins the pre-tamper extent and fails the re-derivation.
+  @backend_native.write_file(base, data) catch {
+    _ => ()
+  }
+  let data2 = @backend_native.read_file(base)
+  let (rows_all, _) = split_complete_lines(data2, true)
+  let s = @utf8.decode_lossy(rows_all[1])
+  let tampered_line = s[0:s.length() - 1].to_owned() + ",\"tampered\":true}"
+  let rewritten = @utf8.decode_lossy(rows_all[0]) + "\n" + tampered_line + "\n"
+  @backend_native.write_file(base, @utf8.encode(rewritten)) catch {
+    _ => ()
+  }
+  audit_log(dir, "local", "backup", "allow", "t3")
+  let (broken2, rows2, _) = audit_chain_stats(base)
+  assert_eq(broken2, -1)
+  assert_eq(rows2, 3L)
+  let pins2 = audit_anchor_pins(base)
+  assert_eq(pins2.length(), 3)
+  let data3 = @backend_native.read_file(base)
+  // Pin #1 (over row 1, untouched) still verifies...
+  assert_eq(audit_anchor_pinned_crc(data3, pins2[0].0), pins2[0].1)
+  // ...while pin #2 (over the pre-tamper row 2) no longer re-derives: the
+  // tampered row replaced the pinned one, exactly the evidence the chain
+  // cannot produce on its own.
+  assert_true(audit_anchor_pinned_crc(data3, pins2[1].0) != pins2[1].1)
+  remove_tree(dir)
+}
