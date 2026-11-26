@@ -257,3 +257,35 @@ test "parse_ts_arg accepts epoch ms and ISO-8601 (M216)" {
   }
   assert_true(raised)
 }
+
+///|
+test "parse_duration_ms: plain numbers stay raw, time-unit suffixes scale to ms (5.5 sixth round)" {
+  // Plain numbers keep their raw value (dashboards treat the field as ms).
+  assert_eq(parse_duration_ms("42"), Some(42.0))
+  assert_eq(parse_duration_ms("0.5"), Some(0.5))
+  assert_eq(parse_duration_ms("-7.25"), Some(-7.25))
+  // Unit suffixes scale into milliseconds; sub-ms units divide so the
+  // result is the correctly-rounded nearest double (950 * 0.001 would
+  // drift into 0.9500000000000001, 950 / 1000.0 is exactly 0.95).
+  assert_eq(parse_duration_ms("42ms"), Some(42.0))
+  assert_eq(parse_duration_ms("1.2s"), Some(1200.0))
+  assert_eq(parse_duration_ms("1.5 s"), Some(1500.0))
+  assert_eq(parse_duration_ms("250us"), Some(0.25))
+  // Both micro-sign spellings (U+00B5 micro sign, U+03BC greek mu).
+  assert_eq(parse_duration_ms("950µs"), Some(0.95))
+  assert_eq(parse_duration_ms("950μs"), Some(0.95))
+  assert_eq(parse_duration_ms("1200ns"), Some(0.0012))
+  // Whitespace around the number survives.
+  assert_eq(parse_duration_ms(" 42ms "), Some(42.0))
+  assert_eq(parse_duration_ms("42 ms"), Some(42.0))
+  // Unknown suffixes and bare units stay dropped — guessing a dimension
+  // ("KB"? a bare "m" for minutes?) would poison the quantiles worse than
+  // omitting the sample.
+  assert_eq(parse_duration_ms("42MS"), None)
+  assert_eq(parse_duration_ms("42 seconds"), None)
+  assert_eq(parse_duration_ms("42KB"), None)
+  assert_eq(parse_duration_ms("ms"), None)
+  assert_eq(parse_duration_ms("s"), None)
+  assert_eq(parse_duration_ms("abc"), None)
+  assert_eq(parse_duration_ms(""), None)
+}

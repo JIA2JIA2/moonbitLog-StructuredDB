@@ -8872,6 +8872,109 @@ fn parse_timeout_ms(t : String?) -> Int64 raise @io.IoError {
 }
 
 ///|
+/// Parse a metric sample that may carry a trailing time unit — logfmt values
+/// like `latency=42ms` and JSON string attributes like `{"latency":"1.2s"}`
+/// are the production shapes, and a bare parse_double silently dropped every
+/// one of them: the dashboard trend reported "no numeric samples" while the
+/// error-rate columns of the very same panel stayed correct (5.5 sixth
+/// round). Plain numbers keep their raw value (the dashboards have always
+/// treated the field as milliseconds); a recognized unit suffix — ns, us,
+/// µs (U+00B5), μs (U+03BC), ms, s — with optional surrounding whitespace
+/// scales the number into milliseconds, so mixed unit spellings sample one
+/// distribution instead of two. Unknown suffixes stay dropped: guessing a
+/// dimension ("KB"? a bare "m" for minutes?) would poison the quantiles
+/// worse than omitting the sample.
+fn parse_duration_ms(s : String) -> Double? {
+  let plain : Double? = Some(@string.parse_double(s)) catch { _ => None }
+  match plain {
+    Some(d) => Some(d)
+    None => {
+      let n = s.length()
+      let mut end = n
+      while end > 0 {
+        let c = s[end - 1]
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+          end = end - 1
+        } else {
+          break
+        }
+      }
+      let mut unit = 0
+      let mut cut = end
+      if end >= 2 {
+        let c1 = s[end - 2]
+        let c0 = s[end - 1]
+        if c1 == 0x6D && c0 == 0x73 {
+          unit = 1
+          cut = end - 2
+        } else if (c1 == 0x75 || c1 == 0xB5 || c1 == 0x3BC) && c0 == 0x73 {
+          unit = 2
+          cut = end - 2
+        } else if c1 == 0x6E && c0 == 0x73 {
+          unit = 3
+          cut = end - 2
+        } else if c0 == 0x73 {
+          unit = 4
+          cut = end - 1
+        }
+      } else if end == 1 {
+        if s[0] == 0x73 {
+          unit = 4
+          cut = 0
+        }
+      }
+      if unit > 0 {
+        let mut start = cut
+        while start > 0 {
+          let c = s[start - 1]
+          if c == 32 || c == 9 || c == 10 || c == 13 {
+            start = start - 1
+          } else {
+            break
+          }
+        }
+        let mut head = 0
+        while head < start {
+          let c = s[head]
+          if c == 32 || c == 9 || c == 10 || c == 13 {
+            head = head + 1
+          } else {
+            break
+          }
+        }
+        if head >= start {
+          return None
+        }
+        let v : Double? = Some(
+          @string.parse_double(s.substring(start=head, end=start)),
+        ) catch {
+          _ => None
+        }
+        match v {
+          Some(d) =>
+            // Divide for the sub-ms units: 950 * 0.001 drifts into
+            // 0.9500000000000001 while 950 / 1000.0 rounds to exactly 0.95.
+            Some(
+              if unit == 1 {
+                d
+              } else if unit == 2 {
+                d / 1000.0
+              } else if unit == 3 {
+                d / 1000000.0
+              } else {
+                d * 1000.0
+              },
+            )
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
 /// Max concurrent queries per directory (4.6): enforced with flock slots on
 /// `<dir>/QLOCK.<i>`; a query that cannot get a slot within the lock timeout
 /// is rejected. Default 4; override with `MOONLOG_MAX_CONCURRENT_QUERIES`.
@@ -10321,7 +10424,7 @@ fn top_counts(
 /// `--json` emits the buckets as JSON.
 
 ///|
-/// Nearest-rank percentile of a sorted array: `vals[ceil(q*n)-1]`, clamped
+/// Nearest-rank percentile of a sorted array: `vals[ceil(q*n]-1]`, clamped
 /// into range (zero dependency — no ceil/math import).
 fn pct_of(sorted : Array[Double], q : Double) -> Double {
   let n = sorted.length()
@@ -10538,11 +10641,7 @@ fn cmd_aggregate(
             Some(qf) =>
               match ctx_extract_field(pairs, qf) {
                 Some(raw) => {
-                  let d_opt = Some(
-                    @string.parse_double(@utf8.decode_lossy(raw)),
-                  ) catch {
-                    _ => None
-                  }
+                  let d_opt = parse_duration_ms(@utf8.decode_lossy(raw))
                   match d_opt {
                     Some(d) =>
                       match qvals.get(bucket) {
@@ -10971,9 +11070,7 @@ fn cmd_dashboard(
           Some(qf) =>
             match ctx_field_from_pairs(fields, [qf]) {
               Some(raw) => {
-                let d_opt = Some(@string.parse_double(@utf8.decode_lossy(raw))) catch {
-                  _ => None
-                }
+                let d_opt = parse_duration_ms(@utf8.decode_lossy(raw))
                 match d_opt {
                   Some(d) => {
                     qvals.push(d)
@@ -11014,9 +11111,13 @@ fn cmd_dashboard(
     // Peak buckets: the worst error-rate and the worst p95 windows, with
     // their record-level time bounds so the drill-down hint carries concrete
     // --since/--until values (the operator used to convert bucket labels to
-    // epoch ms by hand).
+    // epoch ms by hand). The error peak floor is 0.0, not -1.0: a fully
+    // healthy window (every bucket at 0%) must not print "peak errors: ...
+    // (0% of N)" — a peak line on a healthy panel reads as an anomaly that
+    // is not there. The p95 peak keeps -1.0 because p95=0 is a legitimate
+    // sub-millisecond sample fact, not noise.
     let mut peak_err_label : String = ""
-    let mut peak_err_rate : Double = -1.0
+    let mut peak_err_rate : Double = 0.0
     let mut peak_p95_label : String = ""
     let mut peak_p95 : Double = -1.0
     for label in labels {
@@ -11091,6 +11192,15 @@ fn cmd_dashboard(
         max_dim = item.1
       }
       dim_sorted.set(item.0, sorted_latency(dim_lat.get(item.0)))
+    }
+    // Global quantile samples: sorted once, shared by the JSON and the text
+    // renderer — both used to re-sort the same array on their own pass.
+    match qfield {
+      Some(_) =>
+        qvals
+        .mut_view()
+        .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
+      None => ()
     }
     if json {
       let mut s = "{\"dir\":\"" +
@@ -11197,9 +11307,6 @@ fn cmd_dashboard(
       }
       match qfield {
         Some(qf) => {
-          qvals
-          .mut_view()
-          .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
           let n = qvals.length()
           let mut sum : Double = 0.0
           for v in qvals {
@@ -11424,9 +11531,6 @@ fn cmd_dashboard(
               "]",
             )
           }
-          qvals
-          .mut_view()
-          .sort_by(fn(a, b) { if a < b { -1 } else if a > b { 1 } else { 0 } })
           let n = qvals.length()
           if n > 0 {
             let mut sum : Double = 0.0
@@ -13633,11 +13737,7 @@ fn cmd_watch(
           Some(mf) =>
             for pair in fields {
               if ctx_name_eq(pair.0, mf) || ctx_name_tail_eq(pair.0, mf) {
-                let d_opt = Some(
-                  @string.parse_double(@utf8.decode_lossy(pair.1)),
-                ) catch {
-                  _ => None
-                }
+                let d_opt = parse_duration_ms(@utf8.decode_lossy(pair.1))
                 match d_opt {
                   Some(d) => {
                     sum = sum + d
