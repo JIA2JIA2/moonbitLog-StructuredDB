@@ -60,7 +60,14 @@ fn quota_parse_int64(data : Bytes) -> Int64? {
 ///|
 /// Parse one QUOTA rule line. Returns None when the line has no role name or
 /// any present numeric field is malformed — a typo never silently disables a
-/// limit. Omitted fields keep their "unlimited" defaults.
+/// limit. Omitted fields keep their "unlimited" defaults. `write-bytes` and
+/// `storage-bytes` accept `-1` (explicit unlimited, matching the omitted
+/// default) and `0` (freeze the tenant: every write is over budget), but any
+/// other negative value is invalid — the pre-checks gate on `>= 0`, so a
+/// hand-typed `-500` where `500` was meant used to read as "no limit at all"
+/// and silently disarmed the tenant's cap (6.2 fourth round). `retain-days`
+/// keeps its whole negative domain: negative means "never expires" by
+/// contract.
 pub fn parse_quota_line(line : Bytes) -> QuotaRule? {
   let pairs = parse_kv_pairs(line)
   let mut role : Bytes? = None
@@ -74,12 +81,12 @@ pub fn parse_quota_line(line : Bytes) -> QuotaRule? {
       role = Some(pair.1)
     } else if pair.0 == b"write-bytes" {
       match quota_parse_int64(pair.1) {
-        Some(v) => write_bytes = v
+        Some(v) => if v < -1 { ok = false } else { write_bytes = v }
         None => ok = false
       }
     } else if pair.0 == b"storage-bytes" {
       match quota_parse_int64(pair.1) {
-        Some(v) => storage_bytes = v
+        Some(v) => if v < -1 { ok = false } else { storage_bytes = v }
         None => ok = false
       }
     } else if pair.0 == b"query-concurrent" {

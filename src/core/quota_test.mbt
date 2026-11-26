@@ -48,9 +48,30 @@ test "parse_quota_line rejects malformed input" {
     Some(_) => panic()
     None => ()
   }
-  // Negative limits are accepted and mean "unlimited".
+  // Negative limits: -1 stays the explicit "unlimited" (matching the
+  // omitted default) and 0 stays the freeze, but anything below -1 is
+  // invalid — the pre-checks gate on `>= 0`, so a hand-typed `-500` where
+  // `500` was meant used to read as "no limit at all" and silently disarmed
+  // the tenant cap (6.2 fourth round). retain-days keeps its whole negative
+  // domain (negative = never expires).
+  match @core.parse_quota_line(b"role=x write-bytes=-1") {
+    Some(r) => assert_eq(r.write_bytes, -1L)
+    None => panic()
+  }
+  match @core.parse_quota_line(b"role=x write-bytes=0") {
+    Some(r) => assert_eq(r.write_bytes, 0L)
+    None => panic()
+  }
   match @core.parse_quota_line(b"role=x write-bytes=-5") {
-    Some(r) => assert_eq(r.write_bytes, -5L)
+    Some(_) => panic()
+    None => ()
+  }
+  match @core.parse_quota_line(b"role=x storage-bytes=-500") {
+    Some(_) => panic()
+    None => ()
+  }
+  match @core.parse_quota_line(b"role=x retain-days=-5") {
+    Some(r) => assert_eq(r.retain_days, -5L)
     None => panic()
   }
 }

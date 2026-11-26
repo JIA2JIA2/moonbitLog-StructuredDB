@@ -14780,7 +14780,7 @@ fn record_denied(dir : String, cmd : String, args : Array[String]) -> Unit {
 /// Load the directory's QUOTA policy file (6.2); an empty array when the
 /// file is absent (per-tenant quotas disabled). Malformed lines are skipped
 /// like RBAC lines.
-fn load_quota_rules(dir : String) -> Array[@core.QuotaRule] {
+fn load_quota_rules(dir : String) -> Array[@core.QuotaRule] raise @io.IoError {
   if !@backend_native.file_exists(dir + "/QUOTA") {
     return []
   }
@@ -14788,13 +14788,40 @@ fn load_quota_rules(dir : String) -> Array[@core.QuotaRule] {
   let rules : Array[@core.QuotaRule] = []
   let mut start = 0
   let mut i = 0
+  let mut lineno = 0
   while i <= data.length() {
     if i == data.length() || data.at(i).to_int() == 10 {
       let line = @core.slice(data, start, i)
+      lineno = lineno + 1
+      // Blank lines are skipped; anything else that fails to parse is a
+      // broken configuration, not a removable rule — the old loader dropped
+      // such lines silently, so one typo (`write-bytes=5o0`) disabled the
+      // whole tenant cap while every later command kept running as if the
+      // file were fine (and `quota` even reported the file as absent). Fail
+      // loudly instead: the same typo can never be allowed to disable a
+      // limit, which is exactly what parse_quota_line's contract promises.
       if line.length() > 0 {
-        match @core.parse_quota_line(line) {
-          Some(r) => rules.push(r)
-          None => ()
+        let mut blank = true
+        for c in line {
+          if c.to_int() != 32 && c.to_int() != 9 && c.to_int() != 13 {
+            blank = false
+            break
+          }
+        }
+        if !blank {
+          match @core.parse_quota_line(line) {
+            Some(r) => rules.push(r)
+            None =>
+              raise @io.IoError::Invalid(
+                "invalid QUOTA line " +
+                lineno.to_string() +
+                " in " +
+                dir +
+                "/QUOTA: \"" +
+                bytes_to_string(line) +
+                "\" (bad role/number, or write-bytes/storage-bytes below -1)",
+              )
+          }
         }
       }
       start = i + 1
@@ -14826,7 +14853,7 @@ fn current_role(dir : String) -> Bytes? {
 /// The quota rule governing this invocation: the MOONLOG_TOKEN role's rule,
 /// else the reserved `default` rule, else None (no QUOTA file or no
 /// applicable rule).
-fn active_quota_rule(dir : String) -> @core.QuotaRule? {
+fn active_quota_rule(dir : String) -> @core.QuotaRule? raise @io.IoError {
   let rules = load_quota_rules(dir)
   if rules.length() == 0 {
     return None
@@ -14972,7 +14999,18 @@ fn quota_storage_used(dir : String, r : @core.QuotaRule) -> Int64 {
 /// Recompute storage ledgers without printing (after compaction/expiry, so a
 /// spent ledger does not keep rejecting writes until the next manual recalc).
 fn quota_recalc_storage_quiet(dir : String) -> Unit {
-  let rules = load_quota_rules(dir)
+  // Maintenance callers (compact/ttl/purge/...) keep running on a broken
+  // QUOTA file — the write pre-checks already fail loudly on the same file,
+  // so the recalc only warns instead of failing the whole maintenance pass.
+  let rules : Array[@core.QuotaRule] = load_quota_rules(dir) catch {
+    e => {
+      eprintln(
+        "warning: QUOTA parse error, storage recalc skipped: " +
+        io_error_text(e),
+      )
+      return
+    }
+  }
   for r in rules {
     if r.storage_bytes >= 0 {
       let used = tenant_storage_bytes(dir, role_scope(dir, r.role))
@@ -14990,7 +15028,7 @@ fn quota_recalc_storage_quiet(dir : String) -> Unit {
 }
 
 ///|
-fn quota_recalc_storage(dir : String) -> Unit {
+fn quota_recalc_storage(dir : String) -> Unit raise @io.IoError {
   let rules = load_quota_rules(dir)
   for r in rules {
     if r.storage_bytes >= 0 {
@@ -15020,7 +15058,7 @@ fn quota_write_error(
   dir : String,
   rule : @core.QuotaRule?,
   incoming : Int64,
-) -> String? {
+) -> String? raise @io.IoError {
   let r = match rule {
     Some(r) => r
     None => return None
@@ -15188,7 +15226,7 @@ fn quota_charge_storage_keys(
 fn effective_ttl_policy(
   dir : String,
   policy : @core.TtlPolicy,
-) -> @core.TtlPolicy {
+) -> @core.TtlPolicy raise @io.IoError {
   let rules = load_quota_rules(dir)
   if rules.length() == 0 {
     return policy
@@ -15671,7 +15709,11 @@ fn cmd_audit(
 }
 
 ///|
-fn cmd_quota(dir : String, recalc : Bool, json : Bool) -> Unit {
+fn cmd_quota(
+  dir : String,
+  recalc : Bool,
+  json : Bool,
+) -> Unit raise @io.IoError {
   if recalc {
     quota_recalc_storage(dir)
   }
