@@ -18925,6 +18925,27 @@ fn selfmon_threshold_cfg(
 }
 
 ///|
+/// Effective threshold for a PERCENTAGE gauge (disk warn/crit, failure-rate
+/// warn). A value outside 0..100 can never fire: used shares and rates top
+/// out at 100, so `DISK_WARN_PCT=150` silently disarmed the whole disk
+/// dimension while `quota --json`-style output happily displayed the dead
+/// value — the same hand-typed-configuration failure shape M248 closed for
+/// quotas. Out-of-range values fall back to the default, symmetric with the
+/// loader rejecting negatives.
+fn selfmon_threshold_pct(
+  cfg : @hashmap.HashMap[String, Int64],
+  name : String,
+  default : Int64,
+) -> Int64 {
+  let v = selfmon_threshold_cfg(cfg, name, default)
+  if v < (0 : Int64) || v > (100 : Int64) {
+    default
+  } else {
+    v
+  }
+}
+
+///|
 fn selfmon_json_fields(line : Bytes) -> Array[(Bytes, Bytes)]? {
   Some(@core.json_object_fields(line)) catch {
     _ => None
@@ -18977,13 +18998,17 @@ fn selfmon_is_segment_name(name : String) -> Bool {
 ///|
 /// Whether `cmd` is a query/read entry point for the failure-rate gauge.
 /// Exports, deletes, configuration changes and audit queries are excluded so
-/// they cannot dilute "query failure rate".
+/// they cannot dilute "query failure rate". `cursor` (polling a consumer
+/// batch) is a data read like the rest — it was the one audited read entry
+/// point missing here, so its failures escaped the numerator while its
+/// allows were counted in the denominator: the gauge read too healthy
+/// exactly when cursor polling broke.
 fn selfmon_is_query_cmd(cmd : String) -> Bool {
   let list : Array[String] = [
     "get", "getkey", "get-many", "getkey-live", "has-key", "scan", "scan-prefix",
     "scan-range", "scan-time", "tail", "follow", "search", "query", "context", "aggregate",
-    "cluster", "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor-lag",
-    "cursor-list", "stats", "partitions",
+    "cluster", "trend", "alert", "baseline", "dashboard", "anomalies", "watch", "cursor",
+    "cursor-lag", "cursor-list", "stats", "partitions",
   ]
   for c in list {
     if c == cmd {
@@ -19237,8 +19262,48 @@ fn selfmon_newest_segment_age_ms(dir : String) -> Int64 {
 
 ///|
 /// Latest writer snapshot under `<dir>/SELFMON` (max ts across writers):
-/// (writer, ts, pending, head_lag_ms, backlog_alerts); all -1/"" when no
-/// writer has ever reported.
+/// (writer, ts, pending, head_lag_ms, backlog_alerts, corrupt_snapshots);
+/// all -1/"" when no writer has ever reported, corrupt counting the
+/// snapshot files that exist but cannot be parsed — a corrupt snapshot is
+/// exactly what a crash mid-write leaves behind, so "files present but
+/// unreadable" must surface (unknown) instead of reading as "no writer".
+fn selfmon_latest_snapshot(
+  dir : String,
+) -> (String, Int64, Int64, Int64, Int64, Int32) {
+  let names = @backend_native.list_dir(dir + "/SELFMON") catch { _ => [] }
+  let mut best_writer = ""
+  let mut best_ts : Int64 = -1
+  let mut best_pending : Int64 = -1
+  let mut best_lag : Int64 = -1
+  let mut best_alerts : Int64 = -1
+  let mut corrupt : Int32 = 0
+  for name in names {
+    if name.has_suffix(".json") {
+      let data = @backend_native.read_file(dir + "/SELFMON/" + name)
+      match selfmon_json_fields(data) {
+        Some(fields) => {
+          let ts = selfmon_field_int64(fields, b"ts")
+          if ts > best_ts {
+            best_ts = ts
+            best_writer = selfmon_field_str(fields, b"writer")
+            best_pending = selfmon_field_int64(fields, b"pending")
+            best_lag = selfmon_field_int64(fields, b"head_lag_ms")
+            best_alerts = selfmon_field_int64(fields, b"backlog_alerts")
+          } else if ts < 0 {
+            // Parses but carries no timestamp — a snapshot that cannot be
+            // judged for freshness is no usable snapshot.
+            corrupt = corrupt + 1
+          }
+        }
+        None => corrupt = corrupt + 1
+      }
+    }
+  }
+  if best_ts < 0 {
+    return ("", -1, -1, -1, -1, corrupt)
+  }
+  (best_writer, best_ts, best_pending, best_lag, best_alerts, corrupt)
+}
 
 ///|
 /// Age (ms) of the newest event timestamp in the directory — collection
@@ -19275,40 +19340,6 @@ fn selfmon_event_lag_ms(dir : String) -> Int64? {
 }
 
 ///|
-fn selfmon_latest_snapshot(
-  dir : String,
-) -> (String, Int64, Int64, Int64, Int64) {
-  let names = @backend_native.list_dir(dir + "/SELFMON") catch { _ => [] }
-  let mut best_writer = ""
-  let mut best_ts : Int64 = -1
-  let mut best_pending : Int64 = -1
-  let mut best_lag : Int64 = -1
-  let mut best_alerts : Int64 = -1
-  for name in names {
-    if name.has_suffix(".json") {
-      let data = @backend_native.read_file(dir + "/SELFMON/" + name)
-      match selfmon_json_fields(data) {
-        Some(fields) => {
-          let ts = selfmon_field_int64(fields, b"ts")
-          if ts > best_ts {
-            best_ts = ts
-            best_writer = selfmon_field_str(fields, b"writer")
-            best_pending = selfmon_field_int64(fields, b"pending")
-            best_lag = selfmon_field_int64(fields, b"head_lag_ms")
-            best_alerts = selfmon_field_int64(fields, b"backlog_alerts")
-          }
-        }
-        None => ()
-      }
-    }
-  }
-  if best_ts < 0 {
-    return ("", -1, -1, -1, -1)
-  }
-  (best_writer, best_ts, best_pending, best_lag, best_alerts)
-}
-
-///|
 /// Best-effort trim of `<dir>/SELFMON_ERRORS` (6.4 third pass): the error
 /// feed only serves the windowed failure-rate numerator, so out-of-window
 /// rows are dead weight — and a sustained failure storm grows the file
@@ -19341,7 +19372,13 @@ fn selfmon_trim_errors(dir : String, cutoff : Int64, cap : Int64) -> Unit {
         if i == n || data.at(i).to_int() == 10 {
           if i > start {
             let line = @core.slice(data, start, i)
-            if selfmon_line_ts(line) >= cutoff {
+            let ts = selfmon_line_ts(line)
+            // A row whose leading ts cannot be read (hand-edited or crash-
+            // truncated) is kept: the trim only drops rows it can PROVE are
+            // out-of-window, matching the window-boundary philosophy of
+            // skipping without misclassifying — losing a failure record is
+            // worse than keeping a stray line.
+            if ts < 0 || ts >= cutoff {
               out.write_bytes(line)
               out.write_bytes(b"\n")
             }
@@ -19372,8 +19409,13 @@ fn selfmon_trim_errors(dir : String, cutoff : Int64, cap : Int64) -> Unit {
 fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   let now = now_ms()
   let cfg = selfmon_load_thresholds(dir)
-  let disk_warn = selfmon_threshold_cfg(cfg, "DISK_WARN_PCT", 80)
-  let disk_crit = selfmon_threshold_cfg(cfg, "DISK_CRIT_PCT", 90)
+  let disk_warn = selfmon_threshold_pct(cfg, "DISK_WARN_PCT", 80)
+  let mut disk_crit = selfmon_threshold_pct(cfg, "DISK_CRIT_PCT", 90)
+  // An inverted pair (crit below warn) would fire crit at levels the
+  // operator still considers healthy — clamp crit to never cross warn.
+  if disk_crit < disk_warn {
+    disk_crit = disk_warn
+  }
   let backlog_warn = selfmon_threshold_cfg(cfg, "BACKLOG_WARN", 1000)
   let lag_warn = selfmon_threshold_cfg(cfg, "LAG_WARN_MS", 5000)
   let stale_warn = selfmon_threshold_cfg(cfg, "STALE_MS", 300000)
@@ -19381,7 +19423,7 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   let window = selfmon_threshold_cfg(cfg, "WINDOW_MS", 300000)
   let active_window = selfmon_threshold_cfg(cfg, "ACTIVE_WINDOW_MS", 60000)
   let event_lag_warn = selfmon_threshold_cfg(cfg, "EVENT_LAG_MS", 300000)
-  let fail_rate_warn = selfmon_threshold_cfg(cfg, "FAIL_RATE_WARN_PCT", 50)
+  let fail_rate_warn = selfmon_threshold_pct(cfg, "FAIL_RATE_WARN_PCT", 50)
   let since = now - window
 
   // --- disk watermark (6.4) ---
@@ -19392,7 +19434,10 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   if total > 0 && avail >= 0 {
     disk_used = (total - avail) * 100 / total
   }
-  let mut disk_status = "ok"
+  // A filesystem stat that cannot be read is "no data", not "healthy" —
+  // the same distinction M176 drew for a lock-busy probe. -1 doing double
+  // duty as both is how a dimension goes silently blind.
+  let mut disk_status = if disk_used < (0 : Int64) { "unknown" } else { "ok" }
   if disk_used >= disk_crit {
     disk_status = "crit"
   } else if disk_used >= disk_warn {
@@ -19400,7 +19445,7 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   }
 
   // --- writer backlog snapshot (6.4) ---
-  let (writer, snap_ts, pending, head_lag, alerts) = selfmon_latest_snapshot(
+  let (writer, snap_ts, pending, head_lag, alerts, corrupt_snaps) = selfmon_latest_snapshot(
     dir,
   )
   let snapshot_present = snap_ts >= 0
@@ -19413,6 +19458,12 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
   let mut backlog_status = "ok"
   if snapshot_present && (pending >= backlog_warn || head_lag >= lag_warn) {
     backlog_status = "warn"
+  } else if corrupt_snaps > 0 && !snapshot_present {
+    // Snapshot files exist but none of them parses. A corrupt snapshot is
+    // exactly what a crash mid-write leaves behind — the state most likely
+    // to hide crash residue — so this reads as "no data" (unknown), never
+    // as a clean "no writer" ok.
+    backlog_status = "unknown"
   }
 
   // --- ingest staleness (6.4): an active writer whose newest segment is
@@ -19531,6 +19582,8 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
       snapshot_age.to_string() +
       ",\"writer_stale\":" +
       (if writer_stale { "true" } else { "false" }) +
+      ",\"corrupt_snapshots\":" +
+      corrupt_snaps.to_string() +
       ",\"pending_warn\":" +
       backlog_warn.to_string() +
       ",\"lag_warn_ms\":" +
@@ -19605,6 +19658,8 @@ fn cmd_selfmon(dir : String, json : Bool, exit_code : Bool) -> Unit {
       snapshot_age.to_string() +
       " writer_stale=" +
       (if writer_stale { "true" } else { "false" }) +
+      " corrupt=" +
+      corrupt_snaps.to_string() +
       " [" +
       backlog_status +
       "]",

@@ -431,3 +431,104 @@ test "audit pin log flags tail truncation, rewrite and survives later appends (6
   assert_true(audit_anchor_pinned_crc(data3, pins2[1].0) != pins2[1].1)
   remove_tree(dir)
 }
+
+///|
+test "selfmon percentage thresholds reject out-of-range values (6.4 fourth pass)" {
+  let cfg : @hashmap.HashMap[String, Int64] = @hashmap.HashMap::HashMap([])
+  // A hand-typed DISK_WARN_PCT=150 can never fire (used tops out at 100) —
+  // it used to take effect verbatim and silently disarm the disk dimension.
+  cfg.set("DISK_WARN_PCT", 150L)
+  assert_eq(selfmon_threshold_pct(cfg, "DISK_WARN_PCT", 80L), 80L)
+  // Negatives are rejected by the loader already; the wrapper holds the
+  // same floor for env-var-sourced values.
+  cfg.set("DISK_WARN_PCT", -5L)
+  assert_eq(selfmon_threshold_pct(cfg, "DISK_WARN_PCT", 80L), 80L)
+  // A legal value survives untouched.
+  cfg.set("DISK_WARN_PCT", 95L)
+  assert_eq(selfmon_threshold_pct(cfg, "DISK_WARN_PCT", 80L), 95L)
+  // Failure-rate warn shares the domain (the gauge caps at 100).
+  cfg.set("FAIL_RATE_WARN_PCT", 120L)
+  assert_eq(selfmon_threshold_pct(cfg, "FAIL_RATE_WARN_PCT", 50L), 50L)
+  // cursor polling is a data read: its failures belong in the numerator and
+  // its allows in the denominator — the one audited read command that was
+  // missing from the whitelist, so cursor breakage read as "too healthy".
+  assert_true(selfmon_is_query_cmd("cursor"))
+  assert_true(selfmon_is_query_cmd("cursor-lag"))
+  assert_false(selfmon_is_query_cmd("export-jsonl"))
+}
+
+///|
+test "selfmon snapshot reader counts corrupt snapshot files (6.4 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-selfmon-snap"
+  remove_tree(dir)
+  ignore(@backend_native.ensure_dir(dir + "/SELFMON"))
+  // No snapshot at all: no writer has reported — ok, zero corrupt.
+  let (w0, ts0, _, _, _, c0) = selfmon_latest_snapshot(dir)
+  assert_eq(w0, "")
+  assert_eq(ts0, -1L)
+  assert_eq(c0, 0)
+  // A crash mid-write leaves a truncated snapshot: the file exists but
+  // cannot be parsed — corrupt, not "no writer".
+  @backend_native.write_file(dir + "/SELFMON/http.json", b"{\"ts\":") catch {
+    _ => ()
+  }
+  let (_, ts1, _, _, _, c1) = selfmon_latest_snapshot(dir)
+  assert_eq(ts1, -1L)
+  assert_eq(c1, 1)
+  // Parses but carries no timestamp: not usable either.
+  @backend_native.write_file(
+    dir + "/SELFMON/http.json",
+    b"{\"writer\":\"http\",\"pending\":7}",
+  ) catch {
+    _ => ()
+  }
+  let (_, ts2, _, _, _, c2) = selfmon_latest_snapshot(dir)
+  assert_eq(ts2, -1L)
+  assert_eq(c2, 1)
+  // One intact snapshot alongside a corrupt one: the gauge works from the
+  // intact file and the corrupt count is reported alongside.
+  let now = now_ms()
+  @backend_native.write_file(
+    dir + "/SELFMON/http.json",
+    @utf8.encode(
+      "{\"ts\":" +
+      now.to_string() +
+      ",\"writer\":\"http\",\"pending\":12,\"head_lag_ms\":30,\"backlog_alerts\":0}",
+    ),
+  ) catch {
+    _ => ()
+  }
+  @backend_native.write_file(dir + "/SELFMON/http2.json", b"garbage") catch {
+    _ => ()
+  }
+  let (w3, ts3, p3, _, _, c3) = selfmon_latest_snapshot(dir)
+  assert_eq(w3, "http")
+  assert_eq(ts3, now)
+  assert_eq(p3, 12L)
+  assert_eq(c3, 1)
+  remove_tree(dir)
+}
+
+///|
+test "selfmon error trim keeps unparseable rows (6.4 fourth pass)" {
+  let dir = "/tmp/moonlog-wbtest-selfmon-trim"
+  remove_tree(dir)
+  ignore(@backend_native.ensure_dir(dir))
+  let now = now_ms()
+  // One in-window good row, one crash-truncated row (no readable ts), one
+  // out-of-window good row.
+  let body = "{\"ts\":" +
+    now.to_string() +
+    ",\"cmd\":\"query\",\"error\":\"boom\"}\n{\"ts\" truncated mid crash\n{\"ts\":123,\"cmd\":\"query\",\"error\":\"old\"}\n"
+  @backend_native.write_file(dir + "/SELFMON_ERRORS", @utf8.encode(body)) catch {
+    _ => ()
+  }
+  selfmon_trim_errors(dir, now - 1000L, 1L)
+  let kept = @utf8.decode_lossy(
+    @backend_native.read_file(dir + "/SELFMON_ERRORS"),
+  )
+  assert_true(kept.contains("boom"))
+  assert_true(kept.contains("truncated"))
+  assert_false(kept.contains("old"))
+  remove_tree(dir)
+}
