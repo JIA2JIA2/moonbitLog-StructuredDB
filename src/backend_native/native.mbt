@@ -1811,9 +1811,35 @@ pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
       None => ()
     }
   }
+  // Snapshot convergence (6.5 sixth pass): the same deletion propagation the
+  // segment set already had extends to every other member of the backup set —
+  // a policy file the operator deleted at the source (a cancelled TTL, a
+  // retired RBAC, a rotated-away AUDIT.head) must not survive in the backup
+  // and resurface on the restored copy, where it silently changes retention
+  // or access behavior. Only backup-set names are considered, so runtime
+  // state the backup never carried (LOCK, cursors, SELFMON/http.json) and a
+  // leftover MANIFEST.tmp stay untouched.
+  for name in list_dir(dst) {
+    if !is_backup_file(name) {
+      continue
+    }
+    if parse_base_from_log_name(name) is Some(_) {
+      continue
+    }
+    let mut src_has = false
+    for s in src_names {
+      if s == name {
+        src_has = true
+        break
+      }
+    }
+    if !src_has {
+      ignore(remove_file(dst + "/" + name))
+    }
+  }
   let mut copied = 0
   for name in src_names {
-    if !is_backup_file(name) {
+    if !is_backup_file(name) || name == MANIFEST_NAME {
       continue
     }
     let dst_path = dst + "/" + name
@@ -1838,13 +1864,33 @@ pub fn backup_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
     }
   }
   // SELFMON/thresholds is configuration (like RBAC/TTL/QUOTA), while the
-  // sibling http.json is runtime state; carry only the thresholds file.
+  // sibling http.json is runtime state; carry only the thresholds file, and
+  // drop the backup's copy once the source no longer has one.
   if file_exists(src + "/SELFMON/thresholds") {
     ignore(ensure_dir(dst + "/SELFMON"))
     write_file(
       dst + "/SELFMON/thresholds",
       read_file(src + "/SELFMON/thresholds"),
     )
+  } else {
+    ignore(remove_file(dst + "/SELFMON/thresholds"))
+  }
+  // The MANIFEST is written LAST and atomically (write to a temp name, then
+  // rename): a pass interrupted before this point leaves the previous
+  // manifest in place, and every resulting interrupted state — old manifest
+  // with a half-copied or extra segment — is caught by the restore gate
+  // (size mismatch, or a segment the manifest does not list), never
+  // materialized as silently-missing data. A stale temp from an even earlier
+  // crash is cleared up front.
+  let tmp_manifest = dst + "/" + MANIFEST_NAME + ".tmp"
+  ignore(remove_file(tmp_manifest))
+  if file_exists(src + "/" + MANIFEST_NAME) {
+    write_file(tmp_manifest, read_file(src + "/" + MANIFEST_NAME))
+    if !rename_file(tmp_manifest, dst + "/" + MANIFEST_NAME) {
+      raise @io.IoError::Syscall(-1)
+    }
+  } else {
+    ignore(remove_file(dst + "/" + MANIFEST_NAME))
   }
   fsync_dir(dst)
   copied
@@ -1888,6 +1934,25 @@ pub fn restore_log_dir(src : String, dst : String) -> Int32 raise @io.IoError {
         " manifest=" +
         m.segment_sizes[i].to_string(),
       )
+    }
+  }
+  // Completeness gate, reverse direction (6.5 sixth pass): every segment
+  // file on disk must be listed in the manifest. An incremental pass
+  // interrupted after a segment was copied but before the manifest replaced
+  // it used to restore "successfully" with that segment invisible — the
+  // restored copy reported one segment count while opening another, and
+  // every verifier (verify, fsck, drill reconciliation) walks the manifest,
+  // so the orphaned data was provably lost with no alarm anywhere. Rejected
+  // here, before any copy into the target.
+  for name in list_dir(src) {
+    match parse_base_from_log_name(name) {
+      Some(base) =>
+        if !contains_u64(m.segment_bases, base) {
+          raise @io.IoError::Invalid(
+            "incomplete backup (segment not in manifest): " + src + "/" + name,
+          )
+        }
+      None => ()
     }
   }
   ignore(ensure_dir(dst))

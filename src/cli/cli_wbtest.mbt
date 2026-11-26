@@ -218,6 +218,126 @@ test "restore gates on manifest-declared segments (6.5)" {
 }
 
 ///|
+test "restore rejects a segment the manifest does not list (6.5)" {
+  let src = "/tmp/moonlog-wbtest-restore-orphan-src"
+  let bak = "/tmp/moonlog-wbtest-restore-orphan-bak"
+  let rst = "/tmp/moonlog-wbtest-restore-orphan-rst"
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+  ignore(@backend_native.ensure_dir(src))
+  let log = @backend_native.open_log_dir(src, 200)
+  for i in 0..<8 {
+    ignore(
+      log.append(
+        @utf8.encode("key" + i.to_string()),
+        @utf8.encode("payload-0123456789-0123456789-" + i.to_string()),
+        1000L + i.to_int64(),
+      ),
+    )
+  }
+  log.flush()
+  @backend_native.flush_meta(src, log)
+  close_log(log)
+  ignore(@backend_native.backup_log_dir(src, bak))
+  // Interrupted incremental: the new segment was copied but the manifest
+  // (written last, atomically) never replaced it. The manifest-declared
+  // gate above cannot see this direction — the manifest is perfectly happy
+  // with what it lists — yet restoring would materialize orphaned data no
+  // verifier ever walks (open_log, verify, fsck and the drill all follow
+  // the manifest). Rejected before any copy into the target.
+  @backend_native.write_file(bak + "/9999999999999999.log", b"orphan") catch {
+    _ => ()
+  }
+  let mut raised = false
+  ignore(@backend_native.restore_log_dir(bak, rst)) catch {
+    _ => raised = true
+  }
+  assert_true(raised)
+  ignore(@backend_native.remove_file(bak + "/9999999999999999.log"))
+  // The intact backup still restores.
+  assert_true(@backend_native.restore_log_dir(bak, rst) > 0)
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+}
+
+///|
+test "incremental backup converges to the source snapshot (6.5)" {
+  let src = "/tmp/moonlog-wbtest-converge-src"
+  let bak = "/tmp/moonlog-wbtest-converge-bak"
+  let rst = "/tmp/moonlog-wbtest-converge-rst"
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+  ignore(@backend_native.ensure_dir(src))
+  let log = @backend_native.open_log_dir(src, 200)
+  ignore(log.append(b"k", b"v", 1000L))
+  log.flush()
+  @backend_native.flush_meta(src, log)
+  close_log(log)
+  @backend_native.write_file(src + "/TTL", b"default 30\n") catch {
+    _ => ()
+  }
+  @backend_native.write_file(src + "/RBAC", b"role=a token=t allow=scan\n") catch {
+    _ => ()
+  }
+  @backend_native.write_file(src + "/BATCHES", b"b1\n") catch {
+    _ => ()
+  }
+  @backend_native.write_file(src + "/AUDIT", b"{\"ts\":1}\n") catch {
+    _ => ()
+  }
+  @backend_native.write_file(src + "/AUDIT.head", b"size=13 tail=deadbeef\n") catch {
+    _ => ()
+  }
+  ignore(@backend_native.ensure_dir(src + "/SELFMON"))
+  @backend_native.write_file(src + "/SELFMON/thresholds", b"DISK_WARN_PCT=80\n") catch {
+    _ => ()
+  }
+  ignore(@backend_native.backup_log_dir(src, bak))
+  // Everything the source carried was copied.
+  assert_true(@backend_native.file_exists(bak + "/TTL"))
+  assert_true(@backend_native.file_exists(bak + "/RBAC"))
+  assert_true(@backend_native.file_exists(bak + "/BATCHES"))
+  assert_true(@backend_native.file_exists(bak + "/AUDIT"))
+  assert_true(@backend_native.file_exists(bak + "/AUDIT.head"))
+  assert_true(@backend_native.file_exists(bak + "/SELFMON/thresholds"))
+  // The operator cancels every policy (and rotates the audit trail away):
+  // deletion propagation extends beyond segments — a cancelled policy must
+  // not survive in the backup and resurface on the restored copy, where it
+  // silently keeps deleting data or changing access.
+  ignore(@backend_native.remove_file(src + "/TTL"))
+  ignore(@backend_native.remove_file(src + "/RBAC"))
+  ignore(@backend_native.remove_file(src + "/BATCHES"))
+  ignore(@backend_native.remove_file(src + "/AUDIT"))
+  ignore(@backend_native.remove_file(src + "/AUDIT.head"))
+  ignore(@backend_native.remove_file(src + "/SELFMON/thresholds"))
+  ignore(@backend_native.backup_log_dir(src, bak))
+  assert_false(@backend_native.file_exists(bak + "/TTL"))
+  assert_false(@backend_native.file_exists(bak + "/RBAC"))
+  assert_false(@backend_native.file_exists(bak + "/BATCHES"))
+  assert_false(@backend_native.file_exists(bak + "/AUDIT"))
+  assert_false(@backend_native.file_exists(bak + "/AUDIT.head"))
+  assert_false(@backend_native.file_exists(bak + "/SELFMON/thresholds"))
+  // Runtime state the backup never carried is not the propagation's concern.
+  assert_true(@backend_native.file_exists(bak + "/MANIFEST"))
+  // The restored copy enforces nothing the source no longer does.
+  ignore(@backend_native.restore_log_dir(bak, rst))
+  assert_false(@backend_native.file_exists(rst + "/TTL"))
+  assert_false(@backend_native.file_exists(rst + "/RBAC"))
+  // Re-adding at the source propagates forward again.
+  @backend_native.write_file(src + "/TTL", b"default 7\n") catch {
+    _ => ()
+  }
+  ignore(@backend_native.backup_log_dir(src, bak))
+  assert_true(@backend_native.file_exists(bak + "/TTL"))
+  remove_tree(src)
+  remove_tree(bak)
+  remove_tree(rst)
+}
+
+///|
 test "tier policy roundtrips an explicit warm 0 (M214)" {
   let dir = "/tmp/moonlog-wbtest-tier-warm0"
   remove_tree(dir)
